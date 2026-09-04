@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+# omarchy:summary=Print the Antigravity usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+
+import argparse
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone, timedelta
+
+AGENT_ID = "antigravity"
+AGENT_NAME = "Antigravity"
+OAUTH_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+OAUTH_CLIENT_SECRET = "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"
+QUOTA_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+CACHE_DIR = os.path.expanduser("~/.cache/omarchy/agent-usage")
+CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-limits.json")
+USER_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-user.json")
+CACHE_TTL_SECONDS = 60
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def get_token_from_keyring():
+    try:
+        raw = subprocess.check_output(
+            ["secret-tool", "lookup", "service", "gemini", "username", "antigravity"],
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        ).decode("utf-8", errors="ignore").strip()
+        if not raw:
+            return None, "No Antigravity credentials found in keyring"
+        data = json.loads(raw)
+        return data, ""
+    except Exception as e:
+        return None, f"Failed to read keyring: {e}"
+
+
+def get_valid_access_token():
+    data, err = get_token_from_keyring()
+    if not data:
+        return None, err
+
+    tok = data.get("token", {})
+    access_token = tok.get("access_token")
+    refresh_token = tok.get("refresh_token")
+    expiry_str = tok.get("expiry")
+
+    is_expired = False
+    if expiry_str:
+        try:
+            exp_dt = datetime.fromisoformat(expiry_str)
+            now_utc = datetime.now(timezone.utc)
+            if (exp_dt - now_utc).total_seconds() < 120:
+                is_expired = True
+        except Exception:
+            pass
+
+    if (not access_token or is_expired) and refresh_token:
+        try:
+            params = urllib.parse.urlencode({
+                "client_id": OAUTH_CLIENT_ID,
+                "client_secret": OAUTH_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token"
+            }).encode("utf-8")
+            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=params, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                new_token = res.get("access_token")
+                expires_in = res.get("expires_in", 3600)
+                if new_token:
+                    access_token = new_token
+                    tok["access_token"] = new_token
+                    new_exp = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                    tok["expiry"] = new_exp.isoformat()
+                    data["token"] = tok
+                    try:
+                        p = subprocess.Popen(
+                            ["secret-tool", "store", "--label=Password for 'antigravity' on 'gemini'", "service", "gemini", "username", "antigravity"],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        p.communicate(input=json.dumps(data).encode("utf-8"), timeout=5)
+                    except Exception:
+                        pass
+        except Exception as e:
+            sys.stderr.write(f"omarchy-agent-usage-antigravity: token refresh error: {e}\n")
+
+    if not access_token:
+        return None, "Unable to obtain valid access token"
+
+    return access_token, ""
+
+
+def get_cached_limits(max_age_seconds=CACHE_TTL_SECONDS):
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        mtime = os.path.getmtime(CACHE_FILE)
+        age = time.time() - mtime
+        if age <= max_age_seconds:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def get_cached_user_email(access_token):
+    if os.path.exists(USER_CACHE_FILE):
+        try:
+            with open(USER_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("email"):
+                    return data["email"]
+        except Exception:
+            pass
+
+    acc_path = os.path.expanduser("~/.gemini/google_accounts.json")
+    if os.path.exists(acc_path):
+        try:
+            with open(acc_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                old = data.get("old", [])
+                if old and isinstance(old, list):
+                    return old[0]
+        except Exception:
+            pass
+
+    try:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        req = urllib.request.Request("https://www.googleapis.com/oauth2/v2/userinfo", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+            email = info.get("email")
+            if email:
+                ensure_dir(CACHE_DIR)
+                with open(USER_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"email": email}, f)
+                return email
+    except Exception:
+        pass
+
+    return ""
+
+
+def fetch_authoritative_limits(access_token):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "antigravity"
+    }
+    payload = json.dumps({"project": "default-cli-project"}).encode("utf-8")
+    req = urllib.request.Request(QUOTA_ENDPOINT, data=payload, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    groups = data.get("groups", [])
+    parsed_items = []
+    for group in groups:
+        gname = group.get("displayName", "")
+        for b in group.get("buckets", []):
+            rem = b.get("remainingFraction", 1.0)
+            used_pct = round(max(0.0, min(1.0, 1.0 - rem)), 4)
+            w = b.get("window", "")
+            bname = b.get("displayName", "")
+            reset_time = b.get("resetTime", "")
+
+            if "Gemini" in gname:
+                prefix = "Gemini"
+                group_priority = 0
+            elif "Claude" in gname or "GPT" in gname:
+                prefix = "Claude/GPT"
+                group_priority = 1
+            else:
+                prefix = gname
+                group_priority = 2
+
+            if w == "5h" or "Five Hour" in bname:
+                title = f"{prefix} (5h)"
+                label = "Session"
+                window_priority = 0
+            elif w == "weekly" or "Weekly" in bname:
+                title = f"{prefix} (Weekly)"
+                label = "Weekly"
+                window_priority = 1
+            else:
+                title = f"{prefix} ({bname})"
+                label = bname
+                window_priority = 2
+
+            parsed_items.append((
+                group_priority,
+                window_priority,
+                {
+                    "title": title,
+                    "label": label,
+                    "percent": used_pct,
+                    "resetsAt": reset_time
+                }
+            ))
+
+    parsed_items.sort(key=lambda x: (x[0], x[1]))
+    limits = [item[2] for item in parsed_items]
+
+    ensure_dir(CACHE_DIR)
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"limits": limits, "fetchedAt": time.time()}, f)
+    except Exception:
+        pass
+
+    return limits
+
+
+def collect_local_stats():
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+
+    recent_days_map = {}
+    for i in range(7):
+        d = (now - timedelta(days=6-i)).strftime("%Y-%m-%d")
+        recent_days_map[d] = 0
+
+    history_file = os.path.expanduser("~/.gemini/antigravity-cli/history.jsonl")
+    brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
+
+    total_prompts = 0
+    today_prompts = 0
+
+    if os.path.exists(history_file):
+        with open(history_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    ts = data.get("timestamp", 0)
+                    if ts > 1e11:
+                        ts = ts / 1000.0
+                    dt = datetime.fromtimestamp(ts, timezone.utc)
+                    d_str = dt.strftime("%Y-%m-%d")
+                    total_prompts += 1
+                    if d_str == today_str:
+                        today_prompts += 1
+                    if d_str in recent_days_map:
+                        recent_days_map[d_str] += 1
+                except Exception:
+                    continue
+
+    recent_days = [{"date": k, "messageCount": v} for k, v in recent_days_map.items()]
+    active_dates = [k for k, v in recent_days_map.items() if v > 0]
+    total_sessions = len(glob.glob(os.path.join(brain_dir, "*"))) if os.path.exists(brain_dir) else 1
+
+    return {
+        "todayPrompts": today_prompts,
+        "todaySessions": 1 if today_prompts > 0 else 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": recent_days,
+        "totalPrompts": total_prompts,
+        "totalSessions": total_sessions,
+        "activeDays": len(active_dates),
+        "activeDates": active_dates,
+        "modelUsage": {}
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect Antigravity usage record")
+    parser.add_argument("--force", action="store_true", help="Bypass probe cache")
+    parser.add_argument("--limits-only", action="store_true", help="Prioritize speed/cache")
+    args = parser.parse_args()
+
+    limits = None
+    email = ""
+    status_text = ""
+    auth_help = ""
+
+    if shutil.which("agy") is None:
+        status_text = "Not installed"
+        auth_help = "Antigravity CLI ('agy') is not found in PATH."
+
+    if not args.force:
+        ttl = CACHE_TTL_SECONDS * 2 if args.limits_only else CACHE_TTL_SECONDS
+        cached = get_cached_limits(ttl)
+        if cached and "limits" in cached:
+            limits = cached["limits"]
+
+    access_token, token_err = get_valid_access_token()
+
+    if access_token:
+        email = get_cached_user_email(access_token)
+        if limits is None:
+            try:
+                limits = fetch_authoritative_limits(access_token)
+            except Exception as e:
+                sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to fetch quota: {e}\n")
+                stale = get_cached_limits(max_age_seconds=86400 * 7)
+                if stale and "limits" in stale:
+                    limits = stale["limits"]
+                else:
+                    limits = []
+                    status_text = "Quota unavailable"
+                    auth_help = "Check network or Antigravity login status."
+    else:
+        stale = get_cached_limits(max_age_seconds=86400 * 7)
+        if stale and "limits" in stale:
+            limits = stale["limits"]
+        else:
+            limits = []
+            if not status_text:
+                status_text = "Waiting for auth"
+                auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+
+    local_stats = collect_local_stats()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": now_iso,
+        "ready": True,
+        "hasLocalStats": True,
+        "tierLabel": f"Pro · {email}" if email else "Pro",
+        "usageStatusText": status_text,
+        "authHelpText": auth_help,
+        "limits": limits or []
+    }
+    record.update(local_stats)
+
+    print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

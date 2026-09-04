@@ -1,0 +1,39 @@
+#!/bin/bash
+# Omarchy Post-Update Hook: Restore Antigravity Integration
+# Location: ~/.config/omarchy/hooks/post-update.d/90-antigravity.hook
+
+set -euo pipefail
+
+# 1. Ensure user defaults point to gemini
+mkdir -p "$HOME/.config/omarchy/defaults"
+echo "gemini" > "$HOME/.config/omarchy/defaults/agent"
+
+# 2. Ensure gemini shim exists in ~/.local/bin
+mkdir -p "$HOME/.local/bin"
+if [[ ! -x "$HOME/.local/bin/gemini" ]]; then
+  cat <<'EOF' > "$HOME/.local/bin/gemini"
+#!/bin/bash
+exec agy --dangerously-skip-permissions "$@"
+EOF
+  chmod +x "$HOME/.local/bin/gemini"
+fi
+
+# 3. Ensure shell.json has antigravity enabled
+SHELL_CONFIG="$HOME/.config/omarchy/shell.json"
+if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+  tmp=$(mktemp)
+  jq '
+    .bar.layout.right |= map(
+      if .id == "omarchy.agents" then
+        .providers.antigravity.enabled = true
+      else
+        .
+      end
+    )
+  ' "$SHELL_CONFIG" > "$tmp" && mv "$tmp" "$SHELL_CONFIG"
+fi
+
+# 4. Trigger quota refresh
+if [[ -x "$HOME/.local/bin/omarchy-agent-usage-update" ]]; then
+  "$HOME/.local/bin/omarchy-agent-usage-update" --limits-only antigravity >/dev/null 2>&1 || true
+fi

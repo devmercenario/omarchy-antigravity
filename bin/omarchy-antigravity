@@ -1,0 +1,64 @@
+#!/bin/bash
+# omarchy:summary=Antigravity integration helper for Omarchy
+# omarchy:args=[auth|status|refresh|help]
+# omarchy:group=agent
+
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: omarchy-antigravity <command>
+
+Commands:
+  auth, login     Launch Antigravity authentication in a terminal
+  status          Show current token, authentication state, and quotas
+  refresh, update Force refresh quotas and update Omarchy bar widget
+  help            Show this help message
+
+EOF
+}
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  auth|login)
+    echo "Launching Antigravity authentication..."
+    if command -v omarchy-launch-tui >/dev/null 2>&1; then
+      exec omarchy-launch-tui --app-id=org.omarchy.agent agy
+    else
+      exec agy
+    fi
+    ;;
+  status)
+    echo "Checking Antigravity credentials..."
+    raw=$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)
+    if [[ -z "$raw" ]]; then
+      echo "Status: ❌ Not authenticated"
+      echo "Run 'omarchy-antigravity auth' to authenticate."
+      exit 0
+    fi
+    echo "Status: ✅ Authenticated in system keyring"
+    if [[ -x "$HOME/.local/bin/omarchy-agent-usage-antigravity" ]]; then
+      "$HOME/.local/bin/omarchy-agent-usage-antigravity" --force | jq . 2>/dev/null || true
+    fi
+    ;;
+  refresh|update)
+    echo "Refreshing Antigravity quota..."
+    if [[ -x "$HOME/.local/bin/omarchy-agent-usage-update" ]]; then
+      "$HOME/.local/bin/omarchy-agent-usage-update" --force antigravity
+    fi
+    echo "Notifying Omarchy shell..."
+    if command -v omarchy-shell >/dev/null 2>&1; then
+      omarchy-shell ipc omarchy.agents refresh >/dev/null 2>&1 || true
+    fi
+    echo "Quota refreshed!"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac

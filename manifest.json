@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "devmercenario.antigravity",
+  "name": "Antigravity",
+  "version": "1.0.0",
+  "author": "devmercenario",
+  "license": "MIT",
+  "description": "Google Antigravity CLI integration for Omarchy: usage quotas, agent shim, status alerts, and 1-click authentication.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Executable shim to run Antigravity CLI as Omarchy's gemini provider
+exec agy --dangerously-skip-permissions "$@"
