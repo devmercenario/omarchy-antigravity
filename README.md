@@ -8,7 +8,7 @@ Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://oma
 - 📊 **Real-time Quota Meters**: 5-hour session and weekly limits for Gemini and Claude/GPT model groups directly in the Omarchy bar panel.
 - ⚡ **Default Agent Shim**: Launch Antigravity anywhere via Omarchy hotkey (`SUPER + SHIFT + CTRL + A`), terminal (`omarchy agent`), or right-clicking the bar icon.
 - 🔔 **Status Bar Warnings**: The bar icon lights up in warning color with a tooltip when authentication is required or expired.
-- 🔑 **1-Click Authentication**: Interactive **"Entrar"** button in the dashboard opens a floating terminal to log in to Google immediately.
+- 🔑 **1-Click Authentication**: Interactive **"Sign In"** button in the dashboard opens a floating terminal to log in to Google immediately.
 - 🔄 **Auto-Persistence**: Includes an `omarchy update` hook so your setup never gets wiped during system upgrades.
 - 🛡️ **Zero System Pollution**: Installs entirely in user-space (`~/.local/bin`, `~/.config/omarchy/`).
 
@@ -31,7 +31,7 @@ Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://oma
 
 When not authenticated:
 - **Bar Icon**: Lights up in warning color with tooltip `"Antigravity: Waiting for auth"`.
-- **Panel Banner**: Shows an alert box with a direct **[ 󰌑 Entrar ]** button that launches the Google OAuth login with 1 click.
+- **Panel Banner**: Shows an alert box with a direct **[ 󰌑 Sign In ]** button that launches the Google OAuth login with 1 click.
 
 ---
 

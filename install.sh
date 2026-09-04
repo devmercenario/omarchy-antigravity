@@ -106,7 +106,7 @@ RAW_TOKEN=$(secret-tool lookup service gemini username antigravity 2>/dev/null |
 if [[ -z "$RAW_TOKEN" ]]; then
   echo "⚠️  Antigravity is not authenticated yet."
   echo "👉 A warning indicator will appear on your bar."
-  echo "👉 You can click 'Entrar' in the bar panel or run:"
+  echo "👉 You can click 'Sign In' in the bar panel or run:"
   echo "     omarchy-antigravity auth"
 else
   echo "✅ Antigravity is authenticated and operational!"

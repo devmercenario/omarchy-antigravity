@@ -349,7 +349,7 @@ Panel {
     text: "󱚣"
     active: root.alarming
     tooltipText: root.authNeeded
-      ? (root.provider ? root.provider.name + ": " + (root.provider.usageStatusText || "Autenticação necessária") + " (Clique para resolver)" : "Autenticação necessária")
+      ? (root.provider ? root.provider.name + ": " + (root.provider.usageStatusText || "Authentication required") + " (Click to resolve)" : "Authentication required")
       : ""
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.launchAgent()
@@ -552,7 +552,7 @@ Panel {
               Button {
                 id: authActionBtn
                 anchors.verticalCenter: parent.verticalCenter
-                text: "Entrar"
+                text: "Sign In"
                 iconText: "󰌑"
                 bordered: true
                 foreground: root.foreground
