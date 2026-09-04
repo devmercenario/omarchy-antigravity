@@ -18,14 +18,49 @@ Panel {
   readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  readonly property string home: Quickshell.env("HOME") || ""
   readonly property var providers: usage.enabledProviders
+  property string defaultAgentName: ""
   // The selection follows the provider, not the slot it happens to sit in: a
   // provider whose first scan lands while the panel is open would otherwise
   // shift the list underneath you and swap out what you were reading.
   property string selectedProviderId: ""
+
+  FileView {
+    id: defaultAgentWatcher
+    path: root.home + "/.config/omarchy/defaults/agent"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.updateDefaultAgent(text())
+    onLoadFailed: root.defaultAgentName = ""
+  }
+
+  function updateDefaultAgent(content) {
+    var raw = String(content || "").trim().toLowerCase()
+    if (raw === "gemini" || raw === "antigravity") {
+      defaultAgentName = "antigravity"
+    } else if (raw === "claude" || raw === "claude-code") {
+      defaultAgentName = "claude"
+    } else if (raw === "codex") {
+      defaultAgentName = "codex"
+    } else if (raw === "fireworks") {
+      defaultAgentName = "fireworks"
+    } else {
+      defaultAgentName = raw
+    }
+
+    if (!root.opened && defaultAgentName !== "") {
+      selectedProviderId = defaultAgentName
+    }
+  }
+
   readonly property int providerIndex: {
-    for (var i = 0; i < providers.length; i++)
-      if (providers[i].providerId === selectedProviderId) return i
+    var target = selectedProviderId !== "" ? selectedProviderId : defaultAgentName
+    if (target !== "") {
+      for (var i = 0; i < providers.length; i++)
+        if (providers[i].providerId === target) return i
+    }
     return 0
   }
   readonly property var provider: providers.length > 0 ? providers[providerIndex] : null
@@ -313,6 +348,14 @@ Panel {
     cursorActive = false
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
+    if (defaultAgentName !== "") {
+      for (var i = 0; i < providers.length; i++) {
+        if (providers[i].providerId === defaultAgentName) {
+          selectedProviderId = defaultAgentName
+          break
+        }
+      }
+    }
     usage.refreshLimits()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -348,9 +391,17 @@ Panel {
     bar: root.bar
     text: "󱚣"
     active: root.alarming
-    tooltipText: root.authNeeded
-      ? (root.provider ? root.provider.name + ": " + (root.provider.usageStatusText || "Authentication required") + " (Click to resolve)" : "Authentication required")
-      : ""
+    tooltipText: {
+      if (!root.provider) return "Agents"
+      if (root.authNeeded && String(root.provider.usageStatusText || "") !== "") {
+        return root.provider.name + ": " + (root.provider.usageStatusText || "Authentication required") + " (Click to resolve)"
+      }
+      if (root.headline) {
+        var pct = Math.round((1.0 - root.headline.percent) * 100)
+        return root.provider.name + " (" + root.headline.title + "): " + pct + "% remaining"
+      }
+      return root.provider.name
+    }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.launchAgent()
       else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)

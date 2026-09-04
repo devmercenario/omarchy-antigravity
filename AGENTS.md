@@ -225,6 +225,16 @@ Button {
 ```
 This ensures zero friction for unauthenticated users.
 
+### 5.3. Dynamic Default Agent Synchronization
+Antigravity is designed as a first-class, **optional** agent that coexists with all other Omarchy agents (Claude, Codex, Fireworks, etc.). Users can freely change their default agent at any time (`omarchy default agent <name>`), and the bar/panel dynamically reflects the change in real-time:
+
+- `defaultAgentWatcher` (`FileView` in `ui/Panel.qml`) watches `~/.config/omarchy/defaults/agent`.
+- When `defaults/agent` changes:
+  - If set to `claude`: `Panel.qml` switches its active provider to Claude, displaying Claude's rate limits and tokens.
+  - If set to `gemini` or `antigravity`: `Panel.qml` switches to Antigravity, displaying Gemini/Claude quota windows and prompt metrics.
+  - Right-clicking the bar button executes `omarchy-agent --pick`, which always invokes the user's current default agent.
+  - In the panel tab strip, users can still click or middle-click to browse any other enabled provider tabs.
+
 ---
 
 ## 6. Testing & Validation Checklist
