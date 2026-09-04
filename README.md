@@ -1,6 +1,7 @@
 # 🚀 Omarchy Antigravity Integration
 
 [![Omarchy](https://img.shields.io/badge/Omarchy-Linux-blue.svg)](https://omarchy.org/)
+[![Tests](https://github.com/devmercenario/omarchy-antigravity/actions/workflows/test.yml/badge.svg)](https://github.com/devmercenario/omarchy-antigravity/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Arch%20Linux%20%7C%20Hyprland-lightgrey.svg)]()
 
@@ -83,6 +84,20 @@ omarchy-antigravity refresh
    Integrates into the Quickshell bar. When quota is low or when authentication is missing, the bar button triggers an urgent visual alert.
 4. **Update Hook**:
    Drops `90-antigravity.hook` into `~/.config/omarchy/hooks/post-update.d/` so every time you run `omarchy update`, your default agent and widgets remain active.
+
+---
+
+## 🧪 Testing
+
+The repository comes with a 100% covered automated test suite testing the collector, installer, uninstaller, CLI, update hook, and Omarchy plugin manifest:
+
+```bash
+# Run full test suite
+./tests/run_tests.sh
+
+# Or run Python unit & integration tests individually
+python3 -m unittest tests/test_collector.py
+```
 
 ---
 

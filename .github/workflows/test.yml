@@ -1,0 +1,30 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq libsecret-tools
+
+      - name: Run Full Test Suite
+        run: |
+          chmod +x tests/*.sh tests/*.py install.sh uninstall.sh bin/* hooks/post-update.d/*
+          ./tests/run_tests.sh

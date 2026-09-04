@@ -229,38 +229,50 @@ This ensures zero friction for unauthenticated users.
 
 ## 6. Testing & Validation Checklist
 
-When modifying this repository, execute the following validation steps:
+The project includes an automated test suite with 100% functional test coverage. Always run the test suite before submitting pull requests or committing changes.
 
-1. **Manifest Validation**:
-   ```bash
-   omarchy-plugin-validate .
-   ```
-   Must return code `0`.
+### Automated Test Suite:
+```bash
+# Run all 5 test suites
+./tests/run_tests.sh
+```
 
-2. **Collector Execution**:
-   ```bash
-   ./bin/omarchy-agent-usage-antigravity --force | jq .
-   ```
-   Verify:
-   - Valid JSON output.
-   - `percent` fields are between `0.0` and `1.0`.
-   - `usageStatusText` is `""` when authenticated.
-   - User email is present in `tierLabel`.
+The test runner executes:
+1. **Collector Unit & Integration Tests** (`tests/test_collector.py`):
+   - Quota parsing and fraction conversion (`remainingFraction` -> `percent used`).
+   - Priority sorting (Gemini 5h -> Gemini Weekly -> Claude/GPT 5h -> Claude/GPT Weekly).
+   - System keyring extraction and error handling (empty keyring, corrupt JSON).
+   - OAuth2 token auto-refresh flow and expiration checking.
+   - Local stats aggregation (`history.jsonl` prompts parsing, date mapping, brain sessions).
+   - Edge cases: CLI not installed in PATH, unauthenticated state, API network errors, stale cache fallback.
+2. **Plugin Manifest Validation** (`tests/test_manifest.sh`):
+   - Validates `manifest.json` against Omarchy's official `omarchy-plugin-validate` registry schema.
+3. **Installer & Uninstaller Lifecycle** (`tests/test_installer.sh`):
+   - Executes `install.sh` and `uninstall.sh` in an isolated sandbox environment.
+   - Verifies all binaries are copied with `+x` permissions to `~/.local/bin`.
+   - Verifies `defaults/agent` is set to `gemini`.
+   - Verifies `shell.json` enables the `antigravity` provider.
+   - Verifies `uninstall.sh` removes binaries, cache, state, and cleans up cleanly.
+4. **Post-Update Hook Persistence** (`tests/test_hook.sh`):
+   - Simulates `omarchy update` having modified user defaults.
+   - Executes `90-antigravity.hook` to verify automatic restoration of the agent shim and shell settings.
+5. **CLI Functional Commands** (`tests/test_cli.sh`):
+   - Verifies `omarchy-antigravity help`, `status`, and invalid command handling.
 
-3. **Status CLI Tool**:
-   ```bash
-   ./bin/omarchy-antigravity status
-   ```
+### Individual Test Execution:
+```bash
+# Run Python tests directly
+python3 -m unittest tests/test_collector.py
 
-4. **Installer Test**:
-   ```bash
-   ./install.sh
-   ```
+# Run manifest validation
+./tests/test_manifest.sh
 
-5. **Shell Rescan & Hot Reload**:
-   ```bash
-   omarchy-shell shell rescanPlugins
-   ```
+# Run installer test
+./tests/test_installer.sh
+```
+
+### GitHub Actions CI:
+Every push and pull request to `main` automatically triggers `.github/workflows/test.yml` to ensure continuous regression protection.
 
 ---
 

@@ -176,21 +176,25 @@ def fetch_authoritative_limits(access_token):
             bname = b.get("displayName", "")
             reset_time = b.get("resetTime", "")
 
-            if "Gemini" in gname:
+            gname_upper = gname.upper()
+            bname_upper = bname.upper()
+            w_upper = w.upper()
+
+            if "GEMINI" in gname_upper:
                 prefix = "Gemini"
                 group_priority = 0
-            elif "Claude" in gname or "GPT" in gname:
+            elif "CLAUDE" in gname_upper or "GPT" in gname_upper:
                 prefix = "Claude/GPT"
                 group_priority = 1
             else:
                 prefix = gname
                 group_priority = 2
 
-            if w == "5h" or "Five Hour" in bname:
+            if w_upper == "5H" or "FIVE HOUR" in bname_upper or "5-HOUR" in bname_upper:
                 title = f"{prefix} (5h)"
                 label = "Session"
                 window_priority = 0
-            elif w == "weekly" or "Weekly" in bname:
+            elif w_upper == "WEEKLY" or "WEEKLY" in bname_upper:
                 title = f"{prefix} (Weekly)"
                 label = "Weekly"
                 window_priority = 1
@@ -277,11 +281,11 @@ def collect_local_stats():
     }
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Collect Antigravity usage record")
     parser.add_argument("--force", action="store_true", help="Bypass probe cache")
     parser.add_argument("--limits-only", action="store_true", help="Prioritize speed/cache")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     limits = None
     email = ""
