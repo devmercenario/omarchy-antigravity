@@ -4,9 +4,15 @@
 
 set -euo pipefail
 
-# 1. Ensure user defaults point to gemini
-mkdir -p "$HOME/.config/omarchy/defaults"
-echo "gemini" > "$HOME/.config/omarchy/defaults/agent"
+CONFIG_DIR="$HOME/.config/omarchy"
+AGENT_FILE="$CONFIG_DIR/defaults/agent"
+
+# 1. Restore defaults only if user previously selected Antigravity as default,
+# or if no default agent is currently configured.
+if [[ -f "$CONFIG_DIR/antigravity.default" ]] || [[ ! -f "$AGENT_FILE" ]]; then
+  mkdir -p "$CONFIG_DIR/defaults"
+  echo "gemini" > "$AGENT_FILE"
+fi
 
 # 2. Ensure gemini shim exists in ~/.local/bin
 mkdir -p "$HOME/.local/bin"
@@ -19,12 +25,12 @@ EOF
 fi
 
 # 3. Ensure shell.json has antigravity enabled
-SHELL_CONFIG="$HOME/.config/omarchy/shell.json"
+SHELL_CONFIG="$CONFIG_DIR/shell.json"
 if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
   tmp=$(mktemp)
   jq '
     .bar.layout.right |= map(
-      if .id == "omarchy.agents" then
+      if .id == "omarchy.agents" or (.id | endswith(".agents")) then
         .providers.antigravity.enabled = true
       else
         .

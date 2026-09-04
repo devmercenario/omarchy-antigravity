@@ -5,6 +5,7 @@
   "version": "1.0.0",
   "author": "devmercenario",
   "license": "MIT",
+  "homepage": "https://github.com/devmercenario/omarchy-antigravity",
   "description": "Google Antigravity CLI integration for Omarchy: usage quotas, agent shim, status alerts, and 1-click authentication.",
   "kinds": ["service"],
   "entryPoints": {

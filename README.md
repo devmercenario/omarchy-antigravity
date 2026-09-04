@@ -36,11 +36,29 @@ When not authenticated:
 
 ---
 
+## 📋 Prerequisites & External Dependencies
+
+Before installing, ensure the following dependencies are available on your system:
+
+- **Linux Desktop Environment**: Omarchy Linux (Arch Linux + Hyprland + Quickshell).
+- **Google Antigravity CLI (`agy`)**: The official Antigravity CLI installed in your `PATH`.
+- **`libsecret` (`secret-tool`)**: Used by Antigravity and this plugin to securely read OAuth tokens from the desktop Secret Service keyring.
+  ```bash
+  sudo pacman -S libsecret
+  ```
+- **`jq`**: JSON processor used for parsing manifests and shell configs.
+  ```bash
+  sudo pacman -S jq
+  ```
+- **`python3`**: Python 3.10+ standard library runtime (pre-installed on Arch Linux).
+
+---
+
 ## 📥 Installation
 
-### Option 1: Quick Install (Recommended)
+### Option 1: Quick Install (Interactive & Non-Destructive)
 
-Clone and run the automated installer:
+Clone and run the automated installer. The installer creates timestamped backups of `shell.json` and prompts before altering any existing default agent:
 
 ```bash
 git clone https://github.com/devmercenario/omarchy-antigravity.git
@@ -48,6 +66,11 @@ cd omarchy-antigravity
 chmod +x install.sh
 ./install.sh
 ```
+
+**Installer Options**:
+- `./install.sh --set-default`: Explicitly set Antigravity as the default agent without prompting.
+- `./install.sh --no-default`: Install usage metrics and bar widget while keeping your existing default agent.
+- `./install.sh --yes`: Automatic non-interactive install.
 
 ### Option 2: Omarchy Plugin Manager
 
@@ -103,11 +126,23 @@ python3 -m unittest tests/test_collector.py
 
 ## 🗑️ Uninstallation
 
-To completely remove the integration and revert to system defaults:
-
+### If installed via `install.sh`:
 ```bash
 ./uninstall.sh
 omarchy restart shell
+```
+The uninstaller removes all installed binaries, hooks, cache files, and automatically restores your previous default agent backup if one was present.
+
+### If installed via Omarchy Plugin Manager:
+```bash
+omarchy plugin remove devmercenario.antigravity --yes
+omarchy restart shell
+```
+
+### Resetting Default Agent:
+You can manually change or revert your default Omarchy agent at any time with:
+```bash
+omarchy default agent <name>   # e.g. claude, copilot, opencode
 ```
 
 ---

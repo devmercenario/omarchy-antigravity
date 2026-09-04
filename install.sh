@@ -12,6 +12,42 @@ CONFIG_DIR="$HOME/.config/omarchy"
 HOOKS_DIR="$CONFIG_DIR/hooks/post-update.d"
 SHELL_CONFIG="$CONFIG_DIR/shell.json"
 
+ASSUME_YES=0
+SET_DEFAULT=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    -y|--yes)
+      ASSUME_YES=1
+      shift
+      ;;
+    --set-default)
+      SET_DEFAULT="yes"
+      shift
+      ;;
+    --no-default)
+      SET_DEFAULT="no"
+      shift
+      ;;
+    -h|--help)
+      cat <<EOF
+Usage: ./install.sh [options]
+
+Options:
+  -y, --yes          Automatic yes to prompts (non-interactive)
+  --set-default      Explicitly set Antigravity as the default Omarchy agent
+  --no-default       Keep existing default agent intact
+  -h, --help         Show this help message
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 echo "✨ Installing Antigravity Integration for Omarchy..."
 
 # 1. Dependency checks
@@ -49,14 +85,51 @@ chmod +x "$BIN_DIR/omarchy-agent-usage-antigravity" \
 # Ensure ~/.local/bin is in PATH for current subshell
 export PATH="$BIN_DIR:$PATH"
 
-# 3. Configure Antigravity as the default Omarchy agent
-echo "⚙️  Configuring default agent to Antigravity (gemini)..."
+# 3. Configure Antigravity as the default Omarchy agent (with explicit consent)
 mkdir -p "$CONFIG_DIR/defaults"
-echo "gemini" > "$CONFIG_DIR/defaults/agent"
+AGENT_FILE="$CONFIG_DIR/defaults/agent"
+CURRENT_AGENT=""
+[[ -f "$AGENT_FILE" ]] && CURRENT_AGENT=$(cat "$AGENT_FILE")
 
-# 4. Enable Antigravity provider in shell.json
+should_set_default=false
+if [[ "$SET_DEFAULT" == "yes" ]]; then
+  should_set_default=true
+elif [[ "$SET_DEFAULT" == "no" ]]; then
+  should_set_default=false
+elif (( ASSUME_YES )); then
+  should_set_default=true
+elif [[ -n "$CURRENT_AGENT" && "$CURRENT_AGENT" != "gemini" ]]; then
+  echo ""
+  echo "ℹ️  Current default agent is: '$CURRENT_AGENT'"
+  if command -v gum >/dev/null 2>&1 && [[ -t 0 ]]; then
+    if gum confirm "Would you like to set Antigravity (gemini) as your default Omarchy agent?"; then
+      should_set_default=true
+    fi
+  elif [[ -t 0 ]]; then
+    read -r -p "Would you like to set Antigravity (gemini) as your default agent? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      should_set_default=true
+    fi
+  fi
+else
+  should_set_default=true
+fi
+
+if [[ "$should_set_default" == true ]]; then
+  echo "⚙️  Setting default agent to Antigravity (gemini)..."
+  if [[ -f "$AGENT_FILE" && "$CURRENT_AGENT" != "gemini" ]]; then
+    cp "$AGENT_FILE" "$AGENT_FILE.bak.$(date +%s)"
+  fi
+  echo "gemini" > "$AGENT_FILE"
+  touch "$CONFIG_DIR/antigravity.default"
+else
+  echo "ℹ️  Keeping '$CURRENT_AGENT' as default agent."
+fi
+
+# 4. Enable Antigravity provider in shell.json (preserving backup)
 if [[ -f "$SHELL_CONFIG" ]]; then
   echo "🎨 Enabling Antigravity in Omarchy bar widget..."
+  cp "$SHELL_CONFIG" "$SHELL_CONFIG.bak.$(date +%s)"
   tmp=$(mktemp)
   jq '
     .bar.layout.right |= map(
