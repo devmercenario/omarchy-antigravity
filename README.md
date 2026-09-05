@@ -17,18 +17,9 @@ Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://oma
 
 ## 📸 Overview
 
-```
-┌──────────────────────────────────────────────┐
-│  󱚣 Antigravity      Pro · user@gmail.com    │
-├──────────────────────────────────────────────┤
-│  Gemini (5h)        [████████░░] 82% · 4h    │
-│  Gemini (Weekly)    [██████████] 95% · 6d    │
-│  Claude/GPT (5h)    [██████████] 100%        │
-│  Claude/GPT (Weekly)[██████████] 100%        │
-├──────────────────────────────────────────────┤
-│  Today: 14 prompts · 1 session               │
-└──────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="assets/agy-agent.png" alt="Omarchy Antigravity Panel Preview" width="380" />
+</p>
 
 When not authenticated:
 - **Bar Icon**: Lights up in warning color with tooltip `"Antigravity: Waiting for auth"`.

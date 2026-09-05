@@ -28,6 +28,7 @@ omarchy-antigravity/
 ├── install.sh                          # Automated idempotent installer
 ├── uninstall.sh                        # Clean uninstaller that restores system defaults
 ├── assets/
+│   ├── agy-agent.png                   # Visual preview screenshot of the Antigravity bar panel
 │   ├── antigravity.svg                 # White/accent 4-point spark logo for dark themes
 │   └── antigravity-light.svg           # Dark 4-point spark logo for light themes
 ├── bin/
