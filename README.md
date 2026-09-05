@@ -41,7 +41,7 @@ When not authenticated:
 Before installing, ensure the following dependencies are available on your system:
 
 - **Linux Desktop Environment**: Omarchy Linux (Arch Linux + Hyprland + Quickshell).
-- **Google Antigravity CLI (`agy`)**: The official Antigravity CLI installed in your `PATH`.
+- **[Google Antigravity CLI (`agy`)](https://antigravity.google/download#antigravity-cli)**: The official Antigravity CLI installed in your `PATH` (see [Installation & Download](https://antigravity.google/download#antigravity-cli)).
 - **`libsecret` (`secret-tool`)**: Used by Antigravity and this plugin to securely read OAuth tokens from the desktop Secret Service keyring.
   ```bash
   sudo pacman -S libsecret
