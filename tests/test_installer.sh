@@ -19,6 +19,9 @@ trap cleanup EXIT
 
 # Setup mock environment
 export HOME="$TEST_HOME"
+export XDG_STATE_HOME="$TEST_HOME/.local/state"
+export XDG_CACHE_HOME="$TEST_HOME/.cache"
+export XDG_CONFIG_HOME="$TEST_HOME/.config"
 export PATH="$TEST_HOME/.local/bin:$PATH"
 
 # Create mock dependencies in TEST_HOME/.local/bin

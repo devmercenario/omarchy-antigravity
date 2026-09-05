@@ -75,13 +75,7 @@ Panel {
   readonly property var models: modelRows(provider)
   readonly property var headline: bindingWindow(provider)
   readonly property var balance: provider ? (provider.balance || null) : null
-  readonly property bool authNeeded: {
-    for (var i = 0; i < providers.length; i++) {
-      var p = providers[i]
-      if (p && String(p.usageStatusText || "") !== "") return true
-    }
-    return false
-  }
+  readonly property bool authNeeded: !!root.provider && String(root.provider.usageStatusText || "") !== ""
   // A prepaid account runs low the way a subscription window fills up: the
   // last 10% of the funded credits lights the same alarm.
   readonly property bool balanceAlarming: !!balance && balance.funded > 0
@@ -104,6 +98,19 @@ Panel {
   function launchAgent() {
     if (root.bar) root.bar.run("omarchy-agent --pick")
     root.close()
+  }
+
+  function providerAuthCommand(p) {
+    if (!p) return ""
+    var id = String(p.providerId || "")
+    if (id === "antigravity" || id === "gemini") {
+      return "omarchy-launch-tui --app-id=org.omarchy.agent agy"
+    } else if (id === "claude") {
+      return "omarchy-launch-tui --app-id=org.omarchy.agent claude auth login"
+    } else if (id === "codex") {
+      return "omarchy-launch-tui --app-id=org.omarchy.agent codex"
+    }
+    return ""
   }
 
   // ---------------------------------------------------------------- limits
@@ -574,7 +581,7 @@ Panel {
 
               Column {
                 id: statusColumn
-                width: parent.width - authActionBtn.implicitWidth - parent.spacing
+                width: parent.width - (authActionBtn.visible ? authActionBtn.implicitWidth + parent.spacing : 0)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
@@ -602,6 +609,7 @@ Panel {
 
               Button {
                 id: authActionBtn
+                visible: root.providerAuthCommand(root.provider) !== ""
                 anchors.verticalCenter: parent.verticalCenter
                 text: "Sign In"
                 iconText: "󰌑"
@@ -609,8 +617,9 @@ Panel {
                 foreground: root.foreground
                 accent: root.urgent
                 onClicked: {
-                  if (root.bar) {
-                    root.bar.run("omarchy-launch-tui --app-id=org.omarchy.agent agy")
+                  var cmd = root.providerAuthCommand(root.provider)
+                  if (root.bar && cmd !== "") {
+                    root.bar.run(cmd)
                   }
                   root.close()
                 }
