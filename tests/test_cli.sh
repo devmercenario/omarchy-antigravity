@@ -34,5 +34,14 @@ if ! echo "$status_out" | grep -q "Checking Antigravity credentials"; then
   exit 1
 fi
 
+# 4. Test syntax of all shell scripts in bin/
+echo "  ▶ Testing bash syntax for bin scripts..."
+for script in "$PROJECT_ROOT"/bin/*; do
+  [[ -f "$script" ]] || continue
+  if file "$script" | grep -q "shell script"; then
+    bash -n "$script"
+  fi
+done
+
 echo "  ✅ CLI tool passed all functional tests!"
 echo "🎉 CLI tests passed successfully!"

@@ -23,10 +23,10 @@ export PATH="$TEST_HOME/.local/bin:$PATH"
 mkdir -p "$TEST_HOME/.config/omarchy/defaults"
 mkdir -p "$TEST_HOME/.local/bin"
 
-# Test Case 1: User chose Antigravity as default (marked with antigravity.default)
-echo "  ▶ Test Case 1: Hook restores gemini when user opted in..."
+# Test Case 1: System update reset agent file, but user opted into Antigravity
+echo "  ▶ Test Case 1: Hook restores gemini when agent file was wiped..."
 touch "$TEST_HOME/.config/omarchy/antigravity.default"
-echo "claude" > "$TEST_HOME/.config/omarchy/defaults/agent"
+rm -f "$TEST_HOME/.config/omarchy/defaults/agent"
 
 # Simulate shell.json
 cat <<'EOF' > "$TEST_HOME/.config/omarchy/shell.json"
@@ -69,15 +69,20 @@ fi
 
 echo "  ✅ Test Case 1 passed!"
 
-# Test Case 2: User explicitly changed default agent to another agent (no antigravity.default)
+# Test Case 2: User explicitly switched default agent to another agent (e.g. claude)
 echo "  ▶ Test Case 2: Hook does NOT overwrite user configuration without consent..."
-rm -f "$TEST_HOME/.config/omarchy/antigravity.default"
-echo "custom-agent" > "$AGENT_FILE"
+touch "$TEST_HOME/.config/omarchy/antigravity.default"
+echo "claude" > "$AGENT_FILE"
 
 bash "$HOOK_SRC"
 
-if [[ "$(cat "$AGENT_FILE")" != "custom-agent" ]]; then
+if [[ "$(cat "$AGENT_FILE")" != "claude" ]]; then
   echo "❌ Assertion failed: hook overwrote user default agent without consent!" >&2
+  exit 1
+fi
+
+if [[ -f "$TEST_HOME/.config/omarchy/antigravity.default" ]]; then
+  echo "❌ Assertion failed: hook did not remove antigravity.default when user chose another agent." >&2
   exit 1
 fi
 

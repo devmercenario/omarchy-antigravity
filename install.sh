@@ -150,11 +150,15 @@ echo "🖥️  Setting up interactive status bar & 1-click authentication..."
 if [[ ! -d "$USER_PLUGIN_DIR" ]]; then
   if command -v omarchy-plugin-clone >/dev/null 2>&1; then
     omarchy-plugin-clone omarchy.agents >/dev/null 2>&1 || true
+  elif [[ -d "/usr/share/omarchy/shell/plugins/agents" ]]; then
+    mkdir -p "$USER_PLUGIN_DIR"
+    cp -r /usr/share/omarchy/shell/plugins/agents/* "$USER_PLUGIN_DIR/" 2>/dev/null || true
   fi
 fi
 
 if [[ -d "$USER_PLUGIN_DIR" ]]; then
   cp -f "$SCRIPT_DIR/ui/Panel.qml" "$USER_PLUGIN_DIR/Panel.qml"
+  cp -f "$SCRIPT_DIR/ui/Main.qml" "$USER_PLUGIN_DIR/Main.qml"
   mkdir -p "$USER_PLUGIN_DIR/assets"
   cp -f "$SCRIPT_DIR/assets/antigravity.svg" "$USER_PLUGIN_DIR/assets/"
   cp -f "$SCRIPT_DIR/assets/antigravity-light.svg" "$USER_PLUGIN_DIR/assets/"

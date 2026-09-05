@@ -97,6 +97,20 @@ omarchy-antigravity refresh
 
 ---
 
+## 🔀 Dynamic Default Agent Switching
+
+Antigravity is completely optional and non-intrusive:
+- **Switch anytime**: You can change your default agent whenever you like:
+  ```bash
+  omarchy default agent claude
+  # or
+  omarchy default agent gemini   # switches back to Antigravity
+  ```
+- **Real-Time Bar Sync**: The status bar panel automatically watches `~/.config/omarchy/defaults/agent`. When you switch default agents, the bar icon and panel immediately switch their active target to reflect your chosen agent without restarting the shell.
+- **Update Safety**: System updates via `omarchy update` will **never** overwrite your chosen default agent back to Antigravity if you have switched to another provider.
+
+---
+
 ## ⚙️ How It Works Under the Hood
 
 1. **Quota Extraction**:

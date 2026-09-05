@@ -207,7 +207,7 @@ class TestLocalStats(unittest.TestCase):
         now_ms = time.time() * 1000
         lines = [
             json.dumps({"timestamp": now_ms, "prompt": "test 1"}),
-            json.dumps({"timestamp": now_ms - 3600000, "prompt": "test 2"}),
+            json.dumps({"timestamp": now_ms - 5000, "prompt": "test 2"}),
             "corrupted line",
             ""
         ]

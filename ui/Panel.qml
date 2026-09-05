@@ -32,7 +32,7 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.updateDefaultAgent(text())
+    onLoaded: root.updateDefaultAgent(typeof text === "function" ? text() : text)
     onLoadFailed: root.defaultAgentName = ""
   }
 

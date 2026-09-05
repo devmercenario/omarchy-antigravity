@@ -38,8 +38,9 @@ omarchy-antigravity/
 ├── hooks/
 │   └── post-update.d/
 │       └── 90-antigravity.hook          # Omarchy update hook to ensure persistence
-└── ui/
-    └── Panel.qml                       # Enhanced Agents panel (status bar warning & 1-click login)
+├── ui/
+│   ├── Main.qml                        # Usage discovery & dynamic default agent watcher
+│   └── Panel.qml                       # Enhanced Agents panel (status bar warning & 1-click login)
 ```
 
 ---

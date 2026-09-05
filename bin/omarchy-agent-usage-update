@@ -31,7 +31,7 @@ for script in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
   collectors["$id"]="$script"
 done
 
-for script in "$HOME/.local/bin/omarchy-agent-usage-*; do
+for script in "$HOME"/.local/bin/omarchy-agent-usage-*; do
   [[ -x "$script" ]] || continue
   name=$(basename "$script")
   id="${name#omarchy-agent-usage-}"
