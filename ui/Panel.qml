@@ -100,19 +100,6 @@ Panel {
     root.close()
   }
 
-  function providerAuthCommand(p) {
-    if (!p) return ""
-    var id = String(p.providerId || "")
-    if (id === "antigravity" || id === "gemini") {
-      return "omarchy-launch-tui --app-id=org.omarchy.agent agy"
-    } else if (id === "claude") {
-      return "omarchy-launch-tui --app-id=org.omarchy.agent claude auth login"
-    } else if (id === "codex") {
-      return "omarchy-launch-tui --app-id=org.omarchy.agent codex"
-    }
-    return ""
-  }
-
   // ---------------------------------------------------------------- limits
   //
   // Both providers report the same two shapes: a short rolling session window
@@ -609,7 +596,7 @@ Panel {
 
               Button {
                 id: authActionBtn
-                visible: root.providerAuthCommand(root.provider) !== ""
+                visible: !!root.provider && (root.provider.providerId === "antigravity" || root.provider.providerId === "gemini")
                 anchors.verticalCenter: parent.verticalCenter
                 text: "Sign In"
                 iconText: "󰌑"
@@ -617,9 +604,8 @@ Panel {
                 foreground: root.foreground
                 accent: root.urgent
                 onClicked: {
-                  var cmd = root.providerAuthCommand(root.provider)
-                  if (root.bar && cmd !== "") {
-                    root.bar.run(cmd)
+                  if (root.bar) {
+                    root.bar.run("omarchy-launch-tui --app-id=org.omarchy.agent agy")
                   }
                   root.close()
                 }
