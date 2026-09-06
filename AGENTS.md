@@ -24,6 +24,7 @@ omarchy-antigravity/
 ├── AGENTS.md                           # Technical reference for AI agents and maintainers
 ├── LICENSE                             # MIT License
 ├── manifest.json                       # Official Omarchy shell plugin manifest (devmercenario.antigravity)
+├── preview.png                         # Root visual preview for Omarchy Marketplace listing
 ├── Service.qml                         # Omarchy background service for periodic checks and IPC
 ├── install.sh                          # Automated idempotent installer
 ├── uninstall.sh                        # Clean uninstaller that restores system defaults
