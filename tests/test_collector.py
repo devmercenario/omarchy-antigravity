@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -32,10 +33,13 @@ class TestQuotaParsing(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self.orig_retry_delay = collector.RETRY_DELAY_SECONDS
+        collector.RETRY_DELAY_SECONDS = 0
         collector.CACHE_DIR = self.temp_dir
         collector.CACHE_FILE = os.path.join(self.temp_dir, "test-limits.json")
 
     def tearDown(self):
+        collector.RETRY_DELAY_SECONDS = self.orig_retry_delay
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     @patch("urllib.request.urlopen")
@@ -110,9 +114,106 @@ class TestQuotaParsing(unittest.TestCase):
         # Verify disk cache written
         self.assertTrue(os.path.exists(collector.CACHE_FILE))
 
+    @patch("urllib.request.urlopen")
+    def test_fetch_authoritative_limits_retry_success(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "groups": [{
+                "displayName": "GEMINI MODELS",
+                "buckets": [{
+                    "displayName": "Five Hour Limit",
+                    "window": "5h",
+                    "remainingFraction": 0.80,
+                    "resetTime": "2026-09-04T18:00:00Z"
+                }]
+            }]
+        }).encode("utf-8")
+        mock_response.__enter__.return_value = mock_response
+
+        # Fails first attempt, succeeds on second attempt
+        mock_urlopen.side_effect = [urllib.error.URLError("Temporary network blip"), mock_response]
+
+        limits = collector.fetch_authoritative_limits("fake-token")
+        self.assertEqual(len(limits), 1)
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_authoritative_limits_retry_exhausted(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Persistent connection failure")
+
+        with self.assertRaises(urllib.error.URLError):
+            collector.fetch_authoritative_limits("fake-token")
+
+        # 1 initial + 2 retries = 3 attempts
+        self.assertEqual(mock_urlopen.call_count, 3)
+
 
 class TestKeyringAndAuthentication(unittest.TestCase):
-    """Test keyring extraction, validation, and token refresh."""
+    """Test token extraction from file and keyring, validation, and token refresh."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_token_file = collector.TOKEN_FILE
+        self.test_token_file = os.path.join(self.temp_dir, "test-oauth-token")
+        collector.TOKEN_FILE = self.test_token_file
+
+    def tearDown(self):
+        collector.TOKEN_FILE = self.orig_token_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_get_token_from_file_found(self):
+        sample_data = {
+            "token": {
+                "access_token": "file-access-token",
+                "refresh_token": "file-refresh-token",
+                "expiry": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            }
+        }
+        with open(self.test_token_file, "w", encoding="utf-8") as f:
+            json.dump(sample_data, f)
+
+        data, err = collector.get_token_from_file()
+        self.assertIsNotNone(data)
+        self.assertEqual(err, "")
+        self.assertEqual(data["token"]["access_token"], "file-access-token")
+
+    def test_get_token_from_file_missing(self):
+        data, err = collector.get_token_from_file()
+        self.assertIsNone(data)
+        self.assertIn("Token file not found", err)
+
+    def test_get_token_from_file_corrupt(self):
+        with open(self.test_token_file, "w", encoding="utf-8") as f:
+            f.write("invalid json content {")
+        data, err = collector.get_token_from_file()
+        self.assertIsNone(data)
+        self.assertIn("Failed to read token file", err)
+
+    def test_get_credentials_prefers_file(self):
+        sample_data = {"token": {"access_token": "file-tok"}}
+        with open(self.test_token_file, "w", encoding="utf-8") as f:
+            json.dump(sample_data, f)
+
+        data, source, err = collector.get_credentials()
+        self.assertEqual(source, "file")
+        self.assertEqual(data["token"]["access_token"], "file-tok")
+        self.assertEqual(err, "")
+
+    @patch("collector.get_token_from_keyring")
+    def test_get_credentials_fallback_keyring(self, mock_keyring):
+        mock_keyring.return_value = ({"token": {"access_token": "keyring-tok"}}, "")
+        data, source, err = collector.get_credentials()
+        self.assertEqual(source, "keyring")
+        self.assertEqual(data["token"]["access_token"], "keyring-tok")
+        self.assertEqual(err, "")
+
+    def test_save_token_to_file(self):
+        sample_data = {"token": {"access_token": "new-token"}}
+        collector.save_token_to_file(sample_data)
+        self.assertTrue(os.path.exists(self.test_token_file))
+        with open(self.test_token_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["token"]["access_token"], "new-token")
 
     @patch("subprocess.check_output")
     def test_get_token_from_keyring_found(self, mock_subp):
@@ -144,33 +245,33 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         self.assertIsNone(data)
         self.assertIn("Failed to read keyring", err)
 
-    @patch("collector.get_token_from_keyring")
-    def test_get_valid_access_token_valid(self, mock_keyring):
+    @patch("collector.get_credentials")
+    def test_get_valid_access_token_valid(self, mock_cred):
         future_exp = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-        mock_keyring.return_value = ({
+        mock_cred.return_value = ({
             "token": {
                 "access_token": "valid-token",
                 "refresh_token": "refresh-token",
                 "expiry": future_exp
             }
-        }, "")
+        }, "file", "")
 
         token, err = collector.get_valid_access_token()
         self.assertEqual(token, "valid-token")
         self.assertEqual(err, "")
 
-    @patch("subprocess.Popen")
+    @patch("collector.save_token_to_file")
     @patch("urllib.request.urlopen")
-    @patch("collector.get_token_from_keyring")
-    def test_get_valid_access_token_refreshes_expired(self, mock_keyring, mock_urlopen, mock_popen):
+    @patch("collector.get_credentials")
+    def test_get_valid_access_token_refreshes_expired(self, mock_cred, mock_urlopen, mock_save):
         past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        mock_keyring.return_value = ({
+        mock_cred.return_value = ({
             "token": {
                 "access_token": "expired-token",
                 "refresh_token": "valid-refresh-token",
                 "expiry": past_exp
             }
-        }, "")
+        }, "file", "")
 
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps({
@@ -180,13 +281,10 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         mock_resp.__enter__.return_value = mock_resp
         mock_urlopen.return_value = mock_resp
 
-        mock_proc = MagicMock()
-        mock_proc.communicate.return_value = (b"", b"")
-        mock_popen.return_value = mock_proc
-
         token, err = collector.get_valid_access_token()
         self.assertEqual(token, "new-refreshed-token")
         self.assertEqual(err, "")
+        mock_save.assert_called_once()
 
 
 class TestLocalStats(unittest.TestCase):
@@ -309,6 +407,32 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(record["usageStatusText"], "")
             self.assertEqual(record["tierLabel"], "Pro · developer@example.com")
             self.assertEqual(len(record["limits"]), 1)
+
+    @patch("shutil.which")
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_cached_user_email")
+    @patch("collector.get_valid_access_token")
+    def test_main_quota_failure_sets_error_and_empty_limits(self, mock_auth, mock_email, mock_limits, mock_which):
+        mock_which.return_value = "/usr/bin/agy"
+        mock_auth.return_value = ("valid-token", "")
+        mock_email.return_value = "developer@example.com"
+        mock_limits.side_effect = urllib.error.URLError("Quota endpoint down")
+
+        # Put a stale cache file in place to ensure it is NOT used when quota fails
+        with open(collector.CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"limits": [{"title": "Stale Gemini", "percent": 0.5}], "fetchedAt": 1000}, f)
+
+        with patch("builtins.print") as mock_print:
+            collector.main(argv=["--force"])
+            mock_print.assert_called_once()
+            output_str = mock_print.call_args[0][0]
+            record = json.loads(output_str)
+
+            self.assertEqual(record["schemaVersion"], 1)
+            self.assertEqual(record["id"], "antigravity")
+            self.assertEqual(record["usageStatusText"], "Quota unavailable")
+            self.assertIn("Failed to retrieve quota after 3 attempts", record["authHelpText"])
+            self.assertEqual(record["limits"], [])
 
 
 if __name__ == "__main__":

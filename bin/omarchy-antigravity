@@ -31,15 +31,31 @@ case "$cmd" in
     ;;
   status)
     echo "Checking Antigravity credentials..."
-    raw=$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)
-    if [[ -z "$raw" ]]; then
+    token_file="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+    auth_found=""
+    if [[ -f "$token_file" && -s "$token_file" ]]; then
+      auth_found="token file ($token_file)"
+    else
+      raw=$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)
+      if [[ -n "$raw" ]]; then
+        auth_found="system keyring"
+      fi
+    fi
+
+    if [[ -z "$auth_found" ]]; then
       echo "Status: ❌ Not authenticated"
       echo "Run 'omarchy-antigravity auth' to authenticate."
       exit 0
     fi
-    echo "Status: ✅ Authenticated in system keyring"
+    echo "Status: ✅ Authenticated via $auth_found"
+    collector=""
     if [[ -x "$HOME/.local/bin/omarchy-agent-usage-antigravity" ]]; then
-      "$HOME/.local/bin/omarchy-agent-usage-antigravity" --force | jq . 2>/dev/null || true
+      collector="$HOME/.local/bin/omarchy-agent-usage-antigravity"
+    elif [[ -x "$(dirname "$0")/omarchy-agent-usage-antigravity" ]]; then
+      collector="$(dirname "$0")/omarchy-agent-usage-antigravity"
+    fi
+    if [[ -n "$collector" ]]; then
+      "$collector" --force | jq . 2>/dev/null || true
     fi
     ;;
   refresh|update)

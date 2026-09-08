@@ -179,8 +179,15 @@ echo "📊 Fetching initial quota and metrics..."
 
 # 8. Check authentication state
 echo ""
-RAW_TOKEN=$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)
-if [[ -z "$RAW_TOKEN" ]]; then
+TOKEN_FILE="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+IS_AUTH=false
+if [[ -f "$TOKEN_FILE" && -s "$TOKEN_FILE" ]]; then
+  IS_AUTH=true
+elif [[ -n "$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)" ]]; then
+  IS_AUTH=true
+fi
+
+if [[ "$IS_AUTH" == false ]]; then
   echo "⚠️  Antigravity is not authenticated yet."
   echo "👉 A warning indicator will appear on your bar."
   echo "👉 You can click 'Sign In' in the bar panel or run:"
