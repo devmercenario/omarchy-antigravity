@@ -25,10 +25,26 @@ QUOTA_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveU
 CACHE_DIR = os.path.expanduser("~/.cache/omarchy/agent-usage")
 CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-limits.json")
 USER_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-user.json")
+STATE_DIR = os.path.expanduser("~/.local/state/omarchy/agents/usage")
+STATE_FILE = os.path.join(STATE_DIR, "antigravity.json")
 CACHE_TTL_SECONDS = 30
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 2
+
+
+def is_agy_running():
+    """Check via OS process table (pgrep) if at least one agy process is active."""
+    try:
+        res = subprocess.run(
+            ["pgrep", "-x", "agy"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
+        return res.returncode == 0
+    except Exception:
+        return True
 
 
 def ensure_dir(path):
@@ -406,9 +422,15 @@ def collect_local_stats():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Collect Antigravity usage record")
-    parser.add_argument("--force", action="store_true", help="Bypass probe cache")
+    parser.add_argument("--force", action="store_true", help="Bypass probe cache and active session check")
     parser.add_argument("--limits-only", action="store_true", help="Prioritize speed/cache")
     args = parser.parse_args(argv)
+
+    # When not forced and an existing state file already exists, only query remote servers
+    # if there is at least one active 'agy' session running on the machine.
+    if not args.force and os.path.exists(STATE_FILE) and not is_agy_running():
+        sys.stderr.write("omarchy-agent-usage-antigravity: no active agy session running; skipping update\n")
+        return 0
 
     limits = None
     email = ""

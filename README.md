@@ -104,13 +104,15 @@ Antigravity is completely optional and non-intrusive:
 
 ## ⚙️ How It Works Under the Hood
 
-1. **Quota Extraction**:
-   The collector [`omarchy-agent-usage-antigravity`](bin/omarchy-agent-usage-antigravity) securely reads the Google Cloud Code OAuth token from your system keyring via `secret-tool`. If expired, it automatically refreshes it with Google OAuth endpoints, fetches authoritative bucket quotas from Google's Cloud Code internal API, and calculates local prompt metrics from `~/.gemini/antigravity-cli/history.jsonl`.
-2. **Default Agent Dispatch**:
+1. **Dual-Source Credential & Quota Extraction**:
+   The collector [`omarchy-agent-usage-antigravity`](bin/omarchy-agent-usage-antigravity) securely resolves Google Cloud Code credentials by checking `~/.gemini/antigravity-cli/antigravity-oauth-token` first, falling back to the system keyring via `secret-tool`. If tokens are expiring, it auto-refreshes them with Google OAuth endpoints. It retrieves quota buckets from Google's internal Cloud Code endpoint, and automatically falls back to `agy -p /usage` if the API or keyring is temporarily unavailable. Local prompt metrics and active session counts are parsed from `~/.gemini/antigravity-cli/history.jsonl` and `brain/`.
+2. **Session-Aware Refresh & Low-Latency Cache**:
+   To eliminate unnecessary network requests and idle disk writes, the collector inspects the OS process table (`pgrep -x agy`) and only queries remote servers when at least one active Antigravity session is running (or when `--force` is requested via manual refresh). While active, Quickshell polls every 60 seconds with a 30-second cache TTL, and an optional systemd timer (`omarchy-agent-usage.timer`) keeps state refreshed on disk in the background.
+3. **Default Agent Dispatch**:
    Installs `gemini` in `~/.local/bin/` as an executable shim that runs `agy --dangerously-skip-permissions "$@"`. Sets `~/.config/omarchy/defaults/agent` to `gemini`.
-3. **Bar Widget & Status Alerts**:
+4. **Bar Widget & Status Alerts**:
    Integrates into the Quickshell bar. When quota is low or when authentication is missing, the bar button triggers an urgent visual alert.
-4. **Update Hook**:
+5. **Update Hook**:
    Drops `90-antigravity.hook` into `~/.config/omarchy/hooks/post-update.d/` so every time you run `omarchy update`, your default agent and widgets remain active.
 
 ---

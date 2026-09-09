@@ -496,6 +496,49 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(len(record["limits"]), 1)
             self.assertEqual(record["limits"][0]["percent"], 0.42)
 
+    @patch("subprocess.run")
+    def test_is_agy_running_detection(self, mock_run):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_run.return_value = mock_proc
+        self.assertTrue(collector.is_agy_running())
+
+        mock_proc.returncode = 1
+        self.assertFalse(collector.is_agy_running())
+
+    @patch("collector.is_agy_running")
+    @patch("os.path.exists")
+    def test_main_skips_when_no_active_session_and_state_exists(self, mock_exists, mock_running):
+        mock_exists.side_effect = lambda path: True if path == collector.STATE_FILE else False
+        mock_running.return_value = False
+
+        with patch("builtins.print") as mock_print, patch("sys.stderr.write") as mock_stderr:
+            result = collector.main(argv=[])
+            self.assertEqual(result, 0)
+            mock_print.assert_not_called()
+            mock_stderr.assert_called()
+            self.assertIn("no active agy session running", mock_stderr.call_args[0][0])
+
+    @patch("collector.is_agy_running")
+    @patch("os.path.exists")
+    @patch("shutil.which")
+    @patch("collector.get_valid_access_token")
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_cached_user_email")
+    def test_main_forced_bypasses_session_check(self, mock_email, mock_limits, mock_auth, mock_which, mock_exists, mock_running):
+        mock_exists.side_effect = lambda path: True if path == collector.STATE_FILE else False
+        mock_running.return_value = False
+        mock_which.return_value = "/usr/bin/agy"
+        mock_auth.return_value = ("token", "")
+        mock_email.return_value = "user@example.com"
+        mock_limits.return_value = []
+
+        with patch("builtins.print") as mock_print:
+            collector.main(argv=["--force"])
+            mock_print.assert_called_once()
+            record = json.loads(mock_print.call_args[0][0])
+            self.assertEqual(record["id"], "antigravity")
+
 
 if __name__ == "__main__":
     unittest.main()

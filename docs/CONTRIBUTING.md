@@ -54,11 +54,13 @@ omarchy-antigravity/
 ┌──────────────────────────────────────────────┐
 │       Google Antigravity CLI ('agy')         │
 └──────────────────────┬───────────────────────┘
-                       │ Writes OAuth credentials on login
+                       │ 1. Writes token to file ~/.gemini/.../antigravity-oauth-token
+                       │ 2. Writes credentials to Secret Service keyring
                        ▼
 ┌──────────────────────────────────────────────┐
-│  Linux Secret Service (System Keyring)       │
-│  service: gemini  |  username: antigravity   │
+│  Credential Resolution Order                 │
+│  1. File: ~/.gemini/.../antigravity-oauth-token│
+│  2. Keyring: service gemini, user antigravity│
 └──────────────────────┬───────────────────────┘
                        │ Reads access/refresh tokens
                        ▼
@@ -66,16 +68,17 @@ omarchy-antigravity/
 │  bin/omarchy-agent-usage-antigravity         │
 │  1. Check token expiry (refresh if needed)   │
 │  2. Fetch POST /v1internal:retrieveQuota     │
+│     └─ Fallback: `agy -p /usage` on failure  │
 │  3. Read local history (~/.gemini/...)       │
 │  4. Emit JSON to stdout                      │
 └──────────────────────┬───────────────────────┘
-                       │ Writes atomic record
+                       │ Writes atomic record (TTL: 30s)
                        ▼
 ┌──────────────────────────────────────────────┐
 │  ~/.local/state/omarchy/agents/usage/        │
 │  antigravity.json                            │
 └──────────────────────┬───────────────────────┘
-                       │ Watched by FileView in QML
+                       │ Watched by FileView in QML (60s timer)
                        ▼
 ┌──────────────────────────────────────────────┐
 │  Omarchy Bar Widget & Agents Dashboard       │
@@ -85,22 +88,17 @@ omarchy-antigravity/
 └──────────────────────────────────────────────┘
 ```
 
-### 3.1. Keyring Credential Extraction
-- **Lookup Command**:
-  ```bash
-  secret-tool lookup service gemini username antigravity
-  ```
-- **Structure**: JSON object containing:
-  ```json
-  {
-    "token": {
-      "access_token": "ya29...",
-      "refresh_token": "1//0...",
-      "token_type": "Bearer",
-      "expiry": "2026-09-04T13:45:00.000Z"
-    }
-  }
-  ```
+### 3.1. Credential Resolution (File & Keyring)
+The collector resolves authentication tokens in order:
+1. **Token File (Primary)**:
+   - Path: `~/.gemini/antigravity-cli/antigravity-oauth-token`
+   - Format: JSON object containing `"token"` key with `access_token`, `refresh_token`, and `expiry`.
+2. **Keyring (Fallback)**:
+   - Lookup Command:
+     ```bash
+     secret-tool lookup service gemini username antigravity
+     ```
+   - Same JSON structure.
 
 ### 3.2. Automatic OAuth2 Token Refresh
 If `access_token` is expired or within 120 seconds of expiration:
@@ -110,13 +108,16 @@ If `access_token` is expired or within 120 seconds of expiration:
   - `client_secret`: `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`
   - `grant_type`: `refresh_token`
   - `refresh_token`: `<stored_refresh_token>`
-- **Storage**: Updates the system keyring via:
-  ```bash
-  secret-tool store --label="Password for 'antigravity' on 'gemini'" service gemini username antigravity
-  ```
+- **Storage**: Updates both the token file (if present) and the system keyring via `secret-tool store`.
 
-### 3.3. Authoritative Quota Endpoint
-- **URL**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+### 3.3. Authoritative Quota Endpoint & CLI Fallback
+- **Primary Endpoint**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+- **CLI Fallback (`agy -p /usage`)**: If the API call fails or credentials are not yet initialized, the collector runs `agy -p /usage` and parses the tabular output:
+  ```tsv
+  Gemini Models	Weekly Limit Remaining	27%	2026-09-10T18:37:23Z
+  Gemini Models	Five Hour Limit Remaining	52%	2026-09-09T03:56:17Z
+  ```
+- **Cache TTL**: In-memory cache is persisted to `~/.cache/omarchy/agent-usage/antigravity-limits.json` with a 30-second TTL (`CACHE_TTL_SECONDS = 30`) to balance responsiveness and rate-limiting.
 - **Headers**:
   - `Authorization: Bearer <access_token>`
   - `Content-Type: application/json`
@@ -238,6 +239,19 @@ Antigravity is designed as a first-class, **optional** agent that coexists with 
   - If set to `gemini` or `antigravity`: `Panel.qml` switches to Antigravity, displaying Gemini/Claude quota windows and prompt metrics.
   - Right-clicking the bar button executes `omarchy-agent --pick`, which always invokes the user's current default agent.
   - In the panel tab strip, users can still click or middle-click to browse any other enabled provider tabs.
+
+### 5.4. Multi-Provider Runner & Refresh Cadence
+- **Multi-Collector Runner (`omarchy-agent-usage-update`)**:
+  - Scans both `/usr/share/omarchy/bin/omarchy-agent-usage-*` and `~/.local/bin/omarchy-agent-usage-*` to execute all available collectors.
+  - Supports `--limits-only` (rapid quota polling), `--force` (cache bypass), and `--except <id>` (skip providers disabled in `shell.json`).
+  - Writes atomically to `~/.local/state/omarchy/agents/usage/<id>.json` using temporary files and `jq` validation before replacement.
+- **Refresh Intervals**:
+  - `ui/Main.qml` defaults to `refreshIntervalSec: 60` (1 minute), configurable in `shell.json`.
+  - The optional systemd user service and timer (`omarchy-agent-usage.service` / `.timer`) run every minute (`OnUnitActiveSec=1m`) to guarantee background freshness regardless of desktop shell state.
+- **Session-Aware Inactivity Suspension**:
+  - The collector checks `pgrep -x agy` before polling remote Google endpoints. If no active Antigravity session is found in the OS process table and a local state file already exists, it cleanly exits with code 0 without stdout output.
+  - This prevents unnecessary network bandwidth, quota polling, and disk writes when the agent is idle.
+  - Manual refreshes (`--force`) bypass this check to provide on-demand sync anytime.
 
 ---
 
