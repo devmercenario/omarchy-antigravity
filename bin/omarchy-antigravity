@@ -11,6 +11,7 @@ Usage: omarchy-antigravity <command>
 
 Commands:
   auth, login     Launch Antigravity authentication in a terminal
+  run [args...]   Execute Antigravity CLI (agy) using normal permission model
   status          Show current token, authentication state, and quotas
   refresh, update Force refresh quotas and update Omarchy bar widget
   help            Show this help message
@@ -21,6 +22,10 @@ EOF
 cmd="${1:-status}"
 
 case "$cmd" in
+  run)
+    shift
+    exec agy "$@"
+    ;;
   auth|login)
     echo "Launching Antigravity authentication..."
     if command -v omarchy-launch-tui >/dev/null 2>&1; then

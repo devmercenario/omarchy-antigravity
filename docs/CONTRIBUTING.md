@@ -36,8 +36,7 @@ omarchy-antigravity/
 ├── bin/
 │   ├── omarchy-agent-usage-antigravity # Python collector for Google Cloud Code / Antigravity quota
 │   ├── omarchy-agent-usage-update      # Multi-provider runner (unifies /usr/share and ~/.local/bin)
-│   ├── omarchy-antigravity             # User CLI helper (auth | status | refresh | help)
-│   └── gemini                          # Executable shim: agy --dangerously-skip-permissions "$@"
+│   └── omarchy-antigravity             # User CLI helper (run | auth | status | refresh | help)
 ├── hooks/
 │   └── post-update.d/
 │       └── 90-antigravity.hook          # Omarchy update hook to ensure persistence
@@ -277,13 +276,14 @@ The test runner executes:
    - Validates `manifest.json` against Omarchy's official `omarchy-plugin-validate` registry schema.
 3. **Installer & Uninstaller Lifecycle** (`tests/test_installer.sh`):
    - Executes `install.sh` and `uninstall.sh` in an isolated sandbox environment.
-   - Verifies all binaries are copied with `+x` permissions to `~/.local/bin`.
-   - Verifies `defaults/agent` is set to `gemini`.
+   - Verifies all plugin-specific binaries are copied with `+x` permissions to `~/.local/bin`.
+   - Verifies non-conflicting behavior (no hijacking of generic `gemini` executable).
+   - Verifies `defaults/agent` is set to `antigravity`.
    - Verifies `shell.json` enables the `antigravity` provider.
-   - Verifies `uninstall.sh` removes binaries, cache, state, and cleans up cleanly.
+   - Verifies `uninstall.sh` removes binaries, cache, state, and restores system defaults.
 4. **Post-Update Hook Persistence** (`tests/test_hook.sh`):
    - Simulates `omarchy update` having modified user defaults.
-   - Executes `90-antigravity.hook` to verify automatic restoration of the agent shim and shell settings.
+   - Executes `90-antigravity.hook` to verify automatic restoration of settings without creating conflicting shims.
 5. **CLI Functional Commands** (`tests/test_cli.sh`):
    - Verifies `omarchy-antigravity help`, `status`, and invalid command handling.
 

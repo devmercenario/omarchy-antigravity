@@ -64,7 +64,7 @@ echo "  ▶ Testing install.sh in isolated environment..."
 "$PROJECT_ROOT/install.sh" >/dev/null 2>&1
 
 # Assert installed binaries
-for bin in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-antigravity gemini; do
+for bin in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-antigravity; do
   target="$TEST_HOME/.local/bin/$bin"
   if [[ ! -x "$target" ]]; then
     echo "❌ Assertion failed: $target was not installed or is not executable." >&2
@@ -72,10 +72,16 @@ for bin in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-an
   fi
 done
 
+# Assert non-conflicting: gemini shim should NOT be installed
+if [[ -f "$TEST_HOME/.local/bin/gemini" ]]; then
+  echo "❌ Assertion failed: gemini shim should not be installed." >&2
+  exit 1
+fi
+
 # Assert default agent configuration
 AGENT_FILE="$TEST_HOME/.config/omarchy/defaults/agent"
-if [[ ! -f "$AGENT_FILE" ]] || [[ "$(cat "$AGENT_FILE")" != "gemini" ]]; then
-  echo "❌ Assertion failed: $AGENT_FILE is not set to gemini." >&2
+if [[ ! -f "$AGENT_FILE" ]] || [[ "$(cat "$AGENT_FILE")" != "antigravity" ]]; then
+  echo "❌ Assertion failed: $AGENT_FILE is not set to antigravity." >&2
   exit 1
 fi
 
@@ -100,7 +106,7 @@ echo "  ▶ Testing uninstall.sh in isolated environment..."
 "$PROJECT_ROOT/uninstall.sh" >/dev/null 2>&1
 
 # Assert binaries removed
-if [[ -f "$TEST_HOME/.local/bin/omarchy-agent-usage-antigravity" ]] || [[ -f "$TEST_HOME/.local/bin/gemini" ]]; then
+if [[ -f "$TEST_HOME/.local/bin/omarchy-agent-usage-antigravity" ]] || [[ -f "$TEST_HOME/.local/bin/omarchy-antigravity" ]]; then
   echo "❌ Assertion failed: binaries were not removed during uninstall." >&2
   exit 1
 fi

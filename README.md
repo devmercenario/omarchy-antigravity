@@ -7,7 +7,7 @@
 
 Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://omarchy.org/) Linux:
 - 📊 **Real-time Quota Meters**: 5-hour session and weekly limits for Gemini and Claude/GPT model groups directly in the Omarchy bar panel.
-- ⚡ **Default Agent Shim**: Launch Antigravity anywhere via Omarchy hotkey (`SUPER + SHIFT + CTRL + A`), terminal (`omarchy agent`), or right-clicking the bar icon.
+- ⚡ **Agent Integration**: Dedicated CLI helper `omarchy-antigravity` and dashboard support for default agent routing.
 - 🔔 **Status Bar Warnings**: The bar icon lights up in warning color with a tooltip when authentication is required or expired.
 - 🔑 **1-Click Authentication**: Interactive **"Sign In"** button in the dashboard opens a floating terminal to log in to Google immediately.
 - 🔄 **Auto-Persistence**: Includes an `omarchy update` hook so your setup never gets wiped during system upgrades.
@@ -35,11 +35,11 @@ Before installing, ensure the following dependencies are available on your syste
 - **[Google Antigravity CLI (`agy`)](https://antigravity.google/download#antigravity-cli)**: The official Antigravity CLI installed in your `PATH` (see [Installation & Download](https://antigravity.google/download#antigravity-cli)).
 - **`libsecret` (`secret-tool`)**: Used by Antigravity and this plugin to securely read OAuth tokens from the desktop Secret Service keyring.
   ```bash
-  sudo pacman -S libsecret
+  omarchy pkg add libsecret
   ```
 - **`jq`**: JSON processor used for parsing manifests and shell configs.
   ```bash
-  sudo pacman -S jq
+  omarchy pkg add jq
   ```
 - **`python3`**: Python 3.10+ standard library runtime (pre-installed on Arch Linux).
 
@@ -76,6 +76,9 @@ omarchy plugin add https://github.com/devmercenario/omarchy-antigravity.git --en
 This package includes a handy `omarchy-antigravity` helper:
 
 ```bash
+# Run Antigravity CLI using normal permission model
+omarchy-antigravity run
+
 # Check status, token in keyring, and live quotas
 omarchy-antigravity status
 
@@ -95,7 +98,7 @@ Antigravity is completely optional and non-intrusive:
   ```bash
   omarchy default agent claude
   # or
-  omarchy default agent gemini   # switches back to Antigravity
+  omarchy default agent antigravity
   ```
 - **Real-Time Bar Sync**: The status bar panel automatically watches `~/.config/omarchy/defaults/agent`. When you switch default agents, the bar icon and panel immediately switch their active target to reflect your chosen agent without restarting the shell.
 - **Update Safety**: System updates via `omarchy update` will **never** overwrite your chosen default agent back to Antigravity if you have switched to another provider.
@@ -108,8 +111,8 @@ Antigravity is completely optional and non-intrusive:
    The collector [`omarchy-agent-usage-antigravity`](bin/omarchy-agent-usage-antigravity) securely resolves Google Cloud Code credentials by checking `~/.gemini/antigravity-cli/antigravity-oauth-token` first, falling back to the system keyring via `secret-tool`. If tokens are expiring, it auto-refreshes them with Google OAuth endpoints. It retrieves quota buckets from Google's internal Cloud Code endpoint, and automatically falls back to `agy -p /usage` if the API or keyring is temporarily unavailable. Local prompt metrics and active session counts are parsed from `~/.gemini/antigravity-cli/history.jsonl` and `brain/`.
 2. **Session-Aware Refresh & Low-Latency Cache**:
    To eliminate unnecessary network requests and idle disk writes, the collector inspects the OS process table (`pgrep -x agy`) and only queries remote servers when at least one active Antigravity session is running (or when `--force` is requested via manual refresh). While active, Quickshell polls every 60 seconds with a 30-second cache TTL, and an optional systemd timer (`omarchy-agent-usage.timer`) keeps state refreshed on disk in the background.
-3. **Default Agent Dispatch**:
-   Installs `gemini` in `~/.local/bin/` as an executable shim that runs `agy --dangerously-skip-permissions "$@"`. Sets `~/.config/omarchy/defaults/agent` to `gemini`.
+3. **Dedicated CLI & Standard Permission Model**:
+   Ships a plugin-specific `omarchy-antigravity` executable in `~/.local/bin/` providing `run`, `auth`, `status`, and `refresh` subcommands. Executes `agy` using its standard permission model without bypassing permission prompts.
 4. **Bar Widget & Status Alerts**:
    Integrates into the Quickshell bar. When quota is low or when authentication is missing, the bar button triggers an urgent visual alert.
 5. **Update Hook**:

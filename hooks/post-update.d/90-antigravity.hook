@@ -16,20 +16,15 @@ if [[ -f "$AGENT_FILE" ]]; then
   fi
 elif [[ -f "$CONFIG_DIR/antigravity.default" ]]; then
   mkdir -p "$CONFIG_DIR/defaults"
-  echo "gemini" > "$AGENT_FILE"
+  echo "antigravity" > "$AGENT_FILE"
 fi
 
-# 2. Ensure gemini shim exists in ~/.local/bin
-mkdir -p "$HOME/.local/bin"
-if [[ ! -x "$HOME/.local/bin/gemini" ]]; then
-  cat <<'EOF' > "$HOME/.local/bin/gemini"
-#!/bin/bash
-exec agy --dangerously-skip-permissions "$@"
-EOF
-  chmod +x "$HOME/.local/bin/gemini"
+# Clean up legacy gemini permission-bypass shim if present
+if [[ -f "$HOME/.local/bin/gemini" ]] && grep -q -- '--dangerously-skip-permissions' "$HOME/.local/bin/gemini" 2>/dev/null; then
+  rm -f "$HOME/.local/bin/gemini"
 fi
 
-# 3. Ensure shell.json has antigravity enabled
+# 2. Ensure shell.json has antigravity enabled
 SHELL_CONFIG="$CONFIG_DIR/shell.json"
 if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
   tmp=$(mktemp)
@@ -44,7 +39,7 @@ if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
   ' "$SHELL_CONFIG" > "$tmp" && mv "$tmp" "$SHELL_CONFIG"
 fi
 
-# 4. Trigger quota refresh
+# 3. Trigger quota refresh
 if [[ -x "$HOME/.local/bin/omarchy-agent-usage-update" ]]; then
   "$HOME/.local/bin/omarchy-agent-usage-update" --limits-only antigravity >/dev/null 2>&1 || true
 fi

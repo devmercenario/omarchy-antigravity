@@ -15,8 +15,12 @@ echo "🗑️  Uninstalling Antigravity Integration for Omarchy..."
 
 # 1. Remove binaries
 rm -f "$BIN_DIR/omarchy-agent-usage-antigravity" \
-      "$BIN_DIR/omarchy-antigravity" \
-      "$BIN_DIR/gemini"
+      "$BIN_DIR/omarchy-antigravity"
+
+# If a legacy gemini permission-bypass shim exists from a prior install, clean it up safely
+if [[ -f "$BIN_DIR/gemini" ]] && grep -q -- '--dangerously-skip-permissions' "$BIN_DIR/gemini" 2>/dev/null; then
+  rm -f "$BIN_DIR/gemini"
+fi
 
 # 2. Remove hook
 rm -f "$HOOK_FILE"
@@ -29,9 +33,9 @@ rm -f "$STATE_FILE" \
 # 4. Remove default agent selection if Antigravity was default
 rm -f "$CONFIG_DIR/antigravity.default"
 
-# Restore previous agent backup if one exists, or remove if it was gemini
+# Restore previous agent backup if one exists, or remove if it was antigravity/gemini
 AGENT_FILE="$CONFIG_DIR/defaults/agent"
-if [[ -f "$AGENT_FILE" ]] && [[ "$(cat "$AGENT_FILE")" == "gemini" ]]; then
+if [[ -f "$AGENT_FILE" ]] && [[ "$(cat "$AGENT_FILE")" =~ ^(antigravity|gemini)$ ]]; then
   LATEST_BAK=$(find "$CONFIG_DIR/defaults" -name "agent.bak.*" 2>/dev/null | sort -V | tail -n 1)
   if [[ -n "$LATEST_BAK" && -f "$LATEST_BAK" ]]; then
     mv "$LATEST_BAK" "$AGENT_FILE"

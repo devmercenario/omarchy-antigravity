@@ -61,7 +61,7 @@ done
 
 if (( ${#MISSING_DEPS[@]} > 0 )); then
   echo "❌ Missing required dependencies: ${MISSING_DEPS[*]}" >&2
-  echo "Please install them via: sudo pacman -S ${MISSING_DEPS[*]}" >&2
+  echo "Please install them via: omarchy pkg add ${MISSING_DEPS[*]}" >&2
   exit 1
 fi
 
@@ -73,14 +73,25 @@ fi
 # 2. Install executable binaries to ~/.local/bin
 echo "📦 Installing binaries to $BIN_DIR..."
 mkdir -p "$BIN_DIR"
-cp -f "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" "$BIN_DIR/"
-cp -f "$SCRIPT_DIR/bin/omarchy-agent-usage-update" "$BIN_DIR/"
-cp -f "$SCRIPT_DIR/bin/omarchy-antigravity" "$BIN_DIR/"
-cp -f "$SCRIPT_DIR/bin/gemini" "$BIN_DIR/"
-chmod +x "$BIN_DIR/omarchy-agent-usage-antigravity" \
-         "$BIN_DIR/omarchy-agent-usage-update" \
-         "$BIN_DIR/omarchy-antigravity" \
-         "$BIN_DIR/gemini"
+for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
+               "$SCRIPT_DIR/bin/omarchy-agent-usage-update" \
+               "$SCRIPT_DIR/bin/omarchy-antigravity"; do
+  bin_name=$(basename "$bin_src")
+  target="$BIN_DIR/$bin_name"
+  # Refuse to replace non-regular files or paths not owned by this plugin
+  if [[ -e "$target" && ! -f "$target" ]]; then
+    echo "⚠️  Skipping $target: non-regular file exists at destination." >&2
+    continue
+  fi
+  cp -f "$bin_src" "$target"
+  chmod +x "$target"
+done
+
+# Safely clean up legacy gemini permission-bypass shim from prior versions
+if [[ -f "$BIN_DIR/gemini" ]] && grep -q -- '--dangerously-skip-permissions' "$BIN_DIR/gemini" 2>/dev/null; then
+  echo "🧹 Cleaning up legacy gemini permission-bypass shim..."
+  rm -f "$BIN_DIR/gemini"
+fi
 
 # Ensure ~/.local/bin is in PATH for current subshell
 export PATH="$BIN_DIR:$PATH"
@@ -98,15 +109,15 @@ elif [[ "$SET_DEFAULT" == "no" ]]; then
   should_set_default=false
 elif (( ASSUME_YES )); then
   should_set_default=true
-elif [[ -n "$CURRENT_AGENT" && "$CURRENT_AGENT" != "gemini" ]]; then
+elif [[ -n "$CURRENT_AGENT" && "$CURRENT_AGENT" != "antigravity" ]]; then
   echo ""
   echo "ℹ️  Current default agent is: '$CURRENT_AGENT'"
   if command -v gum >/dev/null 2>&1 && [[ -t 0 ]]; then
-    if gum confirm "Would you like to set Antigravity (gemini) as your default Omarchy agent?"; then
+    if gum confirm "Would you like to set Antigravity as your default Omarchy agent?"; then
       should_set_default=true
     fi
   elif [[ -t 0 ]]; then
-    read -r -p "Would you like to set Antigravity (gemini) as your default agent? [y/N]: " ans
+    read -r -p "Would you like to set Antigravity as your default agent? [y/N]: " ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
       should_set_default=true
     fi
@@ -116,11 +127,11 @@ else
 fi
 
 if [[ "$should_set_default" == true ]]; then
-  echo "⚙️  Setting default agent to Antigravity (gemini)..."
-  if [[ -f "$AGENT_FILE" && "$CURRENT_AGENT" != "gemini" ]]; then
+  echo "⚙️  Setting default agent to Antigravity..."
+  if [[ -f "$AGENT_FILE" && "$CURRENT_AGENT" != "antigravity" ]]; then
     cp "$AGENT_FILE" "$AGENT_FILE.bak.$(date +%s)"
   fi
-  echo "gemini" > "$AGENT_FILE"
+  echo "antigravity" > "$AGENT_FILE"
   touch "$CONFIG_DIR/antigravity.default"
 else
   echo "ℹ️  Keeping '$CURRENT_AGENT' as default agent."

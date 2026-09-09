@@ -27,7 +27,7 @@ mkdir -p "$TEST_HOME/.config/omarchy/defaults"
 mkdir -p "$TEST_HOME/.local/bin"
 
 # Test Case 1: System update reset agent file, but user opted into Antigravity
-echo "  ▶ Test Case 1: Hook restores gemini when agent file was wiped..."
+echo "  ▶ Test Case 1: Hook restores antigravity when agent file was wiped..."
 touch "$TEST_HOME/.config/omarchy/antigravity.default"
 rm -f "$TEST_HOME/.config/omarchy/defaults/agent"
 
@@ -53,14 +53,14 @@ EOF
 bash "$HOOK_SRC"
 
 AGENT_FILE="$TEST_HOME/.config/omarchy/defaults/agent"
-if [[ ! -f "$AGENT_FILE" ]] || [[ "$(cat "$AGENT_FILE")" != "gemini" ]]; then
-  echo "❌ Assertion failed: hook did not restore defaults/agent to gemini when consented." >&2
+if [[ ! -f "$AGENT_FILE" ]] || [[ "$(cat "$AGENT_FILE")" != "antigravity" ]]; then
+  echo "❌ Assertion failed: hook did not restore defaults/agent to antigravity when consented." >&2
   exit 1
 fi
 
 SHIM_FILE="$TEST_HOME/.local/bin/gemini"
-if [[ ! -x "$SHIM_FILE" ]]; then
-  echo "❌ Assertion failed: hook did not restore ~/.local/bin/gemini shim." >&2
+if [[ -f "$SHIM_FILE" ]]; then
+  echo "❌ Assertion failed: hook should not create a gemini shim." >&2
   exit 1
 fi
 
