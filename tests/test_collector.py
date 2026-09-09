@@ -370,14 +370,23 @@ class TestMainExecutionScenarios(unittest.TestCase):
         self.orig_cache_dir = collector.CACHE_DIR
         self.orig_cache_file = collector.CACHE_FILE
         self.orig_user_cache = collector.USER_CACHE_FILE
+        self.orig_state_dir = collector.STATE_DIR
+        self.orig_state_file = collector.STATE_FILE
         collector.CACHE_DIR = self.temp_dir
         collector.CACHE_FILE = os.path.join(self.temp_dir, "limits.json")
         collector.USER_CACHE_FILE = os.path.join(self.temp_dir, "user.json")
+        # Point the state file at a path that does not exist yet, so the
+        # session-suspension early return is never triggered by a pre-existing
+        # state file on the developer/CI machine.
+        collector.STATE_DIR = self.temp_dir
+        collector.STATE_FILE = os.path.join(self.temp_dir, "state.json")
 
     def tearDown(self):
         collector.CACHE_DIR = self.orig_cache_dir
         collector.CACHE_FILE = self.orig_cache_file
         collector.USER_CACHE_FILE = self.orig_user_cache
+        collector.STATE_DIR = self.orig_state_dir
+        collector.STATE_FILE = self.orig_state_file
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     @patch("shutil.which")
