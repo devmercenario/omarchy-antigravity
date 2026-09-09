@@ -11,11 +11,20 @@ mkdir -p "$STATE_DIR"
 force=""
 limits_only=""
 agents=()
+declare -A excluded
 
 while (( $# > 0 )); do
   case "$1" in
     --force) force="--force"; shift ;;
     --limits-only) limits_only="--limits-only"; shift ;;
+    --except)
+      if (( $# > 1 )); then
+        excluded["$2"]=1
+        shift 2
+      else
+        shift
+      fi
+      ;;
     *) agents+=("$1"); shift ;;
   esac
 done
@@ -39,17 +48,19 @@ for script in "$HOME"/.local/bin/omarchy-agent-usage-*; do
   collectors["$id"]="$script"
 done
 
-# If specific agents were requested, filter by them
+# If specific agents were requested, filter by them; otherwise run all non-excluded
 target_ids=()
 if (( ${#agents[@]} > 0 )); then
   for id in "${agents[@]}"; do
-    if [[ -n "${collectors[$id]:-}" ]]; then
+    if [[ -n "${collectors[$id]:-}" && -z "${excluded[$id]:-}" ]]; then
       target_ids+=("$id")
     fi
   done
 else
   for id in "${!collectors[@]}"; do
-    target_ids+=("$id")
+    if [[ -z "${excluded[$id]:-}" ]]; then
+      target_ids+=("$id")
+    fi
   done
 fi
 

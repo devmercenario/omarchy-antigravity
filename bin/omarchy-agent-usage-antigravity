@@ -7,6 +7,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,7 @@ QUOTA_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveU
 CACHE_DIR = os.path.expanduser("~/.cache/omarchy/agent-usage")
 CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-limits.json")
 USER_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-user.json")
-CACHE_TTL_SECONDS = 60
+CACHE_TTL_SECONDS = 30
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 2
@@ -291,6 +292,64 @@ def fetch_authoritative_limits(access_token):
     return limits
 
 
+def fetch_limits_via_agy():
+    if shutil.which("agy") is None:
+        return None
+    try:
+        res = subprocess.run(
+            ["agy", "-p", "/usage"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10
+        )
+        if res.returncode != 0:
+            return None
+        lines = res.stdout.strip().splitlines()
+        parsed_items = []
+        for line in lines:
+            m = re.search(r'(Gemini Models|Claude and GPT models)\s+(Weekly|Five Hour)\s+Limit Remaining\s+(\d+)%\s+(\S+)', line)
+            if m:
+                group, window, pct, reset = m.groups()
+                rem_frac = int(pct) / 100.0
+                used_pct = round(max(0.0, min(1.0, 1.0 - rem_frac)), 4)
+                if group == 'Gemini Models':
+                    prefix = "Gemini"
+                    group_priority = 0
+                else:
+                    prefix = "Claude/GPT"
+                    group_priority = 1
+
+                if window == "Five Hour":
+                    label = "Session"
+                    title = f"{prefix} (5h)"
+                    window_priority = 0
+                else:
+                    label = "Weekly"
+                    title = f"{prefix} (Weekly)"
+                    window_priority = 1
+
+                parsed_items.append((group_priority, window_priority, {
+                    "title": title,
+                    "label": label,
+                    "percent": used_pct,
+                    "resetsAt": reset
+                }))
+        if parsed_items:
+            parsed_items.sort(key=lambda x: (x[0], x[1]))
+            limits = [item[2] for item in parsed_items]
+            ensure_dir(CACHE_DIR)
+            try:
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"limits": limits, "fetchedAt": time.time()}, f)
+            except Exception:
+                pass
+            return limits
+    except Exception as e:
+        sys.stderr.write(f"omarchy-agent-usage-antigravity: agy -p /usage error: {e}\n")
+    return None
+
+
 def collect_local_stats():
     now = datetime.now().astimezone()
     today_str = now.strftime("%Y-%m-%d")
@@ -375,14 +434,20 @@ def main(argv=None):
                 limits = fetch_authoritative_limits(access_token)
             except Exception as e:
                 sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to fetch quota after retries: {e}\n")
-                limits = []
-                status_text = "Quota unavailable"
-                auth_help = f"Failed to retrieve quota after 3 attempts: {e}"
+                limits = fetch_limits_via_agy()
+                if not limits:
+                    status_text = "Quota unavailable"
+                    auth_help = f"Failed to retrieve quota: {e}"
     else:
-        limits = []
-        if not status_text:
-            status_text = "Waiting for auth"
-            auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+        if limits is None:
+            limits = fetch_limits_via_agy()
+        if not limits:
+            if not status_text:
+                status_text = "Waiting for auth"
+                auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+
+    if not email and (access_token or limits):
+        email = get_cached_user_email(None)
 
     local_stats = collect_local_stats()
     now_iso = datetime.now(timezone.utc).isoformat()

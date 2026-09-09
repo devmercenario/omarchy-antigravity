@@ -1,6 +1,6 @@
-# 🤖 AGENTS.md — Contributor & AI Agent Engineering Guide
+# 🛠️ Contributing & Engineering Guide
 
-> **Scope**: This document is the authoritative engineering manual for AI agents (and human engineers) extending or maintaining the `omarchy-antigravity` project. Read this before modifying or proposing architectural changes.
+> **Scope**: This document is the technical architecture manual for contributors extending or maintaining the `omarchy-antigravity` project.
 
 ---
 
@@ -21,7 +21,8 @@
 ```
 omarchy-antigravity/
 ├── README.md                           # Public documentation & user guide
-├── AGENTS.md                           # Technical reference for AI agents and maintainers
+├── docs/
+│   └── CONTRIBUTING.md                 # Technical architecture manual for contributors
 ├── LICENSE                             # MIT License
 ├── manifest.json                       # Official Omarchy shell plugin manifest (devmercenario.antigravity)
 ├── preview.png                         # Root visual preview for Omarchy Marketplace listing
@@ -289,7 +290,7 @@ Every push and pull request to `main` automatically triggers `.github/workflows/
 
 ---
 
-## 7. Roadmap & Potential Improvements for Future Agents
+## 7. Roadmap & Potential Improvements
 
 - [ ] **Native Dedicated Bar Widget**:
   Add an alternative standalone widget (`bar-widget` in `manifest.json`) for users who want an isolated Antigravity icon with circular quota rings instead of grouping inside `omarchy.agents`.

@@ -147,6 +147,38 @@ class TestQuotaParsing(unittest.TestCase):
         # 1 initial + 2 retries = 3 attempts
         self.assertEqual(mock_urlopen.call_count, 3)
 
+    @patch("shutil.which")
+    @patch("subprocess.run")
+    def test_fetch_limits_via_agy_success(self, mock_run, mock_which):
+        mock_which.return_value = "/usr/bin/agy"
+        mock_proc = MagicMock()
+        mock_proc.return_code = 0
+        mock_proc.stdout = (
+            "Gemini Models\tWeekly Limit Remaining\t40%\t2026-09-10T18:37:23Z\n"
+            "Gemini Models\tFive Hour Limit Remaining\t58%\t2026-09-08T22:56:17Z\n"
+            "Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-09-15T21:20:15Z\n"
+            "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-09T02:20:15Z\n"
+        )
+        mock_proc.returncode = 0
+        mock_run.return_value = mock_proc
+
+        limits = collector.fetch_limits_via_agy()
+        self.assertIsNotNone(limits)
+        self.assertEqual(len(limits), 4)
+        self.assertEqual(limits[0]["title"], "Gemini (5h)")
+        self.assertEqual(limits[0]["percent"], 0.42)
+        self.assertEqual(limits[1]["title"], "Gemini (Weekly)")
+        self.assertEqual(limits[1]["percent"], 0.6)
+        self.assertEqual(limits[2]["title"], "Claude/GPT (5h)")
+        self.assertEqual(limits[2]["percent"], 0.0)
+        self.assertEqual(limits[3]["title"], "Claude/GPT (Weekly)")
+        self.assertEqual(limits[3]["percent"], 0.0)
+
+    @patch("shutil.which")
+    def test_fetch_limits_via_agy_not_installed(self, mock_which):
+        mock_which.return_value = None
+        self.assertIsNone(collector.fetch_limits_via_agy())
+
 
 class TestKeyringAndAuthentication(unittest.TestCase):
     """Test token extraction from file and keyring, validation, and token refresh."""
@@ -365,10 +397,12 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertIn("not found in PATH", record["authHelpText"])
 
     @patch("shutil.which")
+    @patch("collector.fetch_limits_via_agy")
     @patch("collector.get_valid_access_token")
-    def test_main_unauthenticated_state(self, mock_auth, mock_which):
+    def test_main_unauthenticated_state(self, mock_auth, mock_agy, mock_which):
         mock_which.return_value = "/usr/bin/agy"
         mock_auth.return_value = (None, "No Antigravity credentials found in keyring")
+        mock_agy.return_value = None
 
         with patch("builtins.print") as mock_print:
             collector.main(argv=[])
@@ -409,14 +443,16 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(len(record["limits"]), 1)
 
     @patch("shutil.which")
+    @patch("collector.fetch_limits_via_agy")
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
     @patch("collector.get_valid_access_token")
-    def test_main_quota_failure_sets_error_and_empty_limits(self, mock_auth, mock_email, mock_limits, mock_which):
+    def test_main_quota_failure_sets_error_and_empty_limits(self, mock_auth, mock_email, mock_limits, mock_agy, mock_which):
         mock_which.return_value = "/usr/bin/agy"
         mock_auth.return_value = ("valid-token", "")
         mock_email.return_value = "developer@example.com"
         mock_limits.side_effect = urllib.error.URLError("Quota endpoint down")
+        mock_agy.return_value = None
 
         # Put a stale cache file in place to ensure it is NOT used when quota fails
         with open(collector.CACHE_FILE, "w", encoding="utf-8") as f:
@@ -431,8 +467,34 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(record["schemaVersion"], 1)
             self.assertEqual(record["id"], "antigravity")
             self.assertEqual(record["usageStatusText"], "Quota unavailable")
-            self.assertIn("Failed to retrieve quota after 3 attempts", record["authHelpText"])
+            self.assertIn("Failed to retrieve quota", record["authHelpText"])
             self.assertEqual(record["limits"], [])
+
+    @patch("shutil.which")
+    @patch("collector.fetch_limits_via_agy")
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_cached_user_email")
+    @patch("collector.get_valid_access_token")
+    def test_main_quota_failure_falls_back_to_agy(self, mock_auth, mock_email, mock_limits, mock_agy, mock_which):
+        mock_which.return_value = "/usr/bin/agy"
+        mock_auth.return_value = ("valid-token", "")
+        mock_email.return_value = "developer@example.com"
+        mock_limits.side_effect = urllib.error.URLError("Quota endpoint down")
+        mock_agy.return_value = [
+            {"title": "Gemini (5h)", "label": "Session", "percent": 0.42, "resetsAt": "2026-09-08T22:56:17Z"}
+        ]
+
+        with patch("builtins.print") as mock_print:
+            collector.main(argv=["--force"])
+            mock_print.assert_called_once()
+            output_str = mock_print.call_args[0][0]
+            record = json.loads(output_str)
+
+            self.assertEqual(record["schemaVersion"], 1)
+            self.assertEqual(record["id"], "antigravity")
+            self.assertEqual(record["usageStatusText"], "")
+            self.assertEqual(len(record["limits"]), 1)
+            self.assertEqual(record["limits"][0]["percent"], 0.42)
 
 
 if __name__ == "__main__":

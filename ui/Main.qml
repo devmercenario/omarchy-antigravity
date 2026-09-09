@@ -131,7 +131,7 @@ Item {
 
   // -------------------------------------------------------------- refresh
 
-  property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
+  property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 60)))
   property string pendingUpdateKind: ""
 
   Timer {
@@ -161,7 +161,8 @@ Item {
   }
 
   function updateCommand(kind, agentIds) {
-    var command = ["omarchy-agent-usage-update"]
+    var updateScript = home + "/.local/bin/omarchy-agent-usage-update"
+    var command = [updateScript]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}
