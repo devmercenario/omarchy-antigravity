@@ -14,6 +14,7 @@ SHELL_CONFIG="$CONFIG_DIR/shell.json"
 
 ASSUME_YES=0
 SET_DEFAULT=""
+INSTALL_STATUSLINE=""
 
 while (( $# > 0 )); do
   case "$1" in
@@ -29,6 +30,14 @@ while (( $# > 0 )); do
       SET_DEFAULT="no"
       shift
       ;;
+    -s|--statusline|--with-statusline)
+      INSTALL_STATUSLINE="yes"
+      shift
+      ;;
+    --no-statusline)
+      INSTALL_STATUSLINE="no"
+      shift
+      ;;
     -h|--help)
       cat <<EOF
 Usage: ./install.sh [options]
@@ -37,6 +46,8 @@ Options:
   -y, --yes          Automatic yes to prompts (non-interactive)
   --set-default      Explicitly set Antigravity as the default Omarchy agent
   --no-default       Keep existing default agent intact
+  -s, --statusline   Install/enable theme-aware status bar for Antigravity CLI (agy)
+  --no-statusline    Do not configure status bar for Antigravity CLI
   -h, --help         Show this help message
 EOF
       exit 0
@@ -75,7 +86,8 @@ echo "📦 Installing binaries to $BIN_DIR..."
 mkdir -p "$BIN_DIR"
 for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
                "$SCRIPT_DIR/bin/omarchy-agent-usage-update" \
-               "$SCRIPT_DIR/bin/omarchy-antigravity"; do
+               "$SCRIPT_DIR/bin/omarchy-antigravity" \
+               "$SCRIPT_DIR/bin/omarchy-antigravity-statusline"; do
   bin_name=$(basename "$bin_src")
   target="$BIN_DIR/$bin_name"
   # Refuse to replace non-regular files or paths not owned by this plugin
@@ -178,17 +190,72 @@ if [[ -d "$USER_PLUGIN_DIR" ]]; then
   fi
 fi
 
-# 6. Install Post-Update Hook (persists across omarchy update)
+# 6. Configure Antigravity CLI (agy) bottom status bar
+should_install_statusline=false
+if [[ "$INSTALL_STATUSLINE" == "yes" ]]; then
+  should_install_statusline=true
+elif [[ "$INSTALL_STATUSLINE" == "no" ]]; then
+  should_install_statusline=false
+elif (( ASSUME_YES )); then
+  should_install_statusline=true
+else
+  echo ""
+  if command -v gum >/dev/null 2>&1 && [[ -t 0 ]]; then
+    if gum confirm "Would you like to install the Omarchy status bar for Antigravity CLI (agy)?"; then
+      should_install_statusline=true
+    fi
+  elif [[ -t 0 ]]; then
+    read -r -p "Would you like to install the Omarchy status bar for Antigravity CLI (agy)? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      should_install_statusline=true
+    fi
+  fi
+fi
+
+if [[ "$should_install_statusline" == true ]]; then
+  echo "📊 Configuring Antigravity CLI status bar..."
+  AGY_CLI_DIR="$HOME/.gemini/antigravity-cli"
+  mkdir -p "$AGY_CLI_DIR"
+  if [[ -f "$AGY_CLI_DIR/statusline.sh" && ! -f "$AGY_CLI_DIR/statusline.sh.bak" ]]; then
+    cp "$AGY_CLI_DIR/statusline.sh" "$AGY_CLI_DIR/statusline.sh.bak" 2>/dev/null || true
+  fi
+  cp -f "$SCRIPT_DIR/bin/omarchy-antigravity-statusline" "$AGY_CLI_DIR/statusline.sh"
+  chmod +x "$AGY_CLI_DIR/statusline.sh"
+
+  AGY_SETTINGS="$AGY_CLI_DIR/settings.json"
+  if [[ -f "$AGY_SETTINGS" ]]; then
+    cp "$AGY_SETTINGS" "$AGY_SETTINGS.bak.$(date +%s)"
+    tmp=$(mktemp)
+    jq --arg script "$AGY_CLI_DIR/statusline.sh" '
+      .statusLine = {
+        "type": "command",
+        "command": $script,
+        "enabled": true
+      }
+    ' "$AGY_SETTINGS" > "$tmp" && mv "$tmp" "$AGY_SETTINGS"
+  else
+    jq -n --arg script "$AGY_CLI_DIR/statusline.sh" '{
+      "statusLine": {
+        "type": "command",
+        "command": $script,
+        "enabled": true
+      }
+    }' > "$AGY_SETTINGS"
+  fi
+  echo "✅ Antigravity CLI status bar configured!"
+fi
+
+# 7. Install Post-Update Hook (persists across omarchy update)
 echo "🔄 Installing update persistence hook..."
 mkdir -p "$HOOKS_DIR"
 cp -f "$SCRIPT_DIR/hooks/post-update.d/90-antigravity.hook" "$HOOKS_DIR/90-antigravity.hook"
 chmod +x "$HOOKS_DIR/90-antigravity.hook"
 
-# 7. Collect initial usage metrics
+# 8. Collect initial usage metrics
 echo "📊 Fetching initial quota and metrics..."
 "$BIN_DIR/omarchy-agent-usage-update" --force antigravity >/dev/null 2>&1 || true
 
-# 8. Check authentication state
+# 9. Check authentication state
 echo ""
 TOKEN_FILE="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
 IS_AUTH=false

@@ -1,6 +1,6 @@
 #!/bin/bash
 # omarchy:summary=Antigravity integration helper for Omarchy
-# omarchy:args=[auth|status|refresh|help]
+# omarchy:args=[auth|status|refresh|statusline|help]
 # omarchy:group=agent
 
 set -euo pipefail
@@ -14,6 +14,7 @@ Commands:
   run [args...]   Execute Antigravity CLI (agy) using normal permission model
   status          Show current token, authentication state, and quotas
   refresh, update Force refresh quotas and update Omarchy bar widget
+  statusline      Manage Antigravity CLI status bar [status|enable|disable]
   help            Show this help message
 
 EOF
@@ -73,6 +74,60 @@ case "$cmd" in
       omarchy-shell ipc omarchy.agents refresh >/dev/null 2>&1 || true
     fi
     echo "Quota refreshed!"
+    ;;
+  statusline)
+    subcmd="${2:-status}"
+    agy_dir="$HOME/.gemini/antigravity-cli"
+    settings_file="$agy_dir/settings.json"
+    statusline_script="$agy_dir/statusline.sh"
+    case "$subcmd" in
+      status)
+        echo "Antigravity CLI Status Bar:"
+        if [[ -f "$statusline_script" ]]; then
+          echo "  Script: Installed ($statusline_script)"
+        else
+          echo "  Script: Not installed"
+        fi
+        if [[ -f "$settings_file" ]] && jq -e '.statusLine.enabled == true' "$settings_file" >/dev/null 2>&1; then
+          echo "  Status: ✅ Enabled"
+        else
+          echo "  Status: ❌ Disabled"
+        fi
+        ;;
+      enable)
+        mkdir -p "$agy_dir"
+        statusline_src=""
+        if [[ -x "$HOME/.local/bin/omarchy-antigravity-statusline" ]]; then
+          statusline_src="$HOME/.local/bin/omarchy-antigravity-statusline"
+        elif [[ -x "$(dirname "$0")/omarchy-antigravity-statusline" ]]; then
+          statusline_src="$(dirname "$0")/omarchy-antigravity-statusline"
+        fi
+        if [[ -n "$statusline_src" ]]; then
+          cp -f "$statusline_src" "$statusline_script"
+          chmod +x "$statusline_script"
+        fi
+        tmp=$(mktemp)
+        if [[ -f "$settings_file" ]]; then
+          jq --arg s "$statusline_script" '.statusLine = {"type":"command","command":$s,"enabled":true}' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
+        else
+          jq -n --arg s "$statusline_script" '{"statusLine":{"type":"command","command":$s,"enabled":true}}' > "$settings_file"
+        fi
+        echo "✅ Antigravity CLI status bar enabled!"
+        ;;
+      disable)
+        if [[ -f "$settings_file" ]]; then
+          tmp=$(mktemp)
+          jq '.statusLine.enabled = false' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
+          echo "✅ Antigravity CLI status bar disabled."
+        else
+          echo "Settings file not found."
+        fi
+        ;;
+      *)
+        echo "Usage: omarchy-antigravity statusline [status|enable|disable]"
+        exit 1
+        ;;
+    esac
     ;;
   help|--help|-h)
     usage

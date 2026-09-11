@@ -10,6 +10,7 @@ Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://oma
 - ⚡ **Agent Integration**: Dedicated CLI helper `omarchy-antigravity` and dashboard support for default agent routing.
 - 🔔 **Status Bar Warnings**: The bar icon lights up in warning color with a tooltip when authentication is required or expired.
 - 🔑 **1-Click Authentication**: Interactive **"Sign In"** button in the dashboard opens a floating terminal to log in to Google immediately.
+- 🎨 **Antigravity CLI Status Bar**: Dynamic Omarchy theme-aware bottom status bar for `agy` displaying active Git branch/diff, RTK token killer status (`⚡ RTK`), Shunt-Local status (`󰘚 SL`), and balanced clock.
 - 🔄 **Auto-Persistence**: Includes an `omarchy update` hook so your setup never gets wiped during system upgrades.
 - 🛡️ **Zero System Pollution**: Installs entirely in user-space (`~/.local/bin`, `~/.config/omarchy/`).
 
@@ -61,6 +62,7 @@ chmod +x install.sh
 **Installer Options**:
 - `./install.sh --set-default`: Explicitly set Antigravity as the default agent without prompting.
 - `./install.sh --no-default`: Install usage metrics and bar widget while keeping your existing default agent.
+- `./install.sh -s, --statusline`: Install and configure the dynamic theme status bar for Antigravity CLI (`agy`).
 - `./install.sh --yes`: Automatic non-interactive install.
 
 ### Option 2: Omarchy Plugin Manager
@@ -87,6 +89,11 @@ omarchy-antigravity auth
 
 # Force refresh quota from Google Cloud API and update the bar
 omarchy-antigravity refresh
+
+# Manage Antigravity CLI status bar (status, enable, disable)
+omarchy-antigravity statusline status
+omarchy-antigravity statusline enable
+omarchy-antigravity statusline disable
 ```
 
 ---

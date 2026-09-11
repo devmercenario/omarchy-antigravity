@@ -1,0 +1,214 @@
+#!/bin/bash
+# ==============================================================================
+# Omarchy Antigravity CLI Statusline
+# Dynamic theme-aware status bar for Antigravity CLI (agy)
+# ==============================================================================
+
+set -e
+
+INPUT=""
+if [ ! -t 0 ]; then
+    INPUT=$(cat)
+fi
+
+# Parse input from stdin (agy passes context JSON)
+if [ -n "$INPUT" ]; then
+    if [ -n "${OMARCHY_STATUSLINE_DEBUG:-}" ]; then
+        mkdir -p "$HOME/.gemini/antigravity-cli" 2>/dev/null || true
+        echo "$INPUT" > "$HOME/.gemini/antigravity-cli/last_statusline_input.json" 2>/dev/null || true
+    fi
+    CWD=$(echo "$INPUT" | jq -r ".cwd // empty" 2>/dev/null || true)
+    WIDTH=$(echo "$INPUT" | jq -r ".width // .terminal_width // .columns // empty" 2>/dev/null || true)
+fi
+
+CWD="${CWD:-$PWD}"
+
+if [ -z "$WIDTH" ] || [ "$WIDTH" = "null" ] || [ "$WIDTH" -le 0 ] 2>/dev/null; then
+    WIDTH=$(tput cols </dev/tty 2>/dev/null || true)
+fi
+if [ -z "$WIDTH" ] || [ "$WIDTH" = "null" ] || [ "$WIDTH" -le 0 ] 2>/dev/null; then
+    WIDTH=${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}
+fi
+
+BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null || true)
+if [ -z "$BRANCH" ]; then
+    BRANCH=$(git -C "$CWD" rev-parse --short HEAD 2>/dev/null || true)
+fi
+BRANCH="${BRANCH:-no-git}"
+FOLDER=$(basename "$CWD")
+
+# Load colors dynamically from active Omarchy theme
+OMARCHY_THEME_COLORS="$HOME/.local/state/omarchy/current/theme/colors.toml"
+
+# Default fallback colors (Tokyo Night)
+hex_mode="dark"
+hex_accent="7aa2f7"
+hex_darker_bg="0e0e14"
+hex_dark_bg="13141c"
+hex_bg="1a1b26"
+hex_lighter_bg="24283b"
+hex_fg="c0caf5"
+hex_green="9ece6a"
+hex_yellow="e0af68"
+hex_cyan="7aa2f7"
+
+if [ -f "$OMARCHY_THEME_COLORS" ]; then
+    got_fg=""
+    got_cyan=""
+    while IFS='= ' read -r k v; do
+        v="${v%\"}"
+        v="${v#\"}"
+        v="${v#\#}"
+        case "$k" in
+            mode) hex_mode="$v" ;;
+            accent) hex_accent="$v" ;;
+            darker_background) hex_darker_bg="$v" ;;
+            dark_background) hex_dark_bg="$v" ;;
+            background) hex_bg="$v" ;;
+            lighter_background) hex_lighter_bg="$v" ;;
+            bright_foreground|foreground) [ -z "$got_fg" ] && hex_fg="$v" && got_fg=1 ;;
+            green) hex_green="$v" ;;
+            yellow) hex_yellow="$v" ;;
+            cyan|blue) [ -z "$got_cyan" ] && hex_cyan="$v" && got_cyan=1 ;;
+        esac
+    done < "$OMARCHY_THEME_COLORS"
+fi
+
+# Convert 6-character hex to decimal RGB (e.g., "7aa2f7" -> "122;162;247")
+hex_to_rgb() {
+    local h="$1"
+    if [ ${#h} -ge 6 ]; then
+        printf "%d;%d;%d" "$((16#${h:0:2}))" "$((16#${h:2:2}))" "$((16#${h:4:2}))"
+    else
+        printf "122;162;247"
+    fi
+}
+
+calc_luminance() {
+    local h="$1"
+    if [ ${#h} -ge 6 ]; then
+        local r=$((16#${h:0:2}))
+        local g=$((16#${h:2:2}))
+        local b=$((16#${h:4:2}))
+        echo "$(( (299*r + 587*g + 114*b) / 1000 ))"
+    else
+        echo 128
+    fi
+}
+
+RGB_A_BG=$(hex_to_rgb "$hex_accent")
+ACCENT_LUM=$(calc_luminance "$hex_accent")
+if [ "$hex_mode" = "light" ] && [ "$ACCENT_LUM" -lt 140 ]; then
+    RGB_A_FG="255;255;255"
+else
+    RGB_A_FG=$(hex_to_rgb "$hex_darker_bg")
+fi
+
+RGB_B_BG=$(hex_to_rgb "$hex_lighter_bg")
+RGB_B_FG=$(hex_to_rgb "$hex_fg")
+
+RGB_C_BG=$(hex_to_rgb "$hex_dark_bg")
+RGB_C_FG=$(hex_to_rgb "$hex_fg")
+
+RGB_GREEN=$(hex_to_rgb "$hex_green")
+RGB_YELLOW=$(hex_to_rgb "$hex_yellow")
+RGB_CYAN=$(hex_to_rgb "$hex_cyan")
+
+# Git status indicators
+GIT_STATUS=$(git -C "$CWD" status --porcelain 2>/dev/null || true)
+ADDED=$(echo "$GIT_STATUS" | grep -c "^[MADRC]" 2>/dev/null || true)
+MODIFIED=$(echo "$GIT_STATUS" | grep -c "^.[MD]" 2>/dev/null || true)
+UNTRACKED=$(echo "$GIT_STATUS" | grep -c "^\?\?" 2>/dev/null || true)
+
+DIFF_STR=""
+[ "$ADDED" -gt 0 ] 2>/dev/null && DIFF_STR="${DIFF_STR} \033[38;2;${RGB_GREEN}m+${ADDED}\033[38;2;${RGB_C_FG}m"
+[ "$MODIFIED" -gt 0 ] 2>/dev/null && DIFF_STR="${DIFF_STR} \033[38;2;${RGB_YELLOW}m~${MODIFIED}\033[38;2;${RGB_C_FG}m"
+[ "$UNTRACKED" -gt 0 ] 2>/dev/null && DIFF_STR="${DIFF_STR} \033[38;2;${RGB_CYAN}m?${UNTRACKED}\033[38;2;${RGB_C_FG}m"
+
+# Section colors and powerline separators
+C_A_BG="\033[48;2;${RGB_A_BG}m"
+C_A_FG="\033[38;2;${RGB_A_FG}m"
+C_B_BG="\033[48;2;${RGB_B_BG}m"
+C_B_FG="\033[38;2;${RGB_B_FG}m"
+C_C_BG="\033[48;2;${RGB_C_BG}m"
+C_C_FG="\033[38;2;${RGB_C_FG}m"
+
+SEP_AB="\033[38;2;${RGB_A_BG};48;2;${RGB_B_BG}m"
+SEP_BC="\033[38;2;${RGB_B_BG};48;2;${RGB_C_BG}m"
+SEP_R1="\033[38;2;${RGB_B_BG};48;2;${RGB_C_BG}m"
+SEP_R2="\033[38;2;${RGB_A_BG};48;2;${RGB_B_BG}m"
+
+# Check RTK status (active & configured)
+RTK_STR=""
+if command -v rtk >/dev/null 2>&1; then
+    if [ -f "$HOME/.gemini/hooks/rtk-hook-gemini.sh" ] || \
+       ([ -f "$HOME/.gemini/settings.json" ] && grep -q "rtk" "$HOME/.gemini/settings.json" 2>/dev/null) || \
+       ([ -f "$HOME/.gemini/antigravity-cli/settings.json" ] && grep -q "rtk" "$HOME/.gemini/antigravity-cli/settings.json" 2>/dev/null); then
+        RTK_STR="⚡ RTK"
+    fi
+fi
+
+# Check Shunt-Local status (active & local server UP)
+SL_STR=""
+SL_CONFIG="$HOME/.config/shunt-local/config.json"
+if [ -f "$SL_CONFIG" ]; then
+    if [ -f "$HOME/.gemini/config/hooks.json" ] && grep -q "shunt-local" "$HOME/.gemini/config/hooks.json" 2>/dev/null; then
+        ENDPOINT=$(jq -r '.endpoint // empty' "$SL_CONFIG" 2>/dev/null || true)
+        SL_HOST="127.0.0.1"
+        SL_PORT="8080"
+        if [[ "$ENDPOINT" =~ ://([^:/]+):?([0-9]+)? ]]; then
+            [ -n "${BASH_REMATCH[1]}" ] && SL_HOST="${BASH_REMATCH[1]}"
+            [ -n "${BASH_REMATCH[2]}" ] && SL_PORT="${BASH_REMATCH[2]}"
+        fi
+        # Strictly sanitize host and port to prevent command injection
+        [[ "$SL_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] || SL_HOST="127.0.0.1"
+        [[ "$SL_PORT" =~ ^[0-9]+$ ]] || SL_PORT="8080"
+        if command -v timeout >/dev/null 2>&1; then
+            if timeout 0.1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$SL_HOST" "$SL_PORT" 2>/dev/null; then
+                SL_STR="󰘚 SL"
+            fi
+        fi
+    fi
+fi
+
+# Assemble right middle items (RTK, SL, Model) with clear spacing
+ITEMS=()
+[ -n "$RTK_STR" ] && ITEMS+=("$RTK_STR")
+[ -n "$SL_STR" ] && ITEMS+=("$SL_STR")
+ITEMS+=("Gemini")
+MID_TEXT=""
+for item in "${ITEMS[@]}"; do
+    if [ -z "$MID_TEXT" ]; then
+        MID_TEXT="$item"
+    else
+        MID_TEXT="${MID_TEXT}  ${item}"
+    fi
+done
+
+TIME=$(date +"%H:%M")
+
+LEFT_RAW="${C_A_BG}${C_A_FG}\033[1m 󰚩 AGY \033[0m${SEP_AB}${C_B_BG}${C_B_FG}  ${BRANCH} ${SEP_BC}${C_C_BG}${C_C_FG}  ${FOLDER}${DIFF_STR} "
+RIGHT_RAW="${SEP_R1}${C_B_BG}${C_B_FG} ${MID_TEXT} ${SEP_R2}${C_A_BG}${C_A_FG}\033[1m  ${TIME} \033[0m"
+
+# Accurately compute visible terminal display width (accounting for ANSI escapes & wide characters)
+display_width() {
+    local text="$1"
+    local clean_text
+    clean_text=$(printf "%b" "$text" | sed "s/\x1b\[[0-9;]*[a-zA-Z]//g")
+    local len=${#clean_text}
+    local wide_chars
+    wide_chars=$(echo -n "$clean_text" | grep -o "[⚡🧠🔀]" 2>/dev/null | wc -l || echo 0)
+    echo $(( len + wide_chars ))
+}
+
+LEN_L=$(display_width "$LEFT_RAW")
+LEN_R=$(display_width "$RIGHT_RAW")
+
+PAD_LEN=$(( WIDTH - LEN_L - LEN_R ))
+if [ "$PAD_LEN" -lt 1 ]; then
+    PAD_LEN=1
+fi
+
+PAD=$(printf "%*s" "$PAD_LEN" "")
+
+printf "%b" "${LEFT_RAW}${C_C_BG}${PAD}${RIGHT_RAW}"

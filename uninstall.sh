@@ -15,7 +15,21 @@ echo "🗑️  Uninstalling Antigravity Integration for Omarchy..."
 
 # 1. Remove binaries
 rm -f "$BIN_DIR/omarchy-agent-usage-antigravity" \
-      "$BIN_DIR/omarchy-antigravity"
+      "$BIN_DIR/omarchy-antigravity" \
+      "$BIN_DIR/omarchy-antigravity-statusline"
+
+# Clean up Antigravity CLI statusline if installed
+AGY_CLI_DIR="$HOME/.gemini/antigravity-cli"
+AGY_SETTINGS="$AGY_CLI_DIR/settings.json"
+if [[ -f "$AGY_SETTINGS" ]]; then
+  tmp=$(mktemp)
+  jq 'del(.statusLine)' "$AGY_SETTINGS" > "$tmp" 2>/dev/null && mv "$tmp" "$AGY_SETTINGS" || rm -f "$tmp"
+fi
+if [[ -f "$AGY_CLI_DIR/statusline.sh.bak" ]]; then
+  mv "$AGY_CLI_DIR/statusline.sh.bak" "$AGY_CLI_DIR/statusline.sh"
+else
+  rm -f "$AGY_CLI_DIR/statusline.sh"
+fi
 
 # If a legacy gemini permission-bypass shim exists from a prior install, clean it up safely
 if [[ -f "$BIN_DIR/gemini" ]] && grep -q -- '--dangerously-skip-permissions' "$BIN_DIR/gemini" 2>/dev/null; then

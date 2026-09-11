@@ -59,18 +59,29 @@ echo "agy mock"
 EOF
 chmod +x "$TEST_HOME/.local/bin/agy"
 
-# 1. Run install.sh
+# 1. Run install.sh with --statusline flag
 echo "  ▶ Testing install.sh in isolated environment..."
-"$PROJECT_ROOT/install.sh" >/dev/null 2>&1
+"$PROJECT_ROOT/install.sh" --statusline >/dev/null 2>&1
 
 # Assert installed binaries
-for bin in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-antigravity; do
+for bin in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-antigravity omarchy-antigravity-statusline; do
   target="$TEST_HOME/.local/bin/$bin"
   if [[ ! -x "$target" ]]; then
     echo "❌ Assertion failed: $target was not installed or is not executable." >&2
     exit 1
   fi
 done
+
+# Assert statusline script and settings.json configuration
+if [[ ! -x "$TEST_HOME/.gemini/antigravity-cli/statusline.sh" ]]; then
+  echo "❌ Assertion failed: statusline.sh was not installed to ~/.gemini/antigravity-cli/." >&2
+  exit 1
+fi
+
+if ! jq -e '.statusLine.enabled == true' "$TEST_HOME/.gemini/antigravity-cli/settings.json" >/dev/null 2>&1; then
+  echo "❌ Assertion failed: statusLine was not enabled in settings.json." >&2
+  exit 1
+fi
 
 # Assert non-conflicting: gemini shim should NOT be installed
 if [[ -f "$TEST_HOME/.local/bin/gemini" ]]; then
@@ -106,8 +117,21 @@ echo "  ▶ Testing uninstall.sh in isolated environment..."
 "$PROJECT_ROOT/uninstall.sh" >/dev/null 2>&1
 
 # Assert binaries removed
-if [[ -f "$TEST_HOME/.local/bin/omarchy-agent-usage-antigravity" ]] || [[ -f "$TEST_HOME/.local/bin/omarchy-antigravity" ]]; then
+if [[ -f "$TEST_HOME/.local/bin/omarchy-agent-usage-antigravity" ]] || \
+   [[ -f "$TEST_HOME/.local/bin/omarchy-antigravity" ]] || \
+   [[ -f "$TEST_HOME/.local/bin/omarchy-antigravity-statusline" ]]; then
   echo "❌ Assertion failed: binaries were not removed during uninstall." >&2
+  exit 1
+fi
+
+# Assert statusline script and settings removed
+if [[ -f "$TEST_HOME/.gemini/antigravity-cli/statusline.sh" ]]; then
+  echo "❌ Assertion failed: statusline.sh was not removed during uninstall." >&2
+  exit 1
+fi
+
+if jq -e '.statusLine' "$TEST_HOME/.gemini/antigravity-cli/settings.json" >/dev/null 2>&1; then
+  echo "❌ Assertion failed: statusLine was not deleted from settings.json during uninstall." >&2
   exit 1
 fi
 

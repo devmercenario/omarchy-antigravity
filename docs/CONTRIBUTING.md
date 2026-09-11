@@ -36,10 +36,19 @@ omarchy-antigravity/
 ├── bin/
 │   ├── omarchy-agent-usage-antigravity # Python collector for Google Cloud Code / Antigravity quota
 │   ├── omarchy-agent-usage-update      # Multi-provider runner (unifies /usr/share and ~/.local/bin)
-│   └── omarchy-antigravity             # User CLI helper (run | auth | status | refresh | help)
+│   ├── omarchy-antigravity             # User CLI helper (run | auth | status | refresh | statusline | help)
+│   └── omarchy-antigravity-statusline  # Dynamic theme-aware status bar for Antigravity CLI (agy)
 ├── hooks/
 │   └── post-update.d/
 │       └── 90-antigravity.hook          # Omarchy update hook to ensure persistence
+├── tests/                              # Automated test suites (unit, manifest, hook, installer, statusline)
+│   ├── run_tests.sh                    # Master test runner
+│   ├── test_collector.py               # Quota extraction & process polling unit tests
+│   ├── test_manifest.sh                # Schema & manifest validation
+│   ├── test_installer.sh               # Install & uninstall lifecycle tests
+│   ├── test_hook.sh                    # Post-update hook persistence tests
+│   ├── test_cli.sh                     # CLI commands & argument verification
+│   └── test_statusline.sh              # Status bar rendering, clock alignment, & detection tests
 ├── ui/
 │   ├── Main.qml                        # Usage discovery & dynamic default agent watcher
 │   └── Panel.qml                       # Enhanced Agents panel (status bar warning & 1-click login)
