@@ -9,6 +9,7 @@ from importlib.machinery import SourceFileLoader
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -622,6 +623,40 @@ class TestMainExecutionScenarios(unittest.TestCase):
             mock_print.assert_called_once()
             record = json.loads(mock_print.call_args[0][0])
             self.assertEqual(record["id"], "antigravity")
+
+    def test_save_private_json_permissions_and_atomicity(self):
+        target = os.path.join(self.temp_dir, "private-data.json")
+        collector.save_private_json(target, {"key": "secret_value"})
+        self.assertTrue(os.path.exists(target))
+        st = os.stat(target)
+        self.assertTrue(stat.S_ISREG(st.st_mode))
+        self.assertEqual(st.st_mode & 0o077, 0, "Private file must not have group or other permissions")
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.assertEqual(data.get("key"), "secret_value")
+
+    def test_ensure_dir_sets_0700_mode(self):
+        test_dir = os.path.join(self.temp_dir, "private_dir")
+        collector.ensure_dir(test_dir)
+        self.assertTrue(os.path.isdir(test_dir))
+        st = os.stat(test_dir)
+        self.assertEqual(st.st_mode & 0o077, 0, "Directory must have private 0700 permissions")
+
+    def test_get_cached_limits_descriptor_read(self):
+        cache_path = os.path.join(self.temp_dir, "limits-test.json")
+        orig_cache = collector.CACHE_FILE
+        collector.CACHE_FILE = cache_path
+        try:
+            collector.save_private_json(cache_path, {"limits": [{"title": "Cached 5h", "percent": 0.25}]})
+            cached = collector.get_cached_limits(max_age_seconds=60)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["limits"][0]["title"], "Cached 5h")
+
+            # Stale cache test
+            cached_stale = collector.get_cached_limits(max_age_seconds=-1)
+            self.assertIsNone(cached_stale)
+        finally:
+            collector.CACHE_FILE = orig_cache
 
 
 if __name__ == "__main__":

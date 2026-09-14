@@ -454,6 +454,7 @@ Item {
   function expandPath(path) {
     var value = String(path || "").trim()
     if (value === "") return ""
+    if (value.indexOf("..") !== -1) return ""
     if (value === "~") return home
     if (value.indexOf("~/") === 0) return home + value.substring(1)
     if (value.indexOf("$HOME/") === 0) return home + value.substring(5)

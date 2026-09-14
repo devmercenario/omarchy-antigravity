@@ -14,8 +14,11 @@ fi
 # Parse input from stdin (agy passes context JSON)
 if [ -n "$INPUT" ]; then
     if [ -n "${OMARCHY_STATUSLINE_DEBUG:-}" ]; then
-        mkdir -p "$HOME/.gemini/antigravity-cli" 2>/dev/null || true
-        echo "$INPUT" > "$HOME/.gemini/antigravity-cli/last_statusline_input.json" 2>/dev/null || true
+        (
+            umask 077
+            mkdir -p "$HOME/.gemini/antigravity-cli" 2>/dev/null || true
+            echo "$INPUT" > "$HOME/.gemini/antigravity-cli/last_statusline_input.json" 2>/dev/null || true
+        )
     fi
     CWD=$(echo "$INPUT" | jq -r ".cwd // empty" 2>/dev/null || true)
     WIDTH=$(echo "$INPUT" | jq -r ".width // .terminal_width // .columns // empty" 2>/dev/null || true)

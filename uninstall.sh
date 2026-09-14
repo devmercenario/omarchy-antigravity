@@ -23,7 +23,13 @@ AGY_CLI_DIR="$HOME/.gemini/antigravity-cli"
 AGY_SETTINGS="$AGY_CLI_DIR/settings.json"
 if [[ -f "$AGY_SETTINGS" ]]; then
   tmp=$(mktemp)
-  jq 'del(.statusLine)' "$AGY_SETTINGS" > "$tmp" 2>/dev/null && mv "$tmp" "$AGY_SETTINGS" || rm -f "$tmp"
+  trap 'rm -f "$tmp"' EXIT INT TERM
+  if jq 'del(.statusLine)' "$AGY_SETTINGS" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$AGY_SETTINGS"
+  else
+    rm -f "$tmp"
+  fi
+  trap - EXIT INT TERM
 fi
 if [[ -f "$AGY_CLI_DIR/statusline.sh.bak" ]]; then
   mv "$AGY_CLI_DIR/statusline.sh.bak" "$AGY_CLI_DIR/statusline.sh"

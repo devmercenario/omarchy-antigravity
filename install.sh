@@ -154,6 +154,7 @@ if [[ -f "$SHELL_CONFIG" ]]; then
   echo "🎨 Enabling Antigravity in Omarchy bar widget..."
   cp "$SHELL_CONFIG" "$SHELL_CONFIG.bak.$(date +%s)"
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT INT TERM
   jq '
     .bar.layout.right |= map(
       if .id == "omarchy.agents" or (.id | endswith(".agents")) then
@@ -162,7 +163,8 @@ if [[ -f "$SHELL_CONFIG" ]]; then
         .
       end
     )
-  ' "$SHELL_CONFIG" > "$tmp" && mv "$tmp" "$SHELL_CONFIG"
+  ' "$SHELL_CONFIG" > "$tmp" && mv -f "$tmp" "$SHELL_CONFIG"
+  trap - EXIT INT TERM
 fi
 
 # 5. Install UI enhancement for status bar warning & 1-click auth
@@ -226,13 +228,15 @@ if [[ "$should_install_statusline" == true ]]; then
   if [[ -f "$AGY_SETTINGS" ]]; then
     cp "$AGY_SETTINGS" "$AGY_SETTINGS.bak.$(date +%s)"
     tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT INT TERM
     jq --arg script "$AGY_CLI_DIR/statusline.sh" '
       .statusLine = {
         "type": "command",
         "command": $script,
         "enabled": true
       }
-    ' "$AGY_SETTINGS" > "$tmp" && mv "$tmp" "$AGY_SETTINGS"
+    ' "$AGY_SETTINGS" > "$tmp" && mv -f "$tmp" "$AGY_SETTINGS"
+    trap - EXIT INT TERM
   else
     jq -n --arg script "$AGY_CLI_DIR/statusline.sh" '{
       "statusLine": {

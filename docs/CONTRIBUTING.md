@@ -112,8 +112,8 @@ The collector resolves authentication tokens in order:
 If `access_token` is expired or within 120 seconds of expiration:
 - **Endpoint**: `POST https://oauth2.googleapis.com/token`
 - **Parameters**:
-  - `client_id`: `1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com`
-  - `client_secret`: `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`
+  - `client_id`: Antigravity Installed App Client ID (configurable via `ANTIGRAVITY_CLIENT_ID`)
+  - `client_secret`: Standard Native Client Secret (configurable via `ANTIGRAVITY_CLIENT_SECRET`)
   - `grant_type`: `refresh_token`
   - `refresh_token`: `<stored_refresh_token>`
 - **Storage**: Updates both the token file (if present) and the system keyring via `secret-tool store`.

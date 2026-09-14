@@ -28,6 +28,7 @@ fi
 SHELL_CONFIG="$CONFIG_DIR/shell.json"
 if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
   tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT INT TERM
   jq '
     .bar.layout.right |= map(
       if .id == "omarchy.agents" or (.id | endswith(".agents")) then
@@ -36,7 +37,8 @@ if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
         .
       end
     )
-  ' "$SHELL_CONFIG" > "$tmp" && mv "$tmp" "$SHELL_CONFIG"
+  ' "$SHELL_CONFIG" > "$tmp" && mv -f "$tmp" "$SHELL_CONFIG"
+  trap - EXIT INT TERM
 fi
 
 # 3. Trigger quota refresh

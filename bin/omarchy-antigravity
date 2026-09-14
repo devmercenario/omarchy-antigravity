@@ -107,17 +107,21 @@ case "$cmd" in
           chmod +x "$statusline_script"
         fi
         tmp=$(mktemp)
+        trap 'rm -f "$tmp"' EXIT INT TERM
         if [[ -f "$settings_file" ]]; then
-          jq --arg s "$statusline_script" '.statusLine = {"type":"command","command":$s,"enabled":true}' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
+          jq --arg s "$statusline_script" '.statusLine = {"type":"command","command":$s,"enabled":true}' "$settings_file" > "$tmp" && mv -f "$tmp" "$settings_file"
         else
-          jq -n --arg s "$statusline_script" '{"statusLine":{"type":"command","command":$s,"enabled":true}}' > "$settings_file"
+          jq -n --arg s "$statusline_script" '{"statusLine":{"type":"command","command":$s,"enabled":true}}' > "$tmp" && mv -f "$tmp" "$settings_file"
         fi
+        trap - EXIT INT TERM
         echo "✅ Antigravity CLI status bar enabled!"
         ;;
       disable)
         if [[ -f "$settings_file" ]]; then
           tmp=$(mktemp)
-          jq '.statusLine.enabled = false' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
+          trap 'rm -f "$tmp"' EXIT INT TERM
+          jq '.statusLine.enabled = false' "$settings_file" > "$tmp" && mv -f "$tmp" "$settings_file"
+          trap - EXIT INT TERM
           echo "✅ Antigravity CLI status bar disabled."
         else
           echo "Settings file not found."
