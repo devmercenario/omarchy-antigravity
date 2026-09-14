@@ -203,6 +203,7 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         }
         with open(self.test_token_file, "w", encoding="utf-8") as f:
             json.dump(sample_data, f)
+        os.chmod(self.test_token_file, 0o600)
 
         data, err = collector.get_token_from_file()
         self.assertIsNotNone(data)
@@ -217,14 +218,64 @@ class TestKeyringAndAuthentication(unittest.TestCase):
     def test_get_token_from_file_corrupt(self):
         with open(self.test_token_file, "w", encoding="utf-8") as f:
             f.write("invalid json content {")
+        os.chmod(self.test_token_file, 0o600)
         data, err = collector.get_token_from_file()
         self.assertIsNone(data)
         self.assertIn("Failed to read token file", err)
+
+    def test_get_token_from_file_symlink_rejected(self):
+        real_file = os.path.join(self.temp_dir, "real-target-token")
+        sample_data = {"token": {"access_token": "target-token"}}
+        with open(real_file, "w", encoding="utf-8") as f:
+            json.dump(sample_data, f)
+        os.chmod(real_file, 0o600)
+        os.symlink(real_file, self.test_token_file)
+
+        data, err = collector.get_token_from_file()
+        self.assertIsNone(data)
+        self.assertIn("Failed to open token file", err)
+
+    def test_get_token_from_file_insecure_mode_rejected(self):
+        sample_data = {"token": {"access_token": "tok"}}
+        with open(self.test_token_file, "w", encoding="utf-8") as f:
+            json.dump(sample_data, f)
+        os.chmod(self.test_token_file, 0o644)
+
+        data, err = collector.get_token_from_file()
+        self.assertIsNone(data)
+        self.assertIn("insecure permissions", err)
+
+    def test_get_token_from_file_owner_mismatch_rejected(self):
+        sample_data = {"token": {"access_token": "tok"}}
+        with open(self.test_token_file, "w", encoding="utf-8") as f:
+            json.dump(sample_data, f)
+        os.chmod(self.test_token_file, 0o600)
+
+        with patch("os.getuid", return_value=os.getuid() + 9999):
+            data, err = collector.get_token_from_file()
+            self.assertIsNone(data)
+            self.assertIn("owner mismatch", err)
+
+    def test_get_token_from_file_non_regular_rejected(self):
+        os.mkdir(self.test_token_file, 0o700)
+        data, err = collector.get_token_from_file()
+        self.assertIsNone(data)
+        self.assertTrue("not a regular file" in err or "Is a directory" in err or "Failed to open" in err)
+
+    def test_get_token_from_file_oversized_rejected(self):
+        with open(self.test_token_file, "wb") as f:
+            f.write(b'{"token": "' + b"x" * (collector.MAX_TOKEN_FILE_SIZE + 10) + b'"}')
+        os.chmod(self.test_token_file, 0o600)
+
+        data, err = collector.get_token_from_file()
+        self.assertIsNone(data)
+        self.assertIn("exceeds maximum allowed size", err)
 
     def test_get_credentials_prefers_file(self):
         sample_data = {"token": {"access_token": "file-tok"}}
         with open(self.test_token_file, "w", encoding="utf-8") as f:
             json.dump(sample_data, f)
+        os.chmod(self.test_token_file, 0o600)
 
         data, source, err = collector.get_credentials()
         self.assertEqual(source, "file")
@@ -243,9 +294,33 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         sample_data = {"token": {"access_token": "new-token"}}
         collector.save_token_to_file(sample_data)
         self.assertTrue(os.path.exists(self.test_token_file))
+        st = os.stat(self.test_token_file)
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+        self.assertEqual(st.st_uid, os.getuid())
         with open(self.test_token_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
         self.assertEqual(saved["token"]["access_token"], "new-token")
+
+    def test_save_token_to_file_replaces_symlink_safely(self):
+        victim_file = os.path.join(self.temp_dir, "victim-secret")
+        with open(victim_file, "w", encoding="utf-8") as f:
+            f.write("victim-secret-content")
+        os.symlink(victim_file, self.test_token_file)
+
+        sample_data = {"token": {"access_token": "refreshed-safe-token"}}
+        collector.save_token_to_file(sample_data)
+
+        # Ensure symlink was replaced, not followed
+        self.assertFalse(os.path.islink(self.test_token_file))
+        # Ensure victim content was preserved
+        with open(victim_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "victim-secret-content")
+        # Ensure token file has new token and 0600 mode
+        st = os.stat(self.test_token_file)
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+        data, err = collector.get_token_from_file()
+        self.assertIsNotNone(data)
+        self.assertEqual(data["token"]["access_token"], "refreshed-safe-token")
 
     @patch("subprocess.check_output")
     def test_get_token_from_keyring_found(self, mock_subp):
