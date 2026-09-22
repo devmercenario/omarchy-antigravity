@@ -103,6 +103,9 @@ case "$cmd" in
           statusline_src="$(dirname "$0")/omarchy-antigravity-statusline"
         fi
         if [[ -n "$statusline_src" ]]; then
+          if [[ -f "$statusline_script" && ! -f "$statusline_script.bak" ]]; then
+            cp "$statusline_script" "$statusline_script.bak" 2>/dev/null || true
+          fi
           cp -f --remove-destination "$statusline_src" "$statusline_script"
           chmod +x "$statusline_script"
         fi

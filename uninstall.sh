@@ -10,6 +10,8 @@ CONFIG_DIR="$HOME/.config/omarchy"
 HOOK_FILE="$CONFIG_DIR/hooks/post-update.d/90-antigravity.hook"
 CACHE_DIR="$HOME/.cache/omarchy/agent-usage"
 STATE_FILE="$HOME/.local/state/omarchy/agents/usage/antigravity.json"
+USER_PLUGIN_ID="${USER:-$(id -un)}.agents"
+USER_PLUGIN_DIR="$CONFIG_DIR/plugins/$USER_PLUGIN_ID"
 
 echo "🗑️  Uninstalling Antigravity Integration for Omarchy..."
 
@@ -45,6 +47,22 @@ fi
 # 2. Remove hook
 rm -f "$HOOK_FILE"
 
+# 2b. Restore user UI edits backed up by the installer, if any.
+if [[ -d "$USER_PLUGIN_DIR" ]]; then
+  for ui_file in Panel.qml Main.qml; do
+    if [[ -f "$USER_PLUGIN_DIR/$ui_file.bak" ]]; then
+      mv -f "$USER_PLUGIN_DIR/$ui_file.bak" "$USER_PLUGIN_DIR/$ui_file"
+    fi
+  done
+  if [[ -d "$USER_PLUGIN_DIR/assets" ]]; then
+    for asset in antigravity.svg antigravity-light.svg; do
+      if [[ -f "$USER_PLUGIN_DIR/assets/$asset.bak" ]]; then
+        mv -f "$USER_PLUGIN_DIR/assets/$asset.bak" "$USER_PLUGIN_DIR/assets/$asset"
+      fi
+    done
+  fi
+fi
+
 # 3. Remove cache and state
 rm -f "$STATE_FILE" \
       "$CACHE_DIR/antigravity-limits.json" \
@@ -66,9 +84,19 @@ if [[ -f "$AGENT_FILE" ]] && [[ "$(cat "$AGENT_FILE")" =~ ^(antigravity|gemini)$
   fi
 fi
 
-# 5. Refresh agents
+# 5. Refresh agents (use the installed helper while it is still present)
 if [[ -x "$BIN_DIR/omarchy-agent-usage-update" ]]; then
   "$BIN_DIR/omarchy-agent-usage-update" >/dev/null 2>&1 || true
+elif command -v omarchy-agent-usage-update >/dev/null 2>&1; then
+  omarchy-agent-usage-update >/dev/null 2>&1 || true
+fi
+
+# 6. Remove (or restore) the update helper we shadow-installed, so the stock
+# Omarchy helper is no longer masked by a stale plugin copy.
+if [[ -f "$BIN_DIR/omarchy-agent-usage-update.bak" ]]; then
+  mv -f "$BIN_DIR/omarchy-agent-usage-update.bak" "$BIN_DIR/omarchy-agent-usage-update"
+else
+  rm -f "$BIN_DIR/omarchy-agent-usage-update"
 fi
 
 echo "✅ Antigravity integration removed."

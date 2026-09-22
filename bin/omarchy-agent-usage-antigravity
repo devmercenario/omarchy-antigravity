@@ -62,6 +62,20 @@ class HttpFetchError(Exception):
     """Raised when a remote HTTP request fails or returns an invalid body."""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects so credential-bearing requests are never replayed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"refusing redirect to {newurl}", headers, fp
+        )
+
+
+# Refuse redirects process-wide: a redirect could replay the OAuth client secret
+# and refresh token (or a quota bearer token) to an attacker-chosen host.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
+
+
 def read_bounded(resp, max_bytes):
     """Read at most ``max_bytes`` bytes from an HTTP response body.
 

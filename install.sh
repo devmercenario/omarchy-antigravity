@@ -99,6 +99,11 @@ for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
     echo "⚠️  Skipping $target: non-regular file exists at destination." >&2
     continue
   fi
+  # omarchy-agent-usage-update shadows the stock Omarchy helper of the same
+  # name on PATH; preserve a prior copy so uninstall can restore it.
+  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" && ! -f "$target.bak" ]]; then
+    cp "$target" "$target.bak" 2>/dev/null || true
+  fi
   cp -f "$bin_src" "$target"
   chmod +x "$target"
 done
@@ -186,11 +191,21 @@ if [[ ! -d "$USER_PLUGIN_DIR" ]]; then
 fi
 
 if [[ -d "$USER_PLUGIN_DIR" ]]; then
-  cp -f "$SCRIPT_DIR/ui/Panel.qml" "$USER_PLUGIN_DIR/Panel.qml"
-  cp -f "$SCRIPT_DIR/ui/Main.qml" "$USER_PLUGIN_DIR/Main.qml"
+  # Preserve any pre-existing user UI edits (idempotent single-slot backups)
+  # before installing this plugin's Panel/Main and assets.
+  for ui_file in Panel.qml Main.qml; do
+    if [[ -f "$USER_PLUGIN_DIR/$ui_file" && ! -f "$USER_PLUGIN_DIR/$ui_file.bak" ]]; then
+      cp "$USER_PLUGIN_DIR/$ui_file" "$USER_PLUGIN_DIR/$ui_file.bak" 2>/dev/null || true
+    fi
+    cp -f --remove-destination "$SCRIPT_DIR/ui/$ui_file" "$USER_PLUGIN_DIR/$ui_file"
+  done
   mkdir -p "$USER_PLUGIN_DIR/assets"
-  cp -f "$SCRIPT_DIR/assets/antigravity.svg" "$USER_PLUGIN_DIR/assets/"
-  cp -f "$SCRIPT_DIR/assets/antigravity-light.svg" "$USER_PLUGIN_DIR/assets/"
+  for asset in antigravity.svg antigravity-light.svg; do
+    if [[ -f "$USER_PLUGIN_DIR/assets/$asset" && ! -f "$USER_PLUGIN_DIR/assets/$asset.bak" ]]; then
+      cp "$USER_PLUGIN_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset.bak" 2>/dev/null || true
+    fi
+    cp -f --remove-destination "$SCRIPT_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset"
+  done
   if command -v omarchy-shell >/dev/null 2>&1; then
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
   fi

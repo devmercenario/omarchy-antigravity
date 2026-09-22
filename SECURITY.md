@@ -9,7 +9,7 @@ Security and defense-in-depth are primary architectural priorities:
 - **Zero Elevated Privileges**: The plugin never invokes `sudo`, `su`, `pkexec`, or any privilege-escalation mechanism.
 - **No Private Key Access**: The plugin has zero access to SSH keys (`~/.ssh`), GPG keys (`~/.gnupg`), or system keyrings outside its designated secret service domain (`service: gemini, username: antigravity`).
 - **Standard Permission Model**: The plugin executes `agy` using its standard interactive permission confirmation model. No permission bypass flags (`--dangerously-skip-permissions`) are used or distributed.
-- **Non-Conflicting Namespace**: All installed executables use explicit plugin-scoped prefixes (`omarchy-antigravity*`, `omarchy-agent-usage-*`) to prevent shadowing standard system binaries.
+- **Non-Conflicting Namespace**: Plugin-specific executables use explicit prefixes (`omarchy-antigravity*`). The one intentional exception is `omarchy-agent-usage-update`, which shadows the stock Omarchy helper of the same name on `PATH`; the installer backs up any prior copy and the uninstaller restores or removes it so the stock helper is never permanently masked.
 
 ---
 
@@ -40,13 +40,25 @@ In accordance with [RFC 8252 (OAuth 2.0 for Native Apps)](https://tools.ietf.org
 - All remote API endpoints exclusively use TLS (`https://`).
 - Every network request enforces strict socket timeouts (5s to 10s) to prevent denial-of-service hanging.
 - **Bounded response reads.** Every HTTP body — including `HTTPError` error bodies — is read through a single `read_bounded()` helper that checks `Content-Length` when present and never reads more than the endpoint ceiling plus one byte. This prevents a compromised or misbehaving endpoint from forcing unbounded allocation. Conservative per-endpoint ceilings are applied: 16 KiB for OAuth token refresh, 16 KiB for Google userinfo, 256 KiB for the quota summary, and 4 KiB for error diagnostics.
+- **Redirects refused.** A process-wide no-redirect opener rejects every HTTP redirect, so a credential-bearing request (OAuth client secret + refresh token, or a quota bearer token) can never be replayed to an attacker-chosen host.
 - No third-party trackers, telemetry, or analytics are included.
 
 ### 5. Bounded Local JSON Reads
 Cache and account JSON files (`antigravity-limits.json`, `antigravity-user.json`, and `~/.gemini/google_accounts.json`) are read through the same no-follow descriptor discipline used for the OAuth token, with a 1 MiB ceiling enforced before any decoding or JSON parsing. The CLI history file (`~/.gemini/antigravity-cli/history.jsonl`) is opened with `O_NOFOLLOW`, must be a regular file owned by the current user, and is ignored entirely above a 16 MiB ceiling before it is streamed.
 
 ### 6. Bounded Helper Output
-Helper processes that feed credential or quota state (`secret-tool` and `agy -p /usage`) are executed with a 512 KiB stdout ceiling and a hard timeout. A helper that exceeds either bound is terminated and treated as a failure, so it cannot force unbounded allocation or hang the collector.
+Helper processes that feed credential or quota state (`secret-tool` and `agy -p /usage`) are executed with a 512 KiB stdout ceiling and a hard timeout. A helper that exceeds either bound is terminated and treated as a failure, so it cannot force unbounded allocation or hang the collector. The Antigravity status line additionally bounds stdin to 256 KiB.
+
+### 7. Installation, Removal, and User Consent
+The installer never overwrites user or stock files without a recoverable backup:
+- `shell.json`, the default-agent file, the Antigravity CLI `statusline.sh`, and any pre-existing `omarchy-agent-usage-update` are backed up (single-slot `.bak`) before modification.
+- Plugin UI files (`Panel.qml`, `Main.qml`, and assets in the user's cloned agents plugin) are backed up before replacement.
+- The installer refuses to write plugin binaries through an existing symlink, and copies use `--remove-destination` so symlinks are replaced rather than followed.
+- The uninstaller restores every backup it created — agent selection, status line, UI files, and the shadowed update helper — so the previous state and the stock Omarchy helper are recovered.
+- The post-update hook only fills in a **missing** antigravity provider preference; an explicit `providers.antigravity.enabled = false` is left untouched, and the user's chosen default agent is never overwritten.
+
+### 8. Shell Plugin Data Hardening
+Data derived from synced snapshots is aggregated into null-prototype maps, so an untrusted key such as `__proto__` becomes an ordinary own property instead of mutating an object prototype in the Quickshell runtime. Synced snapshot values are coerced through `String()`/numeric helpers before use.
 
 ---
 

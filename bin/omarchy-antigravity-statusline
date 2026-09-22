@@ -8,7 +8,8 @@ set -e
 
 INPUT=""
 if [ ! -t 0 ]; then
-    INPUT=$(cat)
+    # Bound stdin so a misbehaving caller cannot force unbounded allocation.
+    INPUT=$(head -c 262144)
 fi
 
 # Parse input from stdin (agy passes context JSON)

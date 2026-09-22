@@ -204,7 +204,7 @@ Item {
     var rev = dataRevision
     var syncRev = syncRevision
     var result = []
-    var localIds = {}
+    var localIds = Object.create(null)
     for (var i = 0; i < agents.length; i++) {
       var record = agents[i] ? agents[i].record : null
       if (!record || !record.id) continue
@@ -552,7 +552,14 @@ Item {
   }
 
   function emptyTokenBucket() {
-    return { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }
+    // Null-prototype maps so untrusted JSON keys such as "__proto__" become
+    // ordinary own properties instead of mutating object prototypes.
+    var bucket = Object.create(null)
+    bucket.inputTokens = 0
+    bucket.outputTokens = 0
+    bucket.cacheReadInputTokens = 0
+    bucket.cacheCreationInputTokens = 0
+    return bucket
   }
 
   // Device-scoped stats add up across machines; account-scoped stats
@@ -570,12 +577,12 @@ Item {
 
   function aggregateSnapshots(snapshots) {
     var dates = recentDateStrings()
-    var devices = {}
-    var providers = {}
+    var devices = Object.create(null)
+    var providers = Object.create(null)
 
     function providerAcc(id) {
       if (providers[id]) return providers[id]
-      var recentByDay = {}
+      var recentByDay = Object.create(null)
       for (var d = 0; d < dates.length; d++) recentByDay[dates[d]] = 0
       providers[id] = {
         providerId: id,
@@ -586,14 +593,14 @@ Item {
         todayPrompts: 0,
         todaySessions: 0,
         todayTotalTokens: 0,
-        todayTokensByModel: ({}),
+        todayTokensByModel: Object.create(null),
         recentByDay: recentByDay,
         totalPrompts: 0,
         totalSessions: 0,
         activeDays: 0,
-        activeDates: ({}),
-        modelUsage: ({}),
-        devices: ({})
+        activeDates: Object.create(null),
+        modelUsage: Object.create(null),
+        devices: Object.create(null)
       }
       return providers[id]
     }
@@ -644,7 +651,7 @@ Item {
       }
     }
 
-    var outProviders = {}
+    var outProviders = Object.create(null)
     for (var id in providers) {
       var acc = providers[id]
       var recentDays = []
@@ -704,7 +711,7 @@ Item {
   }
 
   function localSnapshot() {
-    var providerMap = {}
+    var providerMap = Object.create(null)
     for (var i = 0; i < agents.length; i++) {
       var record = agents[i] ? agents[i].record : null
       if (!record || !record.id) continue

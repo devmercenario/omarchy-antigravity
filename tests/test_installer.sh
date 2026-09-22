@@ -59,6 +59,23 @@ echo "agy mock"
 EOF
 chmod +x "$TEST_HOME/.local/bin/agy"
 
+# Pre-seed a fake pre-existing update helper to verify the installer backs it
+# up (it shadows the stock Omarchy helper) and the uninstaller restores it.
+cat <<'EOF' > "$TEST_HOME/.local/bin/omarchy-agent-usage-update"
+#!/bin/bash
+echo "preexisting helper"
+EOF
+chmod +x "$TEST_HOME/.local/bin/omarchy-agent-usage-update"
+
+# Pre-seed a user-customized agents plugin so we can verify the installer
+# backs up existing UI edits and the uninstaller restores them.
+TEST_USER_ID="${USER:-$(id -un)}.agents"
+TEST_PLUGIN_DIR="$TEST_HOME/.config/omarchy/plugins/$TEST_USER_ID"
+mkdir -p "$TEST_PLUGIN_DIR/assets"
+printf '// user custom panel\n' > "$TEST_PLUGIN_DIR/Panel.qml"
+printf '// user custom main\n' > "$TEST_PLUGIN_DIR/Main.qml"
+printf '<svg>user custom</svg>\n' > "$TEST_PLUGIN_DIR/assets/antigravity.svg"
+
 # 1. Run install.sh with --statusline flag
 echo "  ▶ Testing install.sh in isolated environment..."
 "$PROJECT_ROOT/install.sh" --statusline >/dev/null 2>&1
@@ -112,6 +129,34 @@ fi
 
 echo "  ✅ install.sh passed all assertions!"
 
+# Assert user UI edits were backed up and the plugin UI installed
+if [[ ! -f "$TEST_PLUGIN_DIR/Panel.qml.bak" || ! -f "$TEST_PLUGIN_DIR/Main.qml.bak" ]]; then
+  echo "❌ Assertion failed: user UI edits were not backed up by install.sh." >&2
+  exit 1
+fi
+if ! cmp -s "$PROJECT_ROOT/ui/Panel.qml" "$TEST_PLUGIN_DIR/Panel.qml"; then
+  echo "❌ Assertion failed: plugin Panel.qml was not installed." >&2
+  exit 1
+fi
+if ! grep -q "user custom panel" "$TEST_PLUGIN_DIR/Panel.qml.bak"; then
+  echo "❌ Assertion failed: user Panel.qml backup content is wrong." >&2
+  exit 1
+fi
+
+# Assert the pre-existing update helper was backed up and replaced
+if [[ ! -f "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak" ]]; then
+  echo "❌ Assertion failed: pre-existing update helper was not backed up." >&2
+  exit 1
+fi
+if ! grep -q "preexisting helper" "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak"; then
+  echo "❌ Assertion failed: update helper backup content is wrong." >&2
+  exit 1
+fi
+if ! grep -q "Update local usage records" "$TEST_HOME/.local/bin/omarchy-agent-usage-update"; then
+  echo "❌ Assertion failed: plugin update helper was not installed." >&2
+  exit 1
+fi
+
 # 2. Run uninstall.sh
 echo "  ▶ Testing uninstall.sh in isolated environment..."
 "$PROJECT_ROOT/uninstall.sh" >/dev/null 2>&1
@@ -148,4 +193,27 @@ if [[ -f "$AGENT_FILE" ]]; then
 fi
 
 echo "  ✅ uninstall.sh passed all assertions!"
+
+# Assert user UI edits were restored by the uninstaller
+if ! grep -q "user custom panel" "$TEST_PLUGIN_DIR/Panel.qml"; then
+  echo "❌ Assertion failed: user Panel.qml was not restored on uninstall." >&2
+  exit 1
+fi
+if ! grep -q "user custom main" "$TEST_PLUGIN_DIR/Main.qml"; then
+  echo "❌ Assertion failed: user Main.qml was not restored on uninstall." >&2
+  exit 1
+fi
+if [[ -f "$TEST_PLUGIN_DIR/Panel.qml.bak" ]]; then
+  echo "❌ Assertion failed: Panel.qml.bak should have been consumed on uninstall." >&2
+  exit 1
+fi
+if ! grep -q "preexisting helper" "$TEST_HOME/.local/bin/omarchy-agent-usage-update"; then
+  echo "❌ Assertion failed: pre-existing update helper was not restored on uninstall." >&2
+  exit 1
+fi
+if [[ -f "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak" ]]; then
+  echo "❌ Assertion failed: update helper backup should have been consumed on uninstall." >&2
+  exit 1
+fi
+
 echo "🎉 Installer and uninstaller tests passed successfully!"

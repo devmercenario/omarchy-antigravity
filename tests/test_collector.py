@@ -880,6 +880,23 @@ class TestBoundedNetworkReads(unittest.TestCase):
                 error_label="quota request failed",
             )
 
+    def test_redirects_are_refused(self):
+        handler = collector._NoRedirectHandler()
+        req = urllib.request.Request("https://oauth2.googleapis.com/token")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            handler.redirect_request(
+                req, None, 307, "Temporary Redirect", {}, "https://attacker.invalid/token"
+            )
+        self.assertIn("refusing redirect", str(ctx.exception))
+
+    def test_default_opener_refuses_redirects(self):
+        # The module installs a process-wide opener without a redirect handler;
+        # ensure the redirect handler was replaced by the refusing one.
+        opener = urllib.request._opener
+        handler_types = [type(h).__name__ for h in opener.handlers]
+        self.assertIn("_NoRedirectHandler", handler_types)
+        self.assertNotIn("HTTPRedirectHandler", handler_types)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,4 +90,32 @@ if [[ -f "$TEST_HOME/.config/omarchy/antigravity.default" ]]; then
 fi
 
 echo "  ✅ Test Case 2 passed: Hook strictly respects user configuration!"
+
+# Test Case 3: User explicitly disabled the antigravity provider
+echo "  ▶ Test Case 3: Hook does NOT re-enable an explicitly disabled provider..."
+cat <<'EOF' > "$TEST_HOME/.config/omarchy/shell.json"
+{
+  "bar": {
+    "layout": {
+      "right": [
+        {
+          "id": "omarchy.agents",
+          "providers": {
+            "antigravity": { "enabled": false }
+          }
+        }
+      ]
+    }
+  }
+}
+EOF
+
+bash "$HOOK_SRC"
+
+if ! jq -e '.bar.layout.right[] | select(.id == "omarchy.agents") | .providers.antigravity.enabled == false' "$SHELL_JSON" >/dev/null 2>&1; then
+  echo "❌ Assertion failed: hook re-enabled an explicitly disabled provider!" >&2
+  exit 1
+fi
+
+echo "  ✅ Test Case 3 passed: Hook respects an explicit provider disable!"
 echo "🎉 All hook tests passed successfully!"

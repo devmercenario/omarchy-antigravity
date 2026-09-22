@@ -32,7 +32,12 @@ if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
   jq '
     .bar.layout.right |= map(
       if .id == "omarchy.agents" or (.id | endswith(".agents")) then
-        .providers.antigravity.enabled = true
+        # Only fill in a missing preference; never override an explicit false.
+        if (.providers.antigravity.enabled? == null) then
+          .providers.antigravity.enabled = true
+        else
+          .
+        end
       else
         .
       end
