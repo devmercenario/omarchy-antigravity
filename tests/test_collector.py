@@ -517,8 +517,20 @@ class TestLocalStats(unittest.TestCase):
         os.makedirs(self.brain_dir, exist_ok=True)
         os.makedirs(os.path.join(self.brain_dir, "session-1"), exist_ok=True)
         os.makedirs(os.path.join(self.brain_dir, "session-2"), exist_ok=True)
+        self.orig_history = collector.HISTORY_FILE
+        self.orig_brain = collector.BRAIN_DIR
+        self.orig_cache_dir = collector.CACHE_DIR
+        self.orig_history_cache = collector.HISTORY_CACHE_FILE
+        collector.HISTORY_FILE = self.history_file
+        collector.BRAIN_DIR = self.brain_dir
+        collector.CACHE_DIR = self.temp_dir
+        collector.HISTORY_CACHE_FILE = os.path.join(self.temp_dir, "history-cache.json")
 
     def tearDown(self):
+        collector.HISTORY_FILE = self.orig_history
+        collector.BRAIN_DIR = self.orig_brain
+        collector.CACHE_DIR = self.orig_cache_dir
+        collector.HISTORY_CACHE_FILE = self.orig_history_cache
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_collect_local_stats_with_data(self):
@@ -532,33 +544,13 @@ class TestLocalStats(unittest.TestCase):
         with open(self.history_file, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
 
-        with patch("os.path.expanduser") as mock_expand:
-            def expand_mock(path):
-                if "history.jsonl" in path:
-                    return self.history_file
-                if "brain" in path:
-                    return self.brain_dir
-                return path
-            mock_expand.side_effect = expand_mock
+        stats = collector.collect_local_stats()
 
-            stats = collector.collect_local_stats()
-
-            self.assertEqual(stats["todayPrompts"], 2)
-            self.assertEqual(stats["totalPrompts"], 2)
-            self.assertEqual(stats["todaySessions"], 1)
-            self.assertEqual(stats["totalSessions"], 2)
-            self.assertEqual(len(stats["recentDays"]), 7)
-
-    def _stats_with_history(self, history_path):
-        def expand_mock(path):
-            if "history.jsonl" in path:
-                return history_path
-            if "brain" in path:
-                return self.brain_dir
-            return path
-
-        with patch("os.path.expanduser", side_effect=expand_mock):
-            return collector.collect_local_stats()
+        self.assertEqual(stats["todayPrompts"], 2)
+        self.assertEqual(stats["totalPrompts"], 2)
+        self.assertEqual(stats["todaySessions"], 1)
+        self.assertEqual(stats["totalSessions"], 2)
+        self.assertEqual(len(stats["recentDays"]), 7)
 
     def test_collect_local_stats_ignores_symlinked_history(self):
         real = os.path.join(self.temp_dir, "real-history.jsonl")
@@ -566,8 +558,9 @@ class TestLocalStats(unittest.TestCase):
             f.write(json.dumps({"timestamp": time.time() * 1000}) + "\n")
         link = os.path.join(self.temp_dir, "linked-history.jsonl")
         os.symlink(real, link)
+        collector.HISTORY_FILE = link
 
-        stats = self._stats_with_history(link)
+        stats = collector.collect_local_stats()
         self.assertEqual(stats["totalPrompts"], 0)
 
     def test_collect_local_stats_ignores_oversized_history(self):
@@ -575,9 +568,34 @@ class TestLocalStats(unittest.TestCase):
         with open(big, "wb") as f:
             f.seek(collector.MAX_HISTORY_FILE_SIZE + 1)
             f.write(b"\n")
+        collector.HISTORY_FILE = big
 
-        stats = self._stats_with_history(big)
+        stats = collector.collect_local_stats()
         self.assertEqual(stats["totalPrompts"], 0)
+
+    def test_history_cache_is_written_then_reused(self):
+        with open(self.history_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": time.time() * 1000}) + "\n")
+
+        first = collector.collect_local_stats()
+        self.assertEqual(first["totalPrompts"], 1)
+        self.assertTrue(os.path.exists(collector.HISTORY_CACHE_FILE))
+
+        # A second run with an unchanged file and the same local day must serve
+        # the cached aggregation instead of rescanning the history file.
+        with patch("collector._scan_history", side_effect=AssertionError("unexpected rescan")):
+            second = collector.collect_local_stats()
+        self.assertEqual(second["totalPrompts"], 1)
+
+    def test_history_cache_invalidated_when_file_changes(self):
+        with open(self.history_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": time.time() * 1000}) + "\n")
+        collector.collect_local_stats()
+
+        with open(self.history_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": time.time() * 1000}) + "\n")
+        second = collector.collect_local_stats()
+        self.assertEqual(second["totalPrompts"], 2)
 
 
 class TestMainExecutionScenarios(unittest.TestCase):
@@ -590,9 +608,17 @@ class TestMainExecutionScenarios(unittest.TestCase):
         self.orig_user_cache = collector.USER_CACHE_FILE
         self.orig_state_dir = collector.STATE_DIR
         self.orig_state_file = collector.STATE_FILE
+        self.orig_history_file = collector.HISTORY_FILE
+        self.orig_brain_dir = collector.BRAIN_DIR
+        self.orig_history_cache = collector.HISTORY_CACHE_FILE
         collector.CACHE_DIR = self.temp_dir
         collector.CACHE_FILE = os.path.join(self.temp_dir, "limits.json")
         collector.USER_CACHE_FILE = os.path.join(self.temp_dir, "user.json")
+        # Keep history/brain inside the sandbox so tests never read or write the
+        # developer/CI machine's real data.
+        collector.HISTORY_FILE = os.path.join(self.temp_dir, "history.jsonl")
+        collector.BRAIN_DIR = os.path.join(self.temp_dir, "brain")
+        collector.HISTORY_CACHE_FILE = os.path.join(self.temp_dir, "history-cache.json")
         # Point the state file at a path that does not exist yet, so the
         # session-suspension early return is never triggered by a pre-existing
         # state file on the developer/CI machine.
@@ -605,7 +631,18 @@ class TestMainExecutionScenarios(unittest.TestCase):
         collector.USER_CACHE_FILE = self.orig_user_cache
         collector.STATE_DIR = self.orig_state_dir
         collector.STATE_FILE = self.orig_state_file
+        collector.HISTORY_FILE = self.orig_history_file
+        collector.BRAIN_DIR = self.orig_brain_dir
+        collector.HISTORY_CACHE_FILE = self.orig_history_cache
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @patch("collector.is_agy_running", return_value=True)
+    @patch("collector.resolve_tool", return_value=None)
+    @patch("collector.get_valid_access_token", return_value=(None, "no creds"))
+    def test_main_debug_flag_sets_env(self, _auth, _tool, _running):
+        with patch.dict(os.environ, {}, clear=True), patch("builtins.print"):
+            collector.main(argv=["--debug"])
+            self.assertEqual(os.environ.get("OMARCHY_ANTIGRAVITY_DEBUG"), "1")
 
     @patch("collector.resolve_tool")
     @patch("collector.get_valid_access_token")
@@ -814,6 +851,17 @@ class TestMainExecutionScenarios(unittest.TestCase):
         with patch("sys.stderr.write"):
             collector.save_private_json(target, {"a": 1})
         self.assertFalse(os.path.exists(os.path.join(real_dir, "data.json")))
+
+    def test_atomic_write_private_returns_true_on_success(self):
+        target = os.path.join(self.temp_dir, "ok.json")
+        self.assertTrue(collector.atomic_write_private(target, {"a": 1}))
+
+    def test_atomic_write_private_returns_false_on_oversize(self):
+        target = os.path.join(self.temp_dir, "too-big.json")
+        with patch("sys.stderr.write"):
+            self.assertFalse(
+                collector.atomic_write_private(target, {"a": "x" * 100}, max_bytes=10)
+            )
 
     def test_get_cached_limits_descriptor_read(self):
         cache_path = os.path.join(self.temp_dir, "limits-test.json")
@@ -1034,6 +1082,29 @@ class TestLimitClassification(unittest.TestCase):
             [item["title"] for item in limits],
             ["Gemini (5h)", "Gemini (Weekly)", "Claude/GPT (5h)"],
         )
+
+
+class TestObservability(unittest.TestCase):
+    """--debug / OMARCHY_ANTIGRAVITY_DEBUG diagnostics must stay opt-in and on stderr."""
+
+    def test_debug_enabled_reads_env(self):
+        with patch.dict(os.environ, {"OMARCHY_ANTIGRAVITY_DEBUG": "on"}):
+            self.assertTrue(collector.debug_enabled())
+        with patch.dict(os.environ, {"OMARCHY_ANTIGRAVITY_DEBUG": "0"}):
+            self.assertFalse(collector.debug_enabled())
+
+    def test_log_debug_is_silent_unless_enabled(self):
+        with patch.dict(os.environ, {}, clear=True), patch("sys.stderr.write") as w:
+            collector.log_debug("hidden")
+            w.assert_not_called()
+        with patch.dict(os.environ, {"OMARCHY_ANTIGRAVITY_DEBUG": "1"}), patch("sys.stderr.write") as w:
+            collector.log_debug("visible")
+            self.assertIn("[debug] visible", w.call_args[0][0])
+
+    def test_log_warn_always_writes(self):
+        with patch("sys.stderr.write") as w:
+            collector.log_warn("problem")
+            self.assertIn("problem", w.call_args[0][0])
 
 
 class TestTrustedToolResolution(unittest.TestCase):

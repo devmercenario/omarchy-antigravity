@@ -334,7 +334,33 @@ Wherever possible, offer the generic security fixes (null-prototype maps, `..` r
 
 ---
 
-## 7. Roadmap & Potential Improvements
+## 7. Observability, Caching & Packaging
+
+### Observability
+Diagnostics are opt-in and always go to `stderr`, keeping `stdout` reserved for the JSON record:
+
+```bash
+# One-off verbose run
+omarchy-agent-usage-antigravity --debug --force
+
+# Persistent debug for a session
+export OMARCHY_ANTIGRAVITY_DEBUG=1
+```
+
+`--debug` sets `OMARCHY_ANTIGRAVITY_DEBUG` for the process; `log_debug()` emits `[debug]` lines only when that variable is truthy, while `log_warn()` always emits operational warnings.
+
+### History Cache
+The local `history.jsonl` scan is cached in `~/.cache/omarchy/agent-usage/antigravity-history.json` (mode `0600`, atomic). The cache key is `(mtime_ns, size, local-date)`, so it is reused only while the file is unchanged and the day has not rolled over — the “today” counters can never be served from a stale day. Byte counts are validated through the same no-follow private reader as every other cache file.
+
+### Packaging
+`omarchy plugin add <git-url>` / `install.sh` are the supported install paths for this user-space plugin. An AUR package is intentionally not shipped: Arch packaging must not write into `$HOME`, and a correct package would need a maintainer decision on a `/usr/share` layout plus a post-install user-space step. Documenting this avoids shipping a packaging artifact that violates Arch guidelines.
+
+### Deferred: QML runtime smoke test
+`qmllint` cannot type-check the vendored QML on a plain CI runner because the `Quickshell`/`qs.*` import paths only exist on an installed Omarchy system. QML changes are therefore validated locally with `qmllint` (and by inspection); the CI gates cover syntax of all shipped shell/Python files instead.
+
+---
+
+## 8. Roadmap & Potential Improvements
 
 - [ ] **Native Dedicated Bar Widget**:
   Add an alternative standalone widget (`bar-widget` in `manifest.json`) for users who want an isolated Antigravity icon with circular quota rings instead of grouping inside `omarchy.agents`.

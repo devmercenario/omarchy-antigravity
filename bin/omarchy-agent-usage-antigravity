@@ -39,10 +39,13 @@ QUOTA_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveU
 CACHE_DIR = os.path.expanduser("~/.cache/omarchy/agent-usage")
 CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-limits.json")
 USER_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-user.json")
+HISTORY_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-history.json")
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy/agents/usage")
 STATE_FILE = os.path.join(STATE_DIR, "antigravity.json")
 CACHE_TTL_SECONDS = 30
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+HISTORY_FILE = os.path.expanduser("~/.gemini/antigravity-cli/history.jsonl")
+BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity-cli/brain")
 MAX_TOKEN_FILE_SIZE = 64 * 1024
 MAX_CACHE_FILE_SIZE = 1024 * 1024
 MAX_HISTORY_FILE_SIZE = 16 * 1024 * 1024
@@ -79,6 +82,22 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 # Refuse redirects process-wide: a redirect could replay the OAuth client secret
 # and refresh token (or a quota bearer token) to an attacker-chosen host.
 urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
+
+
+def debug_enabled():
+    """True when verbose diagnostics are requested via env or ``--debug``."""
+    return os.getenv("OMARCHY_ANTIGRAVITY_DEBUG", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def log_debug(message):
+    if debug_enabled():
+        sys.stderr.write(f"omarchy-agent-usage-antigravity: [debug] {message}\n")
+
+
+def log_warn(message):
+    sys.stderr.write(f"omarchy-agent-usage-antigravity: {message}\n")
 
 
 def read_bounded(resp, max_bytes):
@@ -357,8 +376,10 @@ def atomic_write_private(file_path, data, max_bytes=None, error_label="private f
 
         os.replace(tmp_path, file_path)
         tmp_path = None
+        return True
     except Exception as e:
-        sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to save {error_label}: {e}\n")
+        log_warn(f"failed to save {error_label}: {e}")
+        return False
     finally:
         if fd is not None:
             try:
@@ -373,11 +394,11 @@ def atomic_write_private(file_path, data, max_bytes=None, error_label="private f
 
 
 def save_private_json(file_path, data):
-    atomic_write_private(file_path, data)
+    return atomic_write_private(file_path, data)
 
 
 def save_token_to_file(data):
-    atomic_write_private(
+    return atomic_write_private(
         TOKEN_FILE, data, max_bytes=MAX_TOKEN_FILE_SIZE, error_label="token file"
     )
 
@@ -385,7 +406,7 @@ def save_token_to_file(data):
 def save_token_to_keyring(data):
     secret_tool = resolve_tool("secret-tool")
     if secret_tool is None:
-        sys.stderr.write("omarchy-agent-usage-antigravity: secret-tool is not available in a trusted PATH\n")
+        log_warn("secret-tool is not available in a trusted PATH")
         return
     try:
         p = subprocess.Popen(
@@ -394,7 +415,7 @@ def save_token_to_keyring(data):
         )
         p.communicate(input=json.dumps(data).encode("utf-8"), timeout=5)
     except Exception as e:
-        sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to save keyring: {e}\n")
+        log_warn(f"failed to save keyring: {e}")
 
 
 def get_valid_access_token():
@@ -453,7 +474,7 @@ def get_valid_access_token():
                 elif source == "keyring":
                     save_token_to_keyring(data)
         except Exception as e:
-            sys.stderr.write(f"omarchy-agent-usage-antigravity: token refresh error: {e}\n")
+            log_warn(f"token refresh error: {e}")
 
     if not access_token:
         return None, "Unable to obtain valid access token"
@@ -675,7 +696,7 @@ def fetch_limits_via_agy():
     try:
         code, stdout_bytes, truncated = run_bounded_stdout([agy, "-p", "/usage"], timeout=10)
         if truncated:
-            sys.stderr.write("omarchy-agent-usage-antigravity: agy -p /usage output exceeded size limit\n")
+            log_warn("agy -p /usage output exceeded size limit")
             return None
         if code != 0:
             return None
@@ -693,7 +714,7 @@ def fetch_limits_via_agy():
             save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
             return limits
     except Exception as e:
-        sys.stderr.write(f"omarchy-agent-usage-antigravity: agy -p /usage error: {e}\n")
+        log_warn(f"agy -p /usage error: {e}")
     return None
 
 
@@ -711,21 +732,23 @@ def count_dir_entries(directory, limit=10000):
     return count
 
 
-def collect_local_stats():
-    now = datetime.now().astimezone()
-    today_str = now.strftime("%Y-%m-%d")
+def _history_cache_key(history_file):
+    """Return a (mtime_ns, size) cache key, or None when the file is unusable."""
+    try:
+        st = os.lstat(history_file)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_uid != os.getuid() or st.st_size > MAX_HISTORY_FILE_SIZE:
+        return None
+    return [st.st_mtime_ns, st.st_size]
 
-    recent_days_map = {}
-    for i in range(7):
-        d = (now - timedelta(days=6-i)).strftime("%Y-%m-%d")
-        recent_days_map[d] = 0
 
-    history_file = os.path.expanduser("~/.gemini/antigravity-cli/history.jsonl")
-    brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
-
+def _scan_history(history_file, today_str, recent_days_map):
+    """Stream history.jsonl and count prompts; returns (total, today)."""
     total_prompts = 0
     today_prompts = 0
-
     fd = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -764,6 +787,51 @@ def collect_local_stats():
                 os.close(fd)
             except OSError:
                 pass
+    return total_prompts, today_prompts
+
+
+def collect_local_stats():
+    now = datetime.now().astimezone()
+    today_str = now.strftime("%Y-%m-%d")
+
+    recent_days_map = {}
+    for i in range(7):
+        d = (now - timedelta(days=6-i)).strftime("%Y-%m-%d")
+        recent_days_map[d] = 0
+
+    history_file = HISTORY_FILE
+    brain_dir = BRAIN_DIR
+
+    total_prompts = 0
+    today_prompts = 0
+
+    # Cache the history scan when the file is unchanged and the local day has
+    # not rolled over; the cache key is validated through the private reader.
+    history_key = _history_cache_key(history_file)
+    cached, _ = read_private_json(HISTORY_CACHE_FILE)
+    cache_hit = False
+    if history_key is not None and cached and cached.get("historyKey") == history_key + [today_str]:
+        total_prompts = int(cached.get("totalPrompts", 0))
+        today_prompts = int(cached.get("todayPrompts", 0))
+        for day in cached.get("recentDays", []):
+            date = day.get("date")
+            if date in recent_days_map:
+                recent_days_map[date] = int(day.get("messageCount", 0))
+        cache_hit = True
+        log_debug(f"history cache hit ({history_key[1]} bytes)")
+
+    if not cache_hit:
+        total_prompts, today_prompts = _scan_history(history_file, today_str, recent_days_map)
+        if history_key is not None:
+            save_private_json(HISTORY_CACHE_FILE, {
+                "historyKey": history_key + [today_str],
+                "totalPrompts": total_prompts,
+                "todayPrompts": today_prompts,
+                "recentDays": [
+                    {"date": k, "messageCount": v} for k, v in recent_days_map.items()
+                ],
+            })
+        log_debug(f"history scanned ({history_key[1] if history_key else 0} bytes)")
 
     recent_days = [{"date": k, "messageCount": v} for k, v in recent_days_map.items()]
     active_dates = [k for k, v in recent_days_map.items() if v > 0]
@@ -783,20 +851,73 @@ def collect_local_stats():
     }
 
 
+def _resolve_limits(access_token, token_err, limits, status_text, auth_help):
+    """Resolve quota limits, preferring the API and falling back to agy."""
+    if access_token:
+        if limits is None:
+            try:
+                limits = fetch_authoritative_limits(access_token)
+            except Exception as e:
+                log_warn(f"failed to fetch quota after retries: {e}")
+                limits = fetch_limits_via_agy()
+                if not limits:
+                    status_text = "Quota unavailable"
+                    auth_help = f"Failed to retrieve quota: {e}"
+    else:
+        if limits is None:
+            limits = fetch_limits_via_agy()
+        if not limits and not status_text:
+            status_text = "Waiting for auth"
+            auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+    return limits, status_text, auth_help
+
+
+def _resolve_email(access_token, limits):
+    """Resolve the account email from cache/accounts file, then userinfo."""
+    email = ""
+    if access_token:
+        email = get_cached_user_email(access_token)
+    if not email and (access_token or limits):
+        email = get_cached_user_email(None)
+    return email
+
+
+def _build_record(email, status_text, auth_help, limits, local_stats):
+    """Assemble the display-ready usage record emitted on stdout."""
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "ready": True,
+        "hasLocalStats": True,
+        "tierLabel": f"Pro · {email}" if email else "Pro",
+        "usageStatusText": status_text,
+        "authHelpText": auth_help,
+        "limits": limits or []
+    }
+    record.update(local_stats)
+    return record
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Collect Antigravity usage record")
     parser.add_argument("--force", action="store_true", help="Bypass probe cache and active session check")
     parser.add_argument("--limits-only", action="store_true", help="Prioritize speed/cache")
+    parser.add_argument("--debug", action="store_true", help="Print verbose diagnostics to stderr")
     args = parser.parse_args(argv)
+
+    if args.debug:
+        os.environ["OMARCHY_ANTIGRAVITY_DEBUG"] = "1"
+    log_debug(f"start force={args.force} limits_only={args.limits_only}")
 
     # When not forced and an existing state file already exists, only query remote servers
     # if there is at least one active 'agy' session running on the machine.
     if not args.force and os.path.exists(STATE_FILE) and not is_agy_running():
-        sys.stderr.write("omarchy-agent-usage-antigravity: no active agy session running; skipping update\n")
+        log_warn("no active agy session running; skipping update")
         return 0
 
     limits = None
-    email = ""
     status_text = ""
     auth_help = ""
 
@@ -809,48 +930,17 @@ def main(argv=None):
         cached = get_cached_limits(ttl)
         if cached and "limits" in cached:
             limits = cached["limits"]
+            log_debug("limits cache hit")
 
     access_token, token_err = get_valid_access_token()
+    log_debug(f"credentials resolved: access_token={'yes' if access_token else 'no'}")
 
-    if access_token:
-        email = get_cached_user_email(access_token)
-        if limits is None:
-            try:
-                limits = fetch_authoritative_limits(access_token)
-            except Exception as e:
-                sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to fetch quota after retries: {e}\n")
-                limits = fetch_limits_via_agy()
-                if not limits:
-                    status_text = "Quota unavailable"
-                    auth_help = f"Failed to retrieve quota: {e}"
-    else:
-        if limits is None:
-            limits = fetch_limits_via_agy()
-        if not limits:
-            if not status_text:
-                status_text = "Waiting for auth"
-                auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+    limits, status_text, auth_help = _resolve_limits(
+        access_token, token_err, limits, status_text, auth_help
+    )
+    email = _resolve_email(access_token, limits)
 
-    if not email and (access_token or limits):
-        email = get_cached_user_email(None)
-
-    local_stats = collect_local_stats()
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    record = {
-        "schemaVersion": 1,
-        "id": AGENT_ID,
-        "name": AGENT_NAME,
-        "updatedAt": now_iso,
-        "ready": True,
-        "hasLocalStats": True,
-        "tierLabel": f"Pro · {email}" if email else "Pro",
-        "usageStatusText": status_text,
-        "authHelpText": auth_help,
-        "limits": limits or []
-    }
-    record.update(local_stats)
-
+    record = _build_record(email, status_text, auth_help, limits, collect_local_stats())
     print(json.dumps(record, separators=(",", ":")))
 
 
