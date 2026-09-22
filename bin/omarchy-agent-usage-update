@@ -75,6 +75,12 @@ for id in "${target_ids[@]}"; do
   [[ -n "$force" ]] && cmd+=("$force")
   [[ -n "$limits_only" ]] && cmd+=("$limits_only")
 
+  # Bound each collector so one hung or misbehaving script cannot stall the
+  # whole refresh indefinitely.
+  if command -v timeout >/dev/null 2>&1; then
+    cmd=(timeout 60 "${cmd[@]}")
+  fi
+
   if "${cmd[@]}" > "$tmp_file" 2>/dev/null; then
     if [[ -s "$tmp_file" ]] && jq -e . "$tmp_file" >/dev/null 2>&1; then
       chmod 600 "$tmp_file" 2>/dev/null || true

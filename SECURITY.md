@@ -35,6 +35,7 @@ In accordance with [RFC 8252 (OAuth 2.0 for Native Apps)](https://tools.ietf.org
 - Client credentials can be overridden anytime via environment variables:
   - `ANTIGRAVITY_CLIENT_ID`
   - `ANTIGRAVITY_CLIENT_SECRET`
+- **Strict mode (opt-in):** set `ANTIGRAVITY_STRICT_CLIENT=1` together with both variables to refuse token refresh whenever explicit credentials are absent. In strict mode the collector never falls back to the built-in default client and instead reports the requirement, so a deployment can avoid the embedded installed-application identifier entirely.
 
 ### 4. Network Security
 - All remote API endpoints exclusively use TLS (`https://`).
@@ -47,10 +48,10 @@ In accordance with [RFC 8252 (OAuth 2.0 for Native Apps)](https://tools.ietf.org
 Cache and account JSON files (`antigravity-limits.json`, `antigravity-user.json`, and `~/.gemini/google_accounts.json`) are read through the same no-follow descriptor discipline used for the OAuth token, with a 1 MiB ceiling enforced before any decoding or JSON parsing. The CLI history file (`~/.gemini/antigravity-cli/history.jsonl`) is opened with `O_NOFOLLOW`, must be a regular file owned by the current user, and is ignored entirely above a 16 MiB ceiling before it is streamed.
 
 ### 6. Bounded Helper Output
-Helper processes that feed credential or quota state (`secret-tool` and `agy -p /usage`) are executed with a 512 KiB stdout ceiling and a hard timeout. A helper that exceeds either bound is terminated and treated as a failure, so it cannot force unbounded allocation or hang the collector. The Antigravity status line additionally bounds stdin to 256 KiB.
+Helper processes that feed credential or quota state (`secret-tool` and `agy -p /usage`) are executed with a 512 KiB stdout ceiling and a hard timeout. A helper that exceeds either bound is terminated and treated as a failure, so it cannot force unbounded allocation or hang the collector. The Antigravity status line additionally bounds stdin to 256 KiB, and the usage-update helper wraps every collector in `timeout 60` so one hung collector cannot stall a full refresh.
 
 ### 6b. Trusted Helper Resolution
-`agy`, `secret-tool`, and `pgrep` are resolved to an absolute path and rejected when the binary is not an executable regular file, or when its containing directory is world-writable or owned by neither root nor the current user. A poisoned `PATH` entry therefore cannot silently substitute an attacker-controlled helper. The status line additionally probes only loopback addresses, so a configured endpoint cannot be used to probe arbitrary hosts.
+`agy`, `secret-tool`, and `pgrep` are resolved to an absolute path and rejected when the binary is not an executable regular file, or when any ancestor directory in its path is world-writable or owned by neither root nor the current user. A poisoned `PATH` entry therefore cannot silently substitute an attacker-controlled helper. The status line additionally probes only loopback addresses, so a configured endpoint cannot be used to probe arbitrary hosts.
 
 ### 7. Installation, Removal, and User Consent
 The installer never overwrites user or stock files without a recoverable backup:

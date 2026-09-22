@@ -436,6 +436,64 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         self.assertEqual(err, "")
         mock_save.assert_called_once()
 
+    @patch("collector.save_token_to_file")
+    @patch("urllib.request.urlopen")
+    @patch("collector.get_credentials")
+    def test_strict_client_refuses_refresh_without_env(self, mock_cred, mock_urlopen, mock_save):
+        mock_cred.return_value = ({"token": {"refresh_token": "refresh"}}, "file", "")
+        orig = collector.STRICT_CLIENT
+        collector.STRICT_CLIENT = True
+        try:
+            with patch.dict(os.environ, {}, clear=True), patch("sys.stderr.write") as mock_err:
+                token, err = collector.get_valid_access_token()
+            self.assertIsNone(token)
+            mock_urlopen.assert_not_called()
+            mock_save.assert_not_called()
+            self.assertTrue(
+                any("strict client mode" in str(call) for call in mock_err.call_args_list)
+            )
+        finally:
+            collector.STRICT_CLIENT = orig
+
+    @patch("collector.save_token_to_file")
+    @patch("urllib.request.urlopen")
+    @patch("collector.get_credentials")
+    def test_strict_client_allows_refresh_with_env(self, mock_cred, mock_urlopen, mock_save):
+        mock_cred.return_value = ({"token": {"refresh_token": "refresh"}}, "file", "")
+        mock_urlopen.return_value = FakeHTTPResponse(
+            json.dumps({"access_token": "strict-token", "expires_in": 3600}).encode("utf-8")
+        )
+        orig = collector.STRICT_CLIENT
+        collector.STRICT_CLIENT = True
+        try:
+            with patch.dict(os.environ, {
+                "ANTIGRAVITY_CLIENT_ID": "client-id",
+                "ANTIGRAVITY_CLIENT_SECRET": "client-secret",
+            }):
+                token, err = collector.get_valid_access_token()
+            self.assertEqual(token, "strict-token")
+            mock_urlopen.assert_called_once()
+        finally:
+            collector.STRICT_CLIENT = orig
+
+    @patch("collector.save_token_to_file")
+    @patch("urllib.request.urlopen")
+    @patch("collector.get_credentials")
+    def test_non_strict_uses_builtin_client(self, mock_cred, mock_urlopen, mock_save):
+        mock_cred.return_value = ({"token": {"refresh_token": "refresh"}}, "file", "")
+        mock_urlopen.return_value = FakeHTTPResponse(
+            json.dumps({"access_token": "default-token", "expires_in": 3600}).encode("utf-8")
+        )
+        orig = collector.STRICT_CLIENT
+        collector.STRICT_CLIENT = False
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                token, err = collector.get_valid_access_token()
+            self.assertEqual(token, "default-token")
+            mock_urlopen.assert_called_once()
+        finally:
+            collector.STRICT_CLIENT = orig
+
 
 class TestLocalStats(unittest.TestCase):
     """Test reading local history and counting prompt usage."""
@@ -931,13 +989,30 @@ class TestTrustedToolResolution(unittest.TestCase):
             self.assertIsNone(collector.resolve_tool("plain-file"))
 
     def test_resolve_tool_accepts_trusted_user_directory(self):
-        tmp = tempfile.mkdtemp()
+        # Use a directory under HOME: /tmp is world-writable and would (correctly)
+        # be rejected by the ancestor-chain check.
+        tmp = tempfile.mkdtemp(dir=os.path.expanduser("~"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         tool = os.path.join(tmp, "ok-tool")
         with open(tool, "w", encoding="utf-8") as f:
             f.write("#!/bin/sh\nexit 0\n")
         os.chmod(tool, 0o755)
         with patch("shutil.which", return_value=tool):
-            self.assertEqual(collector.resolve_tool("ok-tool"), tool)
+            self.assertEqual(collector.resolve_tool("ok-tool"), os.path.realpath(tool))
+
+    def test_resolve_tool_rejects_world_writable_ancestor(self):
+        # A safe-looking immediate parent under a world-writable ancestor must
+        # still be rejected (symlink/directory chain defense).
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        safe = os.path.join(base, "safe")
+        os.makedirs(safe, 0o700)
+        tool = os.path.join(safe, "tool")
+        with open(tool, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(tool, 0o755)
+        with patch("shutil.which", return_value=tool):
+            self.assertIsNone(collector.resolve_tool("tool"))
 
 
 if __name__ == "__main__":
