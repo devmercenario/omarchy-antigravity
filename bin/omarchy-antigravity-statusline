@@ -167,6 +167,12 @@ if [ -f "$SL_CONFIG" ]; then
         # Strictly sanitize host and port to prevent command injection
         [[ "$SL_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] || SL_HOST="127.0.0.1"
         [[ "$SL_PORT" =~ ^[0-9]+$ ]] || SL_PORT="8080"
+        # Only probe loopback: the shunt-local server is local by definition,
+        # and this prevents the status line from probing arbitrary hosts.
+        case "$SL_HOST" in
+            127.0.0.1|localhost|0.0.0.0) : ;;
+            *) SL_HOST="127.0.0.1" ;;
+        esac
         if command -v timeout >/dev/null 2>&1; then
             if timeout 0.1 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$SL_HOST" "$SL_PORT" 2>/dev/null; then
                 SL_STR="󰘚 SL"

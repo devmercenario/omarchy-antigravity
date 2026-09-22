@@ -178,7 +178,7 @@ class TestQuotaParsing(unittest.TestCase):
         # 1 initial + 2 retries = 3 attempts
         self.assertEqual(mock_urlopen.call_count, 3)
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.run_bounded_stdout")
     def test_fetch_limits_via_agy_success(self, mock_bounded, mock_which):
         mock_which.return_value = "/usr/bin/agy"
@@ -202,7 +202,7 @@ class TestQuotaParsing(unittest.TestCase):
         self.assertEqual(limits[3]["title"], "Claude/GPT (Weekly)")
         self.assertEqual(limits[3]["percent"], 0.0)
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     def test_fetch_limits_via_agy_not_installed(self, mock_which):
         mock_which.return_value = None
         self.assertIsNone(collector.fetch_limits_via_agy())
@@ -350,8 +350,9 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         self.assertIsNotNone(data)
         self.assertEqual(data["token"]["access_token"], "refreshed-safe-token")
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/secret-tool")
     @patch("collector.run_bounded_stdout")
-    def test_get_token_from_keyring_found(self, mock_bounded):
+    def test_get_token_from_keyring_found(self, mock_bounded, _mock_tool):
         sample_data = {
             "token": {
                 "access_token": "test-access-token",
@@ -366,32 +367,35 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(data["token"]["access_token"], "test-access-token")
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/secret-tool")
     @patch("collector.run_bounded_stdout")
-    def test_get_token_from_keyring_empty(self, mock_bounded):
+    def test_get_token_from_keyring_empty(self, mock_bounded, _mock_tool):
         mock_bounded.return_value = (0, b"", False)
         data, err = collector.get_token_from_keyring()
         self.assertIsNone(data)
         self.assertIn("No Antigravity credentials", err)
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/secret-tool")
     @patch("collector.run_bounded_stdout")
-    def test_get_token_from_keyring_corrupt_json(self, mock_bounded):
+    def test_get_token_from_keyring_corrupt_json(self, mock_bounded, _mock_tool):
         mock_bounded.return_value = (0, b"invalid json content {", False)
         data, err = collector.get_token_from_keyring()
         self.assertIsNone(data)
         self.assertIn("Failed to read keyring", err)
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/secret-tool")
     @patch("collector.run_bounded_stdout")
-    def test_get_token_from_keyring_oversized_output_rejected(self, mock_bounded):
+    def test_get_token_from_keyring_oversized_output_rejected(self, mock_bounded, _mock_tool):
         mock_bounded.return_value = (0, b"{}", True)
         data, err = collector.get_token_from_keyring()
         self.assertIsNone(data)
         self.assertIn("exceeds maximum allowed size", err)
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
     @patch("collector.run_bounded_stdout")
-    def test_fetch_limits_via_agy_oversized_output_rejected(self, mock_bounded):
-        with patch("shutil.which", return_value="/usr/bin/agy"):
-            mock_bounded.return_value = (0, b"", True)
-            self.assertIsNone(collector.fetch_limits_via_agy())
+    def test_fetch_limits_via_agy_oversized_output_rejected(self, mock_bounded, _mock_tool):
+        mock_bounded.return_value = (0, b"", True)
+        self.assertIsNone(collector.fetch_limits_via_agy())
 
     @patch("collector.get_credentials")
     def test_get_valid_access_token_valid(self, mock_cred):
@@ -533,7 +537,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
         collector.STATE_FILE = self.orig_state_file
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.get_valid_access_token")
     def test_main_cli_not_installed(self, mock_auth, mock_which):
         mock_which.return_value = None  # agy missing
@@ -549,7 +553,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(record["usageStatusText"], "Not installed")
             self.assertIn("not found in PATH", record["authHelpText"])
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.fetch_limits_via_agy")
     @patch("collector.get_valid_access_token")
     def test_main_unauthenticated_state(self, mock_auth, mock_agy, mock_which):
@@ -571,7 +575,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(record["limits"], [])
             self.assertEqual(record["tierLabel"], "Pro")
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
     @patch("collector.get_valid_access_token")
@@ -595,7 +599,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(record["tierLabel"], "Pro · developer@example.com")
             self.assertEqual(len(record["limits"]), 1)
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.fetch_limits_via_agy")
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
@@ -623,7 +627,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertIn("Failed to retrieve quota", record["authHelpText"])
             self.assertEqual(record["limits"], [])
 
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.fetch_limits_via_agy")
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
@@ -649,8 +653,9 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(len(record["limits"]), 1)
             self.assertEqual(record["limits"][0]["percent"], 0.42)
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/pgrep")
     @patch("subprocess.run")
-    def test_is_agy_running_detection(self, mock_run):
+    def test_is_agy_running_detection(self, mock_run, _mock_tool):
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_run.return_value = mock_proc
@@ -674,7 +679,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
 
     @patch("collector.is_agy_running")
     @patch("os.path.exists")
-    @patch("shutil.which")
+    @patch("collector.resolve_tool")
     @patch("collector.get_valid_access_token")
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
@@ -887,6 +892,7 @@ class TestBoundedNetworkReads(unittest.TestCase):
             handler.redirect_request(
                 req, None, 307, "Temporary Redirect", {}, "https://attacker.invalid/token"
             )
+        self.addCleanup(ctx.exception.close)
         self.assertIn("refusing redirect", str(ctx.exception))
 
     def test_default_opener_refuses_redirects(self):
@@ -896,6 +902,42 @@ class TestBoundedNetworkReads(unittest.TestCase):
         handler_types = [type(h).__name__ for h in opener.handlers]
         self.assertIn("_NoRedirectHandler", handler_types)
         self.assertNotIn("HTTPRedirectHandler", handler_types)
+
+
+class TestTrustedToolResolution(unittest.TestCase):
+    """External helpers must resolve to a trusted, non-world-writable path."""
+
+    def test_resolve_tool_rejects_missing(self):
+        with patch("shutil.which", return_value=None):
+            self.assertIsNone(collector.resolve_tool("definitely-not-a-tool"))
+
+    def test_resolve_tool_rejects_world_writable_directory(self):
+        tmp = tempfile.mkdtemp()
+        tool = os.path.join(tmp, "evil-tool")
+        with open(tool, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(tool, 0o755)
+        os.chmod(tmp, 0o777)
+        with patch("shutil.which", return_value=tool):
+            self.assertIsNone(collector.resolve_tool("evil-tool"))
+
+    def test_resolve_tool_rejects_non_executable(self):
+        tmp = tempfile.mkdtemp()
+        tool = os.path.join(tmp, "plain-file")
+        with open(tool, "w", encoding="utf-8") as f:
+            f.write("not a program")
+        os.chmod(tool, 0o644)
+        with patch("shutil.which", return_value=tool):
+            self.assertIsNone(collector.resolve_tool("plain-file"))
+
+    def test_resolve_tool_accepts_trusted_user_directory(self):
+        tmp = tempfile.mkdtemp()
+        tool = os.path.join(tmp, "ok-tool")
+        with open(tool, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(tool, 0o755)
+        with patch("shutil.which", return_value=tool):
+            self.assertEqual(collector.resolve_tool("ok-tool"), tool)
 
 
 if __name__ == "__main__":

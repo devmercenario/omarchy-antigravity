@@ -309,7 +309,22 @@ python3 -m unittest tests/test_collector.py
 ```
 
 ### GitHub Actions CI:
-Every push and pull request to `main` automatically triggers `.github/workflows/test.yml` to ensure continuous regression protection.
+Every push and pull request to `main` automatically triggers `.github/workflows/test.yml` to ensure continuous regression protection. The job is pinned to immutable action SHAs, runs with `permissions: contents: read`, and has a 20-minute timeout plus cancel-in-progress concurrency.
+
+### Staying in Sync with Upstream `omarchy.agents`
+
+`ui/Main.qml` and `ui/Panel.qml` are vendored copies of the official Omarchy `omarchy.agents` plugin with a small set of plugin-specific changes. To avoid missing upstream fixes, periodically diff them against the packaged copy and reconcile:
+
+```bash
+diff -u /usr/share/omarchy/shell/plugins/agents/Main.qml  ui/Main.qml
+diff -u /usr/share/omarchy/shell/plugins/agents/Panel.qml ui/Panel.qml
+```
+
+Local (intentional) changes to preserve when reconciling:
+- `Main.qml`: dynamic default-agent sync, retry handling, `expandPath` rejecting `..`, and null-prototype maps in `aggregateSnapshots`/`localSnapshot` (prototype-pollution defense).
+- `Panel.qml`: default-agent watcher and the antigravity-only Sign-In button.
+
+Wherever possible, offer the generic security fixes (null-prototype maps, `..` rejection) upstream to Omarchy so future vendored copies inherit them.
 
 ---
 

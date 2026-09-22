@@ -49,6 +49,9 @@ Cache and account JSON files (`antigravity-limits.json`, `antigravity-user.json`
 ### 6. Bounded Helper Output
 Helper processes that feed credential or quota state (`secret-tool` and `agy -p /usage`) are executed with a 512 KiB stdout ceiling and a hard timeout. A helper that exceeds either bound is terminated and treated as a failure, so it cannot force unbounded allocation or hang the collector. The Antigravity status line additionally bounds stdin to 256 KiB.
 
+### 6b. Trusted Helper Resolution
+`agy`, `secret-tool`, and `pgrep` are resolved to an absolute path and rejected when the binary is not an executable regular file, or when its containing directory is world-writable or owned by neither root nor the current user. A poisoned `PATH` entry therefore cannot silently substitute an attacker-controlled helper. The status line additionally probes only loopback addresses, so a configured endpoint cannot be used to probe arbitrary hosts.
+
 ### 7. Installation, Removal, and User Consent
 The installer never overwrites user or stock files without a recoverable backup:
 - `shell.json`, the default-agent file, the Antigravity CLI `statusline.sh`, and any pre-existing `omarchy-agent-usage-update` are backed up (single-slot `.bak`) before modification.

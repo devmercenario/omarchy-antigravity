@@ -136,6 +136,11 @@ def fetch_json(req, timeout, max_bytes, error_label):
             ).strip()
         except Exception:
             snippet = ""
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
         if snippet:
             detail = f"{detail}: {snippet[:512]}"
         raise HttpFetchError(detail) from e
@@ -148,9 +153,12 @@ def fetch_json(req, timeout, max_bytes, error_label):
 
 def is_agy_running():
     """Check via OS process table (pgrep) if at least one agy process is active."""
+    pgrep = resolve_tool("pgrep")
+    if pgrep is None:
+        return True
     try:
         res = subprocess.run(
-            ["pgrep", "-x", "agy"],
+            [pgrep, "-x", "agy"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=2
@@ -166,6 +174,34 @@ def ensure_dir(path):
         os.chmod(path, 0o700)
     except OSError:
         pass
+
+
+def resolve_tool(name):
+    """Resolve an external helper to an absolute path in a trusted directory.
+
+    ``shutil.which`` honours ``PATH``; a poisoned ``PATH`` entry could otherwise
+    substitute an attacker-controlled ``agy`` or ``secret-tool``. Reject
+    candidates that are not executable regular files or that live in a
+    world-writable directory or a directory owned by neither root nor this
+    user. Returns the resolved path, or ``None`` when nothing trusted is found.
+    """
+    path = shutil.which(name)
+    if not path:
+        return None
+    try:
+        path = os.path.realpath(path)
+        st = os.stat(path)
+        parent = os.path.dirname(path) or "/"
+        pst = os.stat(parent)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or not os.access(path, os.X_OK):
+        return None
+    if pst.st_mode & 0o002:
+        return None
+    if pst.st_uid not in (0, os.getuid()):
+        return None
+    return path
 
 
 def get_token_from_file():
@@ -203,9 +239,12 @@ def get_token_from_file():
 
 
 def get_token_from_keyring():
+    secret_tool = resolve_tool("secret-tool")
+    if secret_tool is None:
+        return None, "secret-tool is not available in a trusted PATH"
     try:
         code, raw_bytes, truncated = run_bounded_stdout(
-            ["secret-tool", "lookup", "service", "gemini", "username", "antigravity"],
+            [secret_tool, "lookup", "service", "gemini", "username", "antigravity"],
             timeout=5,
         )
         if truncated:
@@ -331,9 +370,13 @@ def save_token_to_file(data):
 
 
 def save_token_to_keyring(data):
+    secret_tool = resolve_tool("secret-tool")
+    if secret_tool is None:
+        sys.stderr.write("omarchy-agent-usage-antigravity: secret-tool is not available in a trusted PATH\n")
+        return
     try:
         p = subprocess.Popen(
-            ["secret-tool", "store", "--label=Password for 'antigravity' on 'gemini'", "service", "gemini", "username", "antigravity"],
+            [secret_tool, "store", "--label=Password for 'antigravity' on 'gemini'", "service", "gemini", "username", "antigravity"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         p.communicate(input=json.dumps(data).encode("utf-8"), timeout=5)
@@ -604,10 +647,11 @@ def fetch_authoritative_limits(access_token):
 
 
 def fetch_limits_via_agy():
-    if shutil.which("agy") is None:
+    agy = resolve_tool("agy")
+    if agy is None:
         return None
     try:
-        code, stdout_bytes, truncated = run_bounded_stdout(["agy", "-p", "/usage"], timeout=10)
+        code, stdout_bytes, truncated = run_bounded_stdout([agy, "-p", "/usage"], timeout=10)
         if truncated:
             sys.stderr.write("omarchy-agent-usage-antigravity: agy -p /usage output exceeded size limit\n")
             return None
@@ -742,7 +786,7 @@ def main(argv=None):
     status_text = ""
     auth_help = ""
 
-    if shutil.which("agy") is None:
+    if resolve_tool("agy") is None:
         status_text = "Not installed"
         auth_help = "Antigravity CLI ('agy') is not found in PATH."
 
