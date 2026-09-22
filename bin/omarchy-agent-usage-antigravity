@@ -176,6 +176,12 @@ def is_agy_running():
 def ensure_dir(path):
     os.makedirs(path, mode=0o700, exist_ok=True)
     try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"Refusing to use a non-directory or symlink path: {path}")
+    try:
         os.chmod(path, 0o700)
     except OSError:
         pass
@@ -300,7 +306,33 @@ def get_credentials():
     return None, None, f"No Antigravity credentials found in token file or keyring ({err_file}; {err_keyring})"
 
 
-def save_private_json(file_path, data):
+def _validate_private_descriptor(fd, label):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"Temporary file is not a regular file: {label}")
+    if st.st_uid != os.getuid():
+        raise OSError(f"Temporary file owner mismatch (uid {st.st_uid} != {os.getuid()})")
+    if (st.st_mode & 0o077) != 0:
+        raise OSError(f"Temporary file has insecure permissions ({oct(st.st_mode & 0o777)})")
+
+
+def _write_all(fd, payload):
+    total_written = 0
+    while total_written < len(payload):
+        written = os.write(fd, payload[total_written:])
+        if written == 0:
+            raise OSError("Failed to write payload to temporary file")
+        total_written += written
+
+
+def atomic_write_private(file_path, data, max_bytes=None, error_label="private file"):
+    """Atomically publish ``data`` as private JSON to ``file_path``.
+
+    The temporary file is created with ``mkstemp`` (mode 0600, ``O_EXCL``) in the
+    target directory, validated on its descriptor, written, fsynced, and
+    published with ``os.replace`` so an existing symlink is replaced rather than
+    followed. Shared by cache and token persistence.
+    """
     fd = None
     tmp_path = None
     try:
@@ -309,22 +341,15 @@ def save_private_json(file_path, data):
 
         prefix = f".{os.path.basename(file_path)}.tmp."
         fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=prefix)
-
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError(f"Temporary file is not a regular file: {tmp_path}")
-        if st.st_uid != os.getuid():
-            raise OSError(f"Temporary file owner mismatch (uid {st.st_uid} != {os.getuid()})")
-        if (st.st_mode & 0o077) != 0:
-            raise OSError(f"Temporary file has insecure permissions ({oct(st.st_mode & 0o777)})")
+        _validate_private_descriptor(fd, tmp_path)
 
         payload = json.dumps(data, indent=2).encode("utf-8")
-        total_written = 0
-        while total_written < len(payload):
-            written = os.write(fd, payload[total_written:])
-            if written == 0:
-                raise OSError("Failed to write payload to temporary file")
-            total_written += written
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise ValueError(
+                f"{error_label} payload exceeds maximum allowed size "
+                f"({len(payload)} > {max_bytes} bytes)"
+            )
+        _write_all(fd, payload)
 
         os.fsync(fd)
         os.close(fd)
@@ -333,7 +358,7 @@ def save_private_json(file_path, data):
         os.replace(tmp_path, file_path)
         tmp_path = None
     except Exception as e:
-        sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to save private file: {e}\n")
+        sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to save {error_label}: {e}\n")
     finally:
         if fd is not None:
             try:
@@ -345,56 +370,16 @@ def save_private_json(file_path, data):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def save_private_json(file_path, data):
+    atomic_write_private(file_path, data)
 
 
 def save_token_to_file(data):
-    fd = None
-    tmp_path = None
-    try:
-        token_dir = os.path.dirname(TOKEN_FILE)
-        ensure_dir(token_dir)
-
-        prefix = f".{os.path.basename(TOKEN_FILE)}.tmp."
-        fd, tmp_path = tempfile.mkstemp(dir=token_dir, prefix=prefix)
-
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError(f"Temporary token file is not a regular file: {tmp_path}")
-        if st.st_uid != os.getuid():
-            raise OSError(f"Temporary token file owner mismatch (uid {st.st_uid} != {os.getuid()})")
-        if (st.st_mode & 0o077) != 0:
-            raise OSError(f"Temporary token file has insecure permissions ({oct(st.st_mode & 0o777)})")
-
-        payload = json.dumps(data, indent=2).encode("utf-8")
-        if len(payload) > MAX_TOKEN_FILE_SIZE:
-            raise ValueError(f"Token payload exceeds maximum allowed size ({len(payload)} > {MAX_TOKEN_FILE_SIZE} bytes)")
-
-        total_written = 0
-        while total_written < len(payload):
-            written = os.write(fd, payload[total_written:])
-            if written == 0:
-                raise OSError("Failed to write token payload to temporary file")
-            total_written += written
-
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
-
-        os.replace(tmp_path, TOKEN_FILE)
-        tmp_path = None
-    except Exception as e:
-        sys.stderr.write(f"omarchy-agent-usage-antigravity: failed to save token file: {e}\n")
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    atomic_write_private(
+        TOKEN_FILE, data, max_bytes=MAX_TOKEN_FILE_SIZE, error_label="token file"
+    )
 
 
 def save_token_to_keyring(data):
@@ -594,6 +579,43 @@ def get_cached_user_email(access_token):
     return ""
 
 
+def _limit_entry(group_name, window, bucket_name, used_pct, reset_time):
+    """Classify one quota bucket into an ordered, display-ready limit record.
+
+    Shared by the authoritative API parser and the ``agy -p /usage`` fallback so
+    both express identical group/window precedence.
+    """
+    group = (group_name or "").upper()
+    bucket = (bucket_name or "").upper()
+    win = (window or "").upper()
+
+    if "GEMINI" in group:
+        prefix, group_priority = "Gemini", 0
+    elif "CLAUDE" in group or "GPT" in group:
+        prefix, group_priority = "Claude/GPT", 1
+    else:
+        prefix, group_priority = (group_name or ""), 2
+
+    if win in ("5H", "FIVE HOUR") or "FIVE HOUR" in bucket or "5-HOUR" in bucket:
+        title, label, window_priority = f"{prefix} (5h)", "Session", 0
+    elif win == "WEEKLY" or "WEEKLY" in bucket:
+        title, label, window_priority = f"{prefix} (Weekly)", "Weekly", 1
+    else:
+        title, label, window_priority = f"{prefix} ({bucket_name})", bucket_name, 2
+
+    return (group_priority, window_priority, {
+        "title": title,
+        "label": label,
+        "percent": used_pct,
+        "resetsAt": reset_time,
+    })
+
+
+def _finalize_limits(parsed_items):
+    parsed_items.sort(key=lambda x: (x[0], x[1]))
+    return [item[2] for item in parsed_items]
+
+
 def fetch_authoritative_limits(access_token):
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -632,50 +654,15 @@ def fetch_authoritative_limits(access_token):
         for b in group.get("buckets", []):
             rem = b.get("remainingFraction", 1.0)
             used_pct = round(max(0.0, min(1.0, 1.0 - rem)), 4)
-            w = b.get("window", "")
-            bname = b.get("displayName", "")
-            reset_time = b.get("resetTime", "")
-
-            gname_upper = gname.upper()
-            bname_upper = bname.upper()
-            w_upper = w.upper()
-
-            if "GEMINI" in gname_upper:
-                prefix = "Gemini"
-                group_priority = 0
-            elif "CLAUDE" in gname_upper or "GPT" in gname_upper:
-                prefix = "Claude/GPT"
-                group_priority = 1
-            else:
-                prefix = gname
-                group_priority = 2
-
-            if w_upper == "5H" or "FIVE HOUR" in bname_upper or "5-HOUR" in bname_upper:
-                title = f"{prefix} (5h)"
-                label = "Session"
-                window_priority = 0
-            elif w_upper == "WEEKLY" or "WEEKLY" in bname_upper:
-                title = f"{prefix} (Weekly)"
-                label = "Weekly"
-                window_priority = 1
-            else:
-                title = f"{prefix} ({bname})"
-                label = bname
-                window_priority = 2
-
-            parsed_items.append((
-                group_priority,
-                window_priority,
-                {
-                    "title": title,
-                    "label": label,
-                    "percent": used_pct,
-                    "resetsAt": reset_time
-                }
+            parsed_items.append(_limit_entry(
+                gname,
+                b.get("window", ""),
+                b.get("displayName", ""),
+                used_pct,
+                b.get("resetTime", ""),
             ))
 
-    parsed_items.sort(key=lambda x: (x[0], x[1]))
-    limits = [item[2] for item in parsed_items]
+    limits = _finalize_limits(parsed_items)
 
     save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
     return limits
@@ -700,31 +687,9 @@ def fetch_limits_via_agy():
                 group, window, pct, reset = m.groups()
                 rem_frac = int(pct) / 100.0
                 used_pct = round(max(0.0, min(1.0, 1.0 - rem_frac)), 4)
-                if group == 'Gemini Models':
-                    prefix = "Gemini"
-                    group_priority = 0
-                else:
-                    prefix = "Claude/GPT"
-                    group_priority = 1
-
-                if window == "Five Hour":
-                    label = "Session"
-                    title = f"{prefix} (5h)"
-                    window_priority = 0
-                else:
-                    label = "Weekly"
-                    title = f"{prefix} (Weekly)"
-                    window_priority = 1
-
-                parsed_items.append((group_priority, window_priority, {
-                    "title": title,
-                    "label": label,
-                    "percent": used_pct,
-                    "resetsAt": reset
-                }))
+                parsed_items.append(_limit_entry(group, window, "", used_pct, reset))
         if parsed_items:
-            parsed_items.sort(key=lambda x: (x[0], x[1]))
-            limits = [item[2] for item in parsed_items]
+            limits = _finalize_limits(parsed_items)
             save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
             return limits
     except Exception as e:

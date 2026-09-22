@@ -18,7 +18,7 @@ echo -e "${BLUE}   Running omarchy-antigravity Full Test Suite        ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 echo ""
 
-TOTAL_SUITES=6
+TOTAL_SUITES=8
 PASSED_SUITES=0
 
 run_suite() {
@@ -37,12 +37,14 @@ run_suite() {
   fi
 }
 
-run_suite "Python Collector Unit & Integration Tests" "python3 -m unittest '$SCRIPT_DIR/test_collector.py'"
+run_suite "Python Collector Unit & Integration Tests" "PYTHONWARNINGS=error::ResourceWarning python3 -m unittest '$SCRIPT_DIR/test_collector.py'"
 run_suite "Plugin Manifest Validation" "bash '$SCRIPT_DIR/test_manifest.sh'"
 run_suite "Installer & Uninstaller Lifecycle" "bash '$SCRIPT_DIR/test_installer.sh'"
+run_suite "Installer Symlink Safety" "bash '$SCRIPT_DIR/test_installer_safety.sh'"
 run_suite "Post-Update Hook Persistence" "bash '$SCRIPT_DIR/test_hook.sh'"
 run_suite "CLI Functional Commands" "bash '$SCRIPT_DIR/test_cli.sh'"
 run_suite "Antigravity CLI Status Bar Tests" "bash '$SCRIPT_DIR/test_statusline.sh'"
+run_suite "CI & Static Gates" "bash '$SCRIPT_DIR/test_ci.sh'"
 
 echo -e "${BLUE}======================================================${NC}"
 if (( PASSED_SUITES == TOTAL_SUITES )); then

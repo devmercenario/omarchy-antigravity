@@ -269,32 +269,38 @@ The project includes an automated test suite with 100% functional test coverage.
 
 ### Automated Test Suite:
 ```bash
-# Run all 5 test suites
+# Run all 8 test suites
 ./tests/run_tests.sh
 ```
 
 The test runner executes:
 1. **Collector Unit & Integration Tests** (`tests/test_collector.py`):
-   - Quota parsing and fraction conversion (`remainingFraction` -> `percent used`).
+   - Quota parsing and fraction conversion (`remainingFraction` -> `percent used`) plus the shared bucket classifier used by both quota sources.
    - Priority sorting (Gemini 5h -> Gemini Weekly -> Claude/GPT 5h -> Claude/GPT Weekly).
-   - System keyring extraction and error handling (empty keyring, corrupt JSON).
-   - OAuth2 token auto-refresh flow and expiration checking.
-   - Local stats aggregation (`history.jsonl` prompts parsing, date mapping, brain sessions).
-   - Edge cases: CLI not installed in PATH, unauthenticated state, API network errors, stale cache fallback.
+   - System keyring extraction and error handling (empty keyring, corrupt JSON, oversized output).
+   - OAuth2 token auto-refresh, expiration checking, strict-client mode, and redirect refusal.
+   - Bounded HTTP reads (success, oversized, `HTTPError`, invalid JSON) and descriptor/symlink hardening for token, cache, and history files.
+   - Trusted helper resolution (world-writable/WRONG-OWNER/non-executable rejection).
+   - Local stats aggregation (`history.jsonl` prompts parsing, date mapping, capped brain-session counting).
+   - Edge cases: CLI not installed in trusted PATH, unauthenticated state, API network errors, and stale cache handling.
 2. **Plugin Manifest Validation** (`tests/test_manifest.sh`):
    - Validates `manifest.json` against Omarchy's official `omarchy-plugin-validate` registry schema.
 3. **Installer & Uninstaller Lifecycle** (`tests/test_installer.sh`):
    - Executes `install.sh` and `uninstall.sh` in an isolated sandbox environment.
    - Verifies all plugin-specific binaries are copied with `+x` permissions to `~/.local/bin`.
-   - Verifies non-conflicting behavior (no hijacking of generic `gemini` executable).
-   - Verifies `defaults/agent` is set to `antigravity`.
-   - Verifies `shell.json` enables the `antigravity` provider.
+   - Verifies user UI edits, the shadowed update helper, and the status line are backed up and restored, and that `defaults/agent`/`shell.json` are set correctly.
    - Verifies `uninstall.sh` removes binaries, cache, state, and restores system defaults.
-4. **Post-Update Hook Persistence** (`tests/test_hook.sh`):
+4. **Installer Symlink Safety** (`tests/test_installer_safety.sh`):
+   - Proves `install.sh` refuses to write through an existing symlink and never truncates the linked victim file.
+5. **Post-Update Hook Persistence** (`tests/test_hook.sh`):
    - Simulates `omarchy update` having modified user defaults.
-   - Executes `90-antigravity.hook` to verify automatic restoration of settings without creating conflicting shims.
-5. **CLI Functional Commands** (`tests/test_cli.sh`):
-   - Verifies `omarchy-antigravity help`, `status`, and invalid command handling.
+   - Verifies restoration of consented settings without creating conflicting shims, and that an explicit `enabled = false` is respected.
+6. **CLI Functional Commands** (`tests/test_cli.sh`):
+   - Verifies `omarchy-antigravity help`, `status`, and invalid command handling, plus bash syntax for the `bin/` scripts.
+7. **Antigravity CLI Status Bar Tests** (`tests/test_statusline.sh`):
+   - Verifies status line syntax, stdin payload handling, and the `statusline` subcommands.
+8. **CI & Static Gates** (`tests/test_ci.sh`):
+   - Asserts the workflow keeps least-privilege permissions, a job timeout, concurrency, and full-SHA action pinning, and syntax-checks every shipped shell/Python file.
 
 ### Individual Test Execution:
 ```bash

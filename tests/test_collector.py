@@ -329,6 +329,12 @@ class TestKeyringAndAuthentication(unittest.TestCase):
             saved = json.load(f)
         self.assertEqual(saved["token"]["access_token"], "new-token")
 
+    def test_save_token_to_file_rejects_oversized_payload(self):
+        oversized = {"token": {"access_token": "x" * (collector.MAX_TOKEN_FILE_SIZE + 10)}}
+        with patch("sys.stderr.write"):
+            collector.save_token_to_file(oversized)
+        self.assertFalse(os.path.exists(self.test_token_file))
+
     def test_save_token_to_file_replaces_symlink_safely(self):
         victim_file = os.path.join(self.temp_dir, "victim-secret")
         with open(victim_file, "w", encoding="utf-8") as f:
@@ -390,6 +396,12 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         data, err = collector.get_token_from_keyring()
         self.assertIsNone(data)
         self.assertIn("exceeds maximum allowed size", err)
+
+    @patch("collector.resolve_tool", return_value=None)
+    def test_get_token_from_keyring_missing_secret_tool(self, _mock_tool):
+        data, err = collector.get_token_from_keyring()
+        self.assertIsNone(data)
+        self.assertIn("trusted PATH", err)
 
     @patch("collector.resolve_tool", return_value="/usr/bin/agy")
     @patch("collector.run_bounded_stdout")
@@ -722,6 +734,10 @@ class TestMainExecutionScenarios(unittest.TestCase):
         mock_proc.returncode = 1
         self.assertFalse(collector.is_agy_running())
 
+    @patch("collector.resolve_tool", return_value=None)
+    def test_is_agy_running_fails_open_without_pgrep(self, _mock_tool):
+        self.assertTrue(collector.is_agy_running())
+
     @patch("collector.is_agy_running")
     @patch("os.path.exists")
     def test_main_skips_when_no_active_session_and_state_exists(self, mock_exists, mock_running):
@@ -772,6 +788,32 @@ class TestMainExecutionScenarios(unittest.TestCase):
         self.assertTrue(os.path.isdir(test_dir))
         st = os.stat(test_dir)
         self.assertEqual(st.st_mode & 0o077, 0, "Directory must have private 0700 permissions")
+
+    def test_ensure_dir_rejects_symlinked_directory(self):
+        real = os.path.join(self.temp_dir, "real-dir")
+        os.makedirs(real, 0o700)
+        link = os.path.join(self.temp_dir, "link-dir")
+        os.symlink(real, link)
+        with self.assertRaises(OSError):
+            collector.ensure_dir(link)
+
+    def test_atomic_write_private_rejects_oversized_payload(self):
+        target = os.path.join(self.temp_dir, "big-private.json")
+        with patch("sys.stderr.write"):
+            collector.atomic_write_private(target, {"k": "x" * 100}, max_bytes=10, error_label="test file")
+        self.assertFalse(os.path.exists(target), "oversized payload must not be published")
+        leftovers = [f for f in os.listdir(self.temp_dir) if f.startswith(".big-private.json.tmp.")]
+        self.assertEqual(leftovers, [], "temporary file must be cleaned up on failure")
+
+    def test_atomic_write_private_refuses_symlinked_directory(self):
+        real_dir = os.path.join(self.temp_dir, "real-cache")
+        os.makedirs(real_dir, 0o700)
+        link_dir = os.path.join(self.temp_dir, "link-cache")
+        os.symlink(real_dir, link_dir)
+        target = os.path.join(link_dir, "data.json")
+        with patch("sys.stderr.write"):
+            collector.save_private_json(target, {"a": 1})
+        self.assertFalse(os.path.exists(os.path.join(real_dir, "data.json")))
 
     def test_get_cached_limits_descriptor_read(self):
         cache_path = os.path.join(self.temp_dir, "limits-test.json")
@@ -960,6 +1002,38 @@ class TestBoundedNetworkReads(unittest.TestCase):
         handler_types = [type(h).__name__ for h in opener.handlers]
         self.assertIn("_NoRedirectHandler", handler_types)
         self.assertNotIn("HTTPRedirectHandler", handler_types)
+
+
+class TestLimitClassification(unittest.TestCase):
+    """The shared bucket classifier used by both quota sources."""
+
+    def test_unknown_group_keeps_name_and_lowest_priority(self):
+        entry = collector._limit_entry("Custom Group", "5h", "Five Hour Limit", 0.1, "R")
+        self.assertEqual(entry[0], 2)
+        self.assertEqual(entry[2]["title"], "Custom Group (5h)")
+
+    def test_unknown_window_falls_back_to_bucket_name(self):
+        entry = collector._limit_entry("Gemini Models", "monthly", "Monthly Limit", 0.2, "R")
+        self.assertEqual(entry[1], 2)
+        self.assertEqual(entry[2]["label"], "Monthly Limit")
+        self.assertEqual(entry[2]["resetsAt"], "R")
+
+    def test_claude_group_is_second_priority(self):
+        entry = collector._limit_entry("Claude and GPT models", "Weekly", "", 0.3, "")
+        self.assertEqual(entry[0], 1)
+        self.assertEqual(entry[2]["title"], "Claude/GPT (Weekly)")
+
+    def test_finalize_limits_sorts_group_then_window(self):
+        items = [
+            collector._limit_entry("Claude and GPT models", "Five Hour", "", 0.1, ""),
+            collector._limit_entry("Gemini Models", "Weekly", "", 0.2, ""),
+            collector._limit_entry("Gemini Models", "Five Hour", "", 0.3, ""),
+        ]
+        limits = collector._finalize_limits(items)
+        self.assertEqual(
+            [item["title"] for item in limits],
+            ["Gemini (5h)", "Gemini (Weekly)", "Claude/GPT (5h)"],
+        )
 
 
 class TestTrustedToolResolution(unittest.TestCase):
