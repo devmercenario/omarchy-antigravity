@@ -39,7 +39,14 @@ In accordance with [RFC 8252 (OAuth 2.0 for Native Apps)](https://tools.ietf.org
 ### 4. Network Security
 - All remote API endpoints exclusively use TLS (`https://`).
 - Every network request enforces strict socket timeouts (5s to 10s) to prevent denial-of-service hanging.
+- **Bounded response reads.** Every HTTP body — including `HTTPError` error bodies — is read through a single `read_bounded()` helper that checks `Content-Length` when present and never reads more than the endpoint ceiling plus one byte. This prevents a compromised or misbehaving endpoint from forcing unbounded allocation. Conservative per-endpoint ceilings are applied: 16 KiB for OAuth token refresh, 16 KiB for Google userinfo, 256 KiB for the quota summary, and 4 KiB for error diagnostics.
 - No third-party trackers, telemetry, or analytics are included.
+
+### 5. Bounded Local JSON Reads
+Cache and account JSON files (`antigravity-limits.json`, `antigravity-user.json`, and `~/.gemini/google_accounts.json`) are read through the same no-follow descriptor discipline used for the OAuth token, with a 1 MiB ceiling enforced before any decoding or JSON parsing. The CLI history file (`~/.gemini/antigravity-cli/history.jsonl`) is opened with `O_NOFOLLOW`, must be a regular file owned by the current user, and is ignored entirely above a 16 MiB ceiling before it is streamed.
+
+### 6. Bounded Helper Output
+Helper processes that feed credential or quota state (`secret-tool` and `agy -p /usage`) are executed with a 512 KiB stdout ceiling and a hard timeout. A helper that exceeds either bound is terminated and treated as a failure, so it cannot force unbounded allocation or hang the collector.
 
 ---
 

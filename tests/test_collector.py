@@ -6,6 +6,7 @@ Part of omarchy-antigravity
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import io
 import json
 import os
 import shutil
@@ -29,6 +30,39 @@ sys.modules["collector"] = collector
 loader.exec_module(collector)
 
 
+class FakeHTTPResponse:
+    """Minimal streaming stand-in for urllib's HTTP response.
+
+    Unlike a ``MagicMock`` with ``read.return_value``, this fake advances
+    through the body on every ``read`` call, so bounded-read regressions are
+    observable and cannot accidentally return the whole payload forever.
+    """
+
+    def __init__(self, body=b"", headers=None, status=200):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self._body = body
+        self._pos = 0
+        self.headers = headers if headers is not None else {}
+        self.status = status
+        self.bytes_served = 0
+
+    def read(self, amt=None):
+        if amt is None:
+            chunk = self._body[self._pos:]
+        else:
+            chunk = self._body[self._pos:self._pos + amt]
+        self._pos += len(chunk)
+        self.bytes_served += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class TestQuotaParsing(unittest.TestCase):
     """Test quota bucket parsing and remainingFraction to percent conversion."""
 
@@ -45,8 +79,7 @@ class TestQuotaParsing(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_fetch_authoritative_limits_success(self, mock_urlopen):
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
+        payload = json.dumps({
             "groups": [
                 {
                     "displayName": "GEMINI MODELS",
@@ -84,8 +117,7 @@ class TestQuotaParsing(unittest.TestCase):
                 }
             ]
         }).encode("utf-8")
-        mock_response.__enter__.return_value = mock_response
-        mock_urlopen.return_value = mock_response
+        mock_urlopen.return_value = FakeHTTPResponse(payload)
 
         limits = collector.fetch_authoritative_limits("fake-token")
 
@@ -117,8 +149,7 @@ class TestQuotaParsing(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_fetch_authoritative_limits_retry_success(self, mock_urlopen):
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
+        payload = json.dumps({
             "groups": [{
                 "displayName": "GEMINI MODELS",
                 "buckets": [{
@@ -129,10 +160,9 @@ class TestQuotaParsing(unittest.TestCase):
                 }]
             }]
         }).encode("utf-8")
-        mock_response.__enter__.return_value = mock_response
 
         # Fails first attempt, succeeds on second attempt
-        mock_urlopen.side_effect = [urllib.error.URLError("Temporary network blip"), mock_response]
+        mock_urlopen.side_effect = [urllib.error.URLError("Temporary network blip"), FakeHTTPResponse(payload)]
 
         limits = collector.fetch_authoritative_limits("fake-token")
         self.assertEqual(len(limits), 1)
@@ -149,19 +179,16 @@ class TestQuotaParsing(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 3)
 
     @patch("shutil.which")
-    @patch("subprocess.run")
-    def test_fetch_limits_via_agy_success(self, mock_run, mock_which):
+    @patch("collector.run_bounded_stdout")
+    def test_fetch_limits_via_agy_success(self, mock_bounded, mock_which):
         mock_which.return_value = "/usr/bin/agy"
-        mock_proc = MagicMock()
-        mock_proc.return_code = 0
-        mock_proc.stdout = (
+        stdout = (
             "Gemini Models\tWeekly Limit Remaining\t40%\t2026-09-10T18:37:23Z\n"
             "Gemini Models\tFive Hour Limit Remaining\t58%\t2026-09-08T22:56:17Z\n"
             "Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-09-15T21:20:15Z\n"
             "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-09T02:20:15Z\n"
         )
-        mock_proc.returncode = 0
-        mock_run.return_value = mock_proc
+        mock_bounded.return_value = (0, stdout.encode("utf-8"), False)
 
         limits = collector.fetch_limits_via_agy()
         self.assertIsNotNone(limits)
@@ -323,8 +350,8 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         self.assertIsNotNone(data)
         self.assertEqual(data["token"]["access_token"], "refreshed-safe-token")
 
-    @patch("subprocess.check_output")
-    def test_get_token_from_keyring_found(self, mock_subp):
+    @patch("collector.run_bounded_stdout")
+    def test_get_token_from_keyring_found(self, mock_bounded):
         sample_data = {
             "token": {
                 "access_token": "test-access-token",
@@ -332,26 +359,39 @@ class TestKeyringAndAuthentication(unittest.TestCase):
                 "expiry": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
             }
         }
-        mock_subp.return_value = json.dumps(sample_data).encode("utf-8")
+        mock_bounded.return_value = (0, json.dumps(sample_data).encode("utf-8"), False)
 
         data, err = collector.get_token_from_keyring()
         self.assertIsNotNone(data)
         self.assertEqual(err, "")
         self.assertEqual(data["token"]["access_token"], "test-access-token")
 
-    @patch("subprocess.check_output")
-    def test_get_token_from_keyring_empty(self, mock_subp):
-        mock_subp.return_value = b""
+    @patch("collector.run_bounded_stdout")
+    def test_get_token_from_keyring_empty(self, mock_bounded):
+        mock_bounded.return_value = (0, b"", False)
         data, err = collector.get_token_from_keyring()
         self.assertIsNone(data)
         self.assertIn("No Antigravity credentials", err)
 
-    @patch("subprocess.check_output")
-    def test_get_token_from_keyring_corrupt_json(self, mock_subp):
-        mock_subp.return_value = b"invalid json content {"
+    @patch("collector.run_bounded_stdout")
+    def test_get_token_from_keyring_corrupt_json(self, mock_bounded):
+        mock_bounded.return_value = (0, b"invalid json content {", False)
         data, err = collector.get_token_from_keyring()
         self.assertIsNone(data)
         self.assertIn("Failed to read keyring", err)
+
+    @patch("collector.run_bounded_stdout")
+    def test_get_token_from_keyring_oversized_output_rejected(self, mock_bounded):
+        mock_bounded.return_value = (0, b"{}", True)
+        data, err = collector.get_token_from_keyring()
+        self.assertIsNone(data)
+        self.assertIn("exceeds maximum allowed size", err)
+
+    @patch("collector.run_bounded_stdout")
+    def test_fetch_limits_via_agy_oversized_output_rejected(self, mock_bounded):
+        with patch("shutil.which", return_value="/usr/bin/agy"):
+            mock_bounded.return_value = (0, b"", True)
+            self.assertIsNone(collector.fetch_limits_via_agy())
 
     @patch("collector.get_credentials")
     def test_get_valid_access_token_valid(self, mock_cred):
@@ -381,13 +421,11 @@ class TestKeyringAndAuthentication(unittest.TestCase):
             }
         }, "file", "")
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
+        payload = json.dumps({
             "access_token": "new-refreshed-token",
             "expires_in": 3600
         }).encode("utf-8")
-        mock_resp.__enter__.return_value = mock_resp
-        mock_urlopen.return_value = mock_resp
+        mock_urlopen.return_value = FakeHTTPResponse(payload)
 
         token, err = collector.get_valid_access_token()
         self.assertEqual(token, "new-refreshed-token")
@@ -436,6 +474,36 @@ class TestLocalStats(unittest.TestCase):
             self.assertEqual(stats["todaySessions"], 1)
             self.assertEqual(stats["totalSessions"], 2)
             self.assertEqual(len(stats["recentDays"]), 7)
+
+    def _stats_with_history(self, history_path):
+        def expand_mock(path):
+            if "history.jsonl" in path:
+                return history_path
+            if "brain" in path:
+                return self.brain_dir
+            return path
+
+        with patch("os.path.expanduser", side_effect=expand_mock):
+            return collector.collect_local_stats()
+
+    def test_collect_local_stats_ignores_symlinked_history(self):
+        real = os.path.join(self.temp_dir, "real-history.jsonl")
+        with open(real, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": time.time() * 1000}) + "\n")
+        link = os.path.join(self.temp_dir, "linked-history.jsonl")
+        os.symlink(real, link)
+
+        stats = self._stats_with_history(link)
+        self.assertEqual(stats["totalPrompts"], 0)
+
+    def test_collect_local_stats_ignores_oversized_history(self):
+        big = os.path.join(self.temp_dir, "big-history.jsonl")
+        with open(big, "wb") as f:
+            f.seek(collector.MAX_HISTORY_FILE_SIZE + 1)
+            f.write(b"\n")
+
+        stats = self._stats_with_history(big)
+        self.assertEqual(stats["totalPrompts"], 0)
 
 
 class TestMainExecutionScenarios(unittest.TestCase):
@@ -657,6 +725,160 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertIsNone(cached_stale)
         finally:
             collector.CACHE_FILE = orig_cache
+
+
+class TestBoundedNetworkReads(unittest.TestCase):
+    """Regression coverage for the bounded HTTP response reader and every
+    remote response/error path (OAuth refresh, userinfo, and quota)."""
+
+    def test_read_bounded_accepts_body_at_limit(self):
+        body = b"a" * 128
+        self.assertEqual(collector.read_bounded(FakeHTTPResponse(body), 128), body)
+
+    def test_read_bounded_rejects_body_over_limit(self):
+        with self.assertRaises(collector.BoundedReadError):
+            collector.read_bounded(FakeHTTPResponse(b"a" * 129), 128)
+
+    def test_read_bounded_rejects_declared_content_length_before_reading(self):
+        resp = FakeHTTPResponse(b"a" * 512, headers={"Content-Length": "999999"})
+        with self.assertRaises(collector.BoundedReadError):
+            collector.read_bounded(resp, 256)
+        self.assertEqual(resp.bytes_served, 0, "oversized Content-Length must short-circuit before reading")
+
+    def test_read_bounded_never_reads_more_than_limit_plus_one(self):
+        # A continuously delivered body with no Content-Length must still be capped.
+        resp = FakeHTTPResponse(b"a" * (10 * 1024 * 1024))
+        with self.assertRaises(collector.BoundedReadError):
+            collector.read_bounded(resp, 1024)
+        self.assertLessEqual(resp.bytes_served, 1025)
+
+    @patch("urllib.request.urlopen")
+    def test_quota_oversized_response_is_rejected_without_retry(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse(
+            b"{" + b"a" * (collector.QUOTA_RESPONSE_MAX_BYTES + 1)
+        )
+        with self.assertRaises(collector.BoundedReadError):
+            collector.fetch_authoritative_limits("fake-token")
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    @patch("collector.save_token_to_file")
+    @patch("urllib.request.urlopen")
+    @patch("collector.get_credentials")
+    def test_oauth_refresh_oversized_response_is_discarded(self, mock_cred, mock_urlopen, mock_save):
+        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        mock_cred.return_value = ({
+            "token": {
+                "refresh_token": "valid-refresh-token",
+            }
+        }, "file", "")
+        mock_urlopen.return_value = FakeHTTPResponse(
+            b"{" + b"a" * (collector.OAUTH_TOKEN_RESPONSE_MAX_BYTES + 1)
+        )
+
+        token, err = collector.get_valid_access_token()
+        self.assertIsNone(token)
+        self.assertIn("Unable to obtain valid access token", err)
+        mock_save.assert_not_called()
+
+    @patch("os.path.expanduser")
+    @patch("urllib.request.urlopen")
+    def test_userinfo_oversized_response_returns_empty(self, mock_urlopen, mock_expand):
+        missing_accounts = "/nonexistent/antigravity-google_accounts.json"
+        mock_expand.side_effect = lambda p: missing_accounts if p.endswith("google_accounts.json") else p
+        orig_user_cache = collector.USER_CACHE_FILE
+        collector.USER_CACHE_FILE = "/nonexistent/antigravity-user-cache.json"
+        try:
+            mock_urlopen.return_value = FakeHTTPResponse(
+                b"{" + b"a" * (collector.USERINFO_RESPONSE_MAX_BYTES + 1)
+            )
+            self.assertEqual(collector.get_cached_user_email("fake-token"), "")
+        finally:
+            collector.USER_CACHE_FILE = orig_user_cache
+
+    def test_read_private_json_rejects_oversized_file(self):
+        path = os.path.join(tempfile.mkdtemp(), "big.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x" * 2048)
+        os.chmod(path, 0o600)
+        data, st = collector.read_private_json(path, max_bytes=1024)
+        self.assertIsNone(data)
+        self.assertIsNone(st)
+
+    def test_read_private_json_rejects_symlink(self):
+        tmp = tempfile.mkdtemp()
+        real = os.path.join(tmp, "real.json")
+        with open(real, "w", encoding="utf-8") as f:
+            json.dump({"a": 1}, f)
+        os.chmod(real, 0o600)
+        link = os.path.join(tmp, "link.json")
+        os.symlink(real, link)
+        data, _ = collector.read_private_json(link)
+        self.assertIsNone(data)
+
+    def test_get_cached_user_email_reads_google_accounts_descriptor(self):
+        tmp = tempfile.mkdtemp()
+        acc = os.path.join(tmp, "google_accounts.json")
+        with open(acc, "w", encoding="utf-8") as f:
+            json.dump({"active": "user@example.com"}, f)
+        os.chmod(acc, 0o600)
+        orig_user_cache = collector.USER_CACHE_FILE
+        collector.USER_CACHE_FILE = os.path.join(tmp, "missing-user.json")
+        try:
+            with patch("os.path.expanduser", side_effect=lambda p: acc if p.endswith("google_accounts.json") else p):
+                self.assertEqual(collector.get_cached_user_email("fake-token"), "user@example.com")
+        finally:
+            collector.USER_CACHE_FILE = orig_user_cache
+
+    @patch("urllib.request.urlopen")
+    def test_http_error_body_is_bounded_and_reported(self, mock_urlopen):
+        err = urllib.error.HTTPError(
+            "https://example.invalid/quota",
+            500,
+            "Server Error",
+            {},
+            io.BytesIO(b"e" * (collector.HTTP_ERROR_BODY_MAX_BYTES * 8)),
+        )
+        self.addCleanup(err.close)
+        mock_urlopen.side_effect = err
+        with self.assertRaises(collector.HttpFetchError) as ctx:
+            collector.fetch_json(
+                urllib.request.Request("https://example.invalid/quota"),
+                timeout=5,
+                max_bytes=1024,
+                error_label="quota request failed",
+            )
+        self.assertIn("HTTP 500", str(ctx.exception))
+
+    @patch("urllib.request.urlopen")
+    def test_http_error_small_body_is_included_in_diagnostics(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://example.invalid/quota",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b"quota disabled"),
+        )
+        self.addCleanup(mock_urlopen.side_effect.close)
+        with self.assertRaises(collector.HttpFetchError) as ctx:
+            collector.fetch_json(
+                urllib.request.Request("https://example.invalid/quota"),
+                timeout=5,
+                max_bytes=1024,
+                error_label="quota request failed",
+            )
+        self.assertIn("HTTP 403", str(ctx.exception))
+        self.assertIn("quota disabled", str(ctx.exception))
+
+    @patch("urllib.request.urlopen")
+    def test_invalid_json_response_is_wrapped(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse(b"not json")
+        with self.assertRaises(collector.HttpFetchError):
+            collector.fetch_json(
+                urllib.request.Request("https://example.invalid/quota"),
+                timeout=5,
+                max_bytes=1024,
+                error_label="quota request failed",
+            )
 
 
 if __name__ == "__main__":

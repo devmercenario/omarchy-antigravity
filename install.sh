@@ -90,7 +90,11 @@ for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
                "$SCRIPT_DIR/bin/omarchy-antigravity-statusline"; do
   bin_name=$(basename "$bin_src")
   target="$BIN_DIR/$bin_name"
-  # Refuse to replace non-regular files or paths not owned by this plugin
+  # Refuse to write through an existing symlink or replace non-regular files.
+  if [[ -L "$target" ]]; then
+    echo "⚠️  Skipping $target: refusing to write through an existing symlink." >&2
+    continue
+  fi
   if [[ -e "$target" && ! -f "$target" ]]; then
     echo "⚠️  Skipping $target: non-regular file exists at destination." >&2
     continue
@@ -221,7 +225,7 @@ if [[ "$should_install_statusline" == true ]]; then
   if [[ -f "$AGY_CLI_DIR/statusline.sh" && ! -f "$AGY_CLI_DIR/statusline.sh.bak" ]]; then
     cp "$AGY_CLI_DIR/statusline.sh" "$AGY_CLI_DIR/statusline.sh.bak" 2>/dev/null || true
   fi
-  cp -f "$SCRIPT_DIR/bin/omarchy-antigravity-statusline" "$AGY_CLI_DIR/statusline.sh"
+  cp -f --remove-destination "$SCRIPT_DIR/bin/omarchy-antigravity-statusline" "$AGY_CLI_DIR/statusline.sh"
   chmod +x "$AGY_CLI_DIR/statusline.sh"
 
   AGY_SETTINGS="$AGY_CLI_DIR/settings.json"
