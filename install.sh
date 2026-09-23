@@ -100,9 +100,12 @@ for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
     continue
   fi
   # omarchy-agent-usage-update shadows the stock Omarchy helper of the same
-  # name on PATH; preserve a prior copy so uninstall can restore it.
-  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" && ! -f "$target.bak" ]]; then
-    cp "$target" "$target.bak" 2>/dev/null || true
+  # name on PATH; preserve a prior copy so uninstall can restore it. The
+  # backup is a hidden dotfile so the collector-discovery glob
+  # `omarchy-agent-usage-*` (which that helper itself uses) can never mistake
+  # the backup for a collector and re-execute it recursively.
+  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" && ! -f "$BIN_DIR/.omarchy-agent-usage-update.bak" ]]; then
+    cp "$target" "$BIN_DIR/.omarchy-agent-usage-update.bak" 2>/dev/null || true
   fi
   cp -f "$bin_src" "$target"
   chmod +x "$target"

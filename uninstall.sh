@@ -93,8 +93,8 @@ fi
 
 # 6. Remove (or restore) the update helper we shadow-installed, so the stock
 # Omarchy helper is no longer masked by a stale plugin copy.
-if [[ -f "$BIN_DIR/omarchy-agent-usage-update.bak" ]]; then
-  mv -f "$BIN_DIR/omarchy-agent-usage-update.bak" "$BIN_DIR/omarchy-agent-usage-update"
+if [[ -f "$BIN_DIR/.omarchy-agent-usage-update.bak" ]]; then
+  mv -f "$BIN_DIR/.omarchy-agent-usage-update.bak" "$BIN_DIR/omarchy-agent-usage-update"
 else
   rm -f "$BIN_DIR/omarchy-agent-usage-update"
 fi

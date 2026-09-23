@@ -144,11 +144,11 @@ if ! grep -q "user custom panel" "$TEST_PLUGIN_DIR/Panel.qml.bak"; then
 fi
 
 # Assert the pre-existing update helper was backed up and replaced
-if [[ ! -f "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak" ]]; then
+if [[ ! -f "$TEST_HOME/.local/bin/.omarchy-agent-usage-update.bak" ]]; then
   echo "❌ Assertion failed: pre-existing update helper was not backed up." >&2
   exit 1
 fi
-if ! grep -q "preexisting helper" "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak"; then
+if ! grep -q "preexisting helper" "$TEST_HOME/.local/bin/.omarchy-agent-usage-update.bak"; then
   echo "❌ Assertion failed: update helper backup content is wrong." >&2
   exit 1
 fi
@@ -211,7 +211,7 @@ if ! grep -q "preexisting helper" "$TEST_HOME/.local/bin/omarchy-agent-usage-upd
   echo "❌ Assertion failed: pre-existing update helper was not restored on uninstall." >&2
   exit 1
 fi
-if [[ -f "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak" ]]; then
+if [[ -f "$TEST_HOME/.local/bin/.omarchy-agent-usage-update.bak" ]]; then
   echo "❌ Assertion failed: update helper backup should have been consumed on uninstall." >&2
   exit 1
 fi

@@ -55,7 +55,7 @@ Helper processes that feed credential or quota state (`secret-tool` and `agy -p 
 
 ### 7. Installation, Removal, and User Consent
 The installer never overwrites user or stock files without a recoverable backup:
-- `shell.json`, the default-agent file, the Antigravity CLI `statusline.sh`, and any pre-existing `omarchy-agent-usage-update` are backed up (single-slot `.bak`) before modification.
+- `shell.json`, the default-agent file, the Antigravity CLI `statusline.sh`, and any pre-existing `omarchy-agent-usage-update` are backed up (single-slot `.bak`) before modification; the update-helper backup is a hidden dotfile (`.omarchy-agent-usage-update.bak`) so the collector-discovery glob can never mistake it for a collector and re-execute it.
 - Plugin UI files (`Panel.qml`, `Main.qml`, and assets in the user's cloned agents plugin) are backed up before replacement.
 - The installer refuses to write plugin binaries through an existing symlink, and copies use `--remove-destination` so symlinks are replaced rather than followed.
 - The uninstaller restores every backup it created — agent selection, status line, UI files, and the shadowed update helper — so the previous state and the stock Omarchy helper are recovered.

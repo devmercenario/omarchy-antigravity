@@ -18,7 +18,7 @@ echo -e "${BLUE}   Running omarchy-antigravity Full Test Suite        ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 echo ""
 
-TOTAL_SUITES=8
+TOTAL_SUITES=9
 PASSED_SUITES=0
 
 run_suite() {
@@ -40,6 +40,7 @@ run_suite() {
 run_suite "Python Collector Unit & Integration Tests" "PYTHONWARNINGS=error::ResourceWarning python3 -m unittest '$SCRIPT_DIR/test_collector.py'"
 run_suite "Plugin Manifest Validation" "bash '$SCRIPT_DIR/test_manifest.sh'"
 run_suite "Installer & Uninstaller Lifecycle" "bash '$SCRIPT_DIR/test_installer.sh'"
+run_suite "Usage-Updater Collector Discovery" "bash '$SCRIPT_DIR/test_usage_update.sh'"
 run_suite "Installer Symlink Safety" "bash '$SCRIPT_DIR/test_installer_safety.sh'"
 run_suite "Post-Update Hook Persistence" "bash '$SCRIPT_DIR/test_hook.sh'"
 run_suite "CLI Functional Commands" "bash '$SCRIPT_DIR/test_cli.sh'"

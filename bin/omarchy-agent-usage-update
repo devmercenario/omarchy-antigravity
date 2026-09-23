@@ -30,7 +30,10 @@ while (( $# > 0 )); do
   esac
 done
 
-# Collect all available agent collector scripts from both system and local bin
+# Collect all available agent collector scripts from both system and local
+# bin. The `update` helper and any backup/temp/editor file are skipped: a
+# stale .bak of THIS script is a full copy of the updater, and discovering it
+# as a collector re-executes it recursively (fork bomb).
 declare -A collectors
 
 for script in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
@@ -38,6 +41,9 @@ for script in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
   name=$(basename "$script")
   id="${name#omarchy-agent-usage-}"
   [[ "$id" == "update" || "$id" == "*" ]] && continue
+  case "$id" in
+    *.bak|*.tmp|*.orig|*.old|*.disabled|*.sample|*.swp|*~) continue ;;
+  esac
   collectors["$id"]="$script"
 done
 
@@ -46,6 +52,9 @@ for script in "$HOME"/.local/bin/omarchy-agent-usage-*; do
   name=$(basename "$script")
   id="${name#omarchy-agent-usage-}"
   [[ "$id" == "update" || "$id" == "*" ]] && continue
+  case "$id" in
+    *.bak|*.tmp|*.orig|*.old|*.disabled|*.sample|*.swp|*~) continue ;;
+  esac
   collectors["$id"]="$script"
 done
 
