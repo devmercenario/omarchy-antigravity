@@ -141,6 +141,31 @@ python3 -m unittest tests/test_collector.py
 
 ---
 
+## 🛡️ Pre-push checks (marketplace review, locally)
+
+Reproduce the Omarchy plugin marketplace's review checks against your local
+commit — no push and no network required:
+
+```bash
+./tests/preflight.sh
+```
+
+Runs, in order: `omarchy plugin validate` (manifest / "Quattro" compatibility),
+`qmllint` on the QML sources, the full test suite, and the marketplace's
+**Automated Security Baseline** — the same deterministic scanner the
+marketplace runs, executed against the local git tree via a vendored copy
+(`tests/marketplace-baseline/`).
+
+The baseline scans `HEAD` (the last commit), so commit your changes first. It
+prints the same report a maintainer sees and exits non-zero when the outcome
+is `needs-fixes`. To run it automatically on every `git push`:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+---
+
 ## 🗑️ Uninstallation
 
 ### If installed via `install.sh`:
