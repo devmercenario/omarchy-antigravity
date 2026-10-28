@@ -48,6 +48,7 @@ run_suite "Installer Symlink Safety" "bash '$SCRIPT_DIR/test_installer_safety.sh
 run_suite "Reinstall & Uninstall Safety" "bash '$SCRIPT_DIR/test_uninstall_safety.sh'"
 run_suite "Post-Update Hook Persistence" "bash '$SCRIPT_DIR/test_hook.sh'"
 run_suite "Agent Launcher (omarchy-agent)" "bash '$SCRIPT_DIR/test_agent_launcher.sh'"
+run_suite "Omarchy 4.5 Native Mode" "bash '$SCRIPT_DIR/test_native_mode.sh'"
 run_suite "CLI Functional Commands" "bash '$SCRIPT_DIR/test_cli.sh'"
 run_suite "Antigravity CLI Status Bar Tests" "bash '$SCRIPT_DIR/test_statusline.sh'"
 run_suite "CI & Static Gates" "bash '$SCRIPT_DIR/test_ci.sh'"

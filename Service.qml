@@ -10,9 +10,6 @@ Item {
   visible: false
 
   readonly property string home: Quickshell.env("HOME") || ""
-  // This plugin's updater has to win over the stock one on PATH; without a
-  // HOME, fall back to whichever updater PATH finds.
-  readonly property string updateScript: home !== "" ? home + "/.local/bin/omarchy-agent-usage-update" : "omarchy-agent-usage-update"
 
   IpcHandler {
     target: "devmercenario.antigravity"
@@ -41,6 +38,12 @@ Item {
   Process {
     id: refreshProcess
     running: false
-    command: [root.updateScript, "--limits-only", "antigravity"]
+    // This plugin's updater wins over the stock one when it is installed;
+    // on Omarchy 4.5 it is handed back and the stock one runs. "agy" is
+    // 4.5's own Antigravity collector; each updater skips the id it does not
+    // know. HOME arrives as $0, never interpolated into the script.
+    command: ["bash", "-c",
+              "u=\"$0/.local/bin/omarchy-agent-usage-update\"; [[ -n $0 && -x $u ]] || u=omarchy-agent-usage-update; exec \"$u\" --limits-only antigravity agy",
+              root.home]
   }
 }

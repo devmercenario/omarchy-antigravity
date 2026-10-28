@@ -17,6 +17,13 @@ SHELL_CONFIG="$CONFIG_DIR/shell.json"
 STATUSLINE_MARKER_RE='^# (omarchy-antigravity: statusline|Omarchy Antigravity CLI Statusline)$'
 UPDATER_MARKER_RE='^# (omarchy-antigravity: agent-usage-update|omarchy:summary=Update local usage records for all configured coding agents)$'
 AGENT_LAUNCHER_MARKER_RE='^# omarchy-antigravity: agent-launcher$'
+
+# Omarchy 4.5 and later ship Antigravity support of their own (agent id "agy",
+# a usage collector and the panel icon). There the plugin installs only the
+# status line and its helper, and `omarchy-antigravity adopt-native` hands
+# the rest over.
+NATIVE_ANTIGRAVITY=0
+[[ -x "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent-usage-agy" ]] && NATIVE_ANTIGRAVITY=1
 # Dropped into the agents plugin folder when this installer created it.
 CLONE_MARKER=".omarchy-antigravity-cloned"
 
@@ -171,11 +178,14 @@ fi
 if has_marker "$UPDATER_BAK" "$UPDATER_MARKER_RE"; then
   rm -f "$UPDATER_BAK"
 fi
-for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
-               "$SCRIPT_DIR/bin/omarchy-agent-usage-update" \
-               "$SCRIPT_DIR/bin/omarchy-agent" \
-               "$SCRIPT_DIR/bin/omarchy-antigravity" \
-               "$SCRIPT_DIR/bin/omarchy-antigravity-statusline"; do
+BIN_SOURCES=("$SCRIPT_DIR/bin/omarchy-antigravity" "$SCRIPT_DIR/bin/omarchy-antigravity-statusline")
+if (( ! NATIVE_ANTIGRAVITY )); then
+  BIN_SOURCES=("$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity"
+               "$SCRIPT_DIR/bin/omarchy-agent-usage-update"
+               "$SCRIPT_DIR/bin/omarchy-agent"
+               "${BIN_SOURCES[@]}")
+fi
+for bin_src in "${BIN_SOURCES[@]}"; do
   bin_name=$(basename "$bin_src")
   target="$BIN_DIR/$bin_name"
   # Refuse to write through an existing symlink or replace non-regular files.
@@ -217,18 +227,26 @@ fi
 # Ensure ~/.local/bin is in PATH for current subshell
 export PATH="$BIN_DIR:$PATH"
 
+if (( NATIVE_ANTIGRAVITY )); then
+  echo "🤝 Omarchy supports Antigravity natively; handing usage and launching over to it..."
+  "$BIN_DIR/omarchy-antigravity" adopt-native
+fi
+
 # 3. Configure Antigravity as the default Omarchy agent (with explicit consent)
 mkdir -p "$CONFIG_DIR/defaults"
 AGENT_FILE="$CONFIG_DIR/defaults/agent"
 CURRENT_AGENT=""
 [[ -f "$AGENT_FILE" ]] && CURRENT_AGENT=$(tr -d '[:space:]' < "$AGENT_FILE")
+# Omarchy 4.5 knows Antigravity as "agy" and launches it itself.
+DEFAULT_AGENT_ID="antigravity"
+(( NATIVE_ANTIGRAVITY )) && DEFAULT_AGENT_ID="agy"
 
 # Releases before the Antigravity CLI set "gemini", served by a
 # ~/.local/bin/gemini shim to agy that has since been removed; Omarchy now
 # opens the deprecated Gemini CLI for it. Move a default this plugin set (its
 # opt-in marker is there) to "antigravity"; a user's own Gemini pick has no
 # marker and stays.
-if [[ "$CURRENT_AGENT" == "gemini" && -f "$CONFIG_DIR/antigravity.default" ]]; then
+if (( ! NATIVE_ANTIGRAVITY )) && [[ "$CURRENT_AGENT" == "gemini" && -f "$CONFIG_DIR/antigravity.default" ]]; then
   echo "⚙️  Moving the legacy 'gemini' default agent to 'antigravity'..."
   echo "antigravity" > "$AGENT_FILE"
   CURRENT_AGENT="antigravity"
@@ -241,7 +259,7 @@ elif [[ "$SET_DEFAULT" == "no" ]]; then
   should_set_default=false
 elif (( ASSUME_YES )); then
   should_set_default=true
-elif [[ -n "$CURRENT_AGENT" && "$CURRENT_AGENT" != "antigravity" ]]; then
+elif [[ -n "$CURRENT_AGENT" && "$CURRENT_AGENT" != "$DEFAULT_AGENT_ID" ]]; then
   echo ""
   echo "ℹ️  Current default agent is: '$CURRENT_AGENT'"
   if command -v gum >/dev/null 2>&1 && [[ -t 0 ]]; then
@@ -260,18 +278,19 @@ fi
 
 if [[ "$should_set_default" == true ]]; then
   echo "⚙️  Setting default agent to Antigravity..."
-  if [[ -f "$AGENT_FILE" && "$CURRENT_AGENT" != "antigravity" ]]; then
+  if [[ -f "$AGENT_FILE" && "$CURRENT_AGENT" != "$DEFAULT_AGENT_ID" ]]; then
     cp "$AGENT_FILE" "$AGENT_FILE.bak.$(date +%s)"
   fi
-  echo "antigravity" > "$AGENT_FILE"
+  echo "$DEFAULT_AGENT_ID" > "$AGENT_FILE"
   touch "$CONFIG_DIR/antigravity.default"
 else
   echo "ℹ️  Keeping '$CURRENT_AGENT' as default agent."
 fi
 prune_backups "$AGENT_FILE"
 
-# 4. Enable Antigravity provider in shell.json (preserving backup)
-if [[ -f "$SHELL_CONFIG" ]]; then
+# 4. Enable Antigravity provider in shell.json (preserving backup). Omarchy
+# 4.5's own widget lists its native "agy" provider by itself.
+if [[ -f "$SHELL_CONFIG" ]] && (( ! NATIVE_ANTIGRAVITY )); then
   echo "🎨 Enabling Antigravity in Omarchy bar widget..."
   # Every agents widget (the built-in omarchy.agents or a <user>.agents
   # clone) in any bar section. Missing sections and entries without a string
@@ -286,42 +305,46 @@ if [[ -f "$SHELL_CONFIG" ]]; then
 fi
 
 # 5. Install UI enhancement for status bar warning & 1-click auth
-USER_PLUGIN_ID="${USER:-$(id -un)}.agents"
-USER_PLUGIN_DIR="$CONFIG_DIR/plugins/$USER_PLUGIN_ID"
+# Omarchy 4.5 keeps its own agents panel: the plugin's copy is built on the
+# 4.0 one and would hide 4.5's panel features.
+if (( ! NATIVE_ANTIGRAVITY )); then
+  USER_PLUGIN_ID="${USER:-$(id -un)}.agents"
+  USER_PLUGIN_DIR="$CONFIG_DIR/plugins/$USER_PLUGIN_ID"
 
-echo "🖥️  Setting up interactive status bar & 1-click authentication..."
-if [[ ! -d "$USER_PLUGIN_DIR" ]]; then
-  if command -v omarchy-plugin-clone >/dev/null 2>&1; then
-    omarchy-plugin-clone omarchy.agents >/dev/null 2>&1 || true
-  elif [[ -d "/usr/share/omarchy/shell/plugins/agents" ]]; then
-    mkdir -p "$USER_PLUGIN_DIR"
-    cp -r /usr/share/omarchy/shell/plugins/agents/* "$USER_PLUGIN_DIR/" 2>/dev/null || true
+  echo "🖥️  Setting up interactive status bar & 1-click authentication..."
+  if [[ ! -d "$USER_PLUGIN_DIR" ]]; then
+    if command -v omarchy-plugin-clone >/dev/null 2>&1; then
+      omarchy-plugin-clone omarchy.agents >/dev/null 2>&1 || true
+    elif [[ -d "/usr/share/omarchy/shell/plugins/agents" ]]; then
+      mkdir -p "$USER_PLUGIN_DIR"
+      cp -r /usr/share/omarchy/shell/plugins/agents/* "$USER_PLUGIN_DIR/" 2>/dev/null || true
+    fi
+    # Record that this installer created the clone, so uninstall can remove
+    # it again (a folder that already existed is the user's and is kept).
+    if [[ -d "$USER_PLUGIN_DIR" && ! -L "$USER_PLUGIN_DIR" ]]; then
+      touch "$USER_PLUGIN_DIR/$CLONE_MARKER"
+    fi
   fi
-  # Record that this installer created the clone, so uninstall can remove
-  # it again (a folder that already existed is the user's and is kept).
-  if [[ -d "$USER_PLUGIN_DIR" && ! -L "$USER_PLUGIN_DIR" ]]; then
-    touch "$USER_PLUGIN_DIR/$CLONE_MARKER"
-  fi
-fi
 
-if [[ -d "$USER_PLUGIN_DIR" ]]; then
-  # Preserve any pre-existing user UI edits (idempotent single-slot backups)
-  # before installing this plugin's Panel/Main and assets.
-  for ui_file in Panel.qml Main.qml; do
-    if [[ -f "$USER_PLUGIN_DIR/$ui_file" && ! -f "$USER_PLUGIN_DIR/$ui_file.bak" ]]; then
-      cp "$USER_PLUGIN_DIR/$ui_file" "$USER_PLUGIN_DIR/$ui_file.bak" 2>/dev/null || true
+  if [[ -d "$USER_PLUGIN_DIR" ]]; then
+    # Preserve any pre-existing user UI edits (idempotent single-slot backups)
+    # before installing this plugin's Panel/Main and assets.
+    for ui_file in Panel.qml Main.qml; do
+      if [[ -f "$USER_PLUGIN_DIR/$ui_file" && ! -f "$USER_PLUGIN_DIR/$ui_file.bak" ]]; then
+        cp "$USER_PLUGIN_DIR/$ui_file" "$USER_PLUGIN_DIR/$ui_file.bak" 2>/dev/null || true
+      fi
+      cp -f --remove-destination "$SCRIPT_DIR/ui/$ui_file" "$USER_PLUGIN_DIR/$ui_file"
+    done
+    mkdir -p "$USER_PLUGIN_DIR/assets"
+    for asset in antigravity.svg antigravity-light.svg; do
+      if [[ -f "$USER_PLUGIN_DIR/assets/$asset" && ! -f "$USER_PLUGIN_DIR/assets/$asset.bak" ]]; then
+        cp "$USER_PLUGIN_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset.bak" 2>/dev/null || true
+      fi
+      cp -f --remove-destination "$SCRIPT_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset"
+    done
+    if command -v omarchy-shell >/dev/null 2>&1; then
+      omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     fi
-    cp -f --remove-destination "$SCRIPT_DIR/ui/$ui_file" "$USER_PLUGIN_DIR/$ui_file"
-  done
-  mkdir -p "$USER_PLUGIN_DIR/assets"
-  for asset in antigravity.svg antigravity-light.svg; do
-    if [[ -f "$USER_PLUGIN_DIR/assets/$asset" && ! -f "$USER_PLUGIN_DIR/assets/$asset.bak" ]]; then
-      cp "$USER_PLUGIN_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset.bak" 2>/dev/null || true
-    fi
-    cp -f --remove-destination "$SCRIPT_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset"
-  done
-  if command -v omarchy-shell >/dev/null 2>&1; then
-    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
   fi
 fi
 
@@ -399,7 +422,11 @@ chmod +x "$HOOKS_DIR/90-antigravity.hook"
 
 # 8. Collect initial usage metrics
 echo "📊 Fetching initial quota and metrics..."
-"$BIN_DIR/omarchy-agent-usage-update" --force antigravity >/dev/null 2>&1 || true
+if (( NATIVE_ANTIGRAVITY )); then
+  "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent-usage-update" --force agy >/dev/null 2>&1 || true
+else
+  "$BIN_DIR/omarchy-agent-usage-update" --force antigravity >/dev/null 2>&1 || true
+fi
 
 # 9. Check authentication state
 echo ""
@@ -415,7 +442,11 @@ fi
 if [[ "$IS_AUTH" == false ]]; then
   echo "⚠️  Antigravity is not authenticated yet."
   echo "👉 A warning indicator will appear on your bar."
-  echo "👉 You can click 'Sign In' in the bar panel or run:"
+  if (( ! NATIVE_ANTIGRAVITY )); then
+    echo "👉 You can click 'Sign In' in the bar panel or run:"
+  else
+    echo "👉 Run:"
+  fi
   echo "     omarchy-antigravity auth"
 else
   echo "✅ Antigravity is authenticated and operational!"

@@ -7,6 +7,20 @@ set -euo pipefail
 CONFIG_DIR="$HOME/.config/omarchy"
 AGENT_FILE="$CONFIG_DIR/defaults/agent"
 
+# Omarchy 4.5 and later handle Antigravity themselves (agent id "agy", usage
+# collector, panel). After the update that brings them, hand the plugin's
+# collector, updater, launcher and panel over; the status line stays.
+if [[ -x "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent-usage-agy" ]]; then
+  if [[ ! -f "$AGENT_FILE" && -f "$CONFIG_DIR/antigravity.default" ]]; then
+    mkdir -p "$CONFIG_DIR/defaults"
+    echo "agy" > "$AGENT_FILE"
+  fi
+  if [[ -x "$HOME/.local/bin/omarchy-antigravity" ]]; then
+    "$HOME/.local/bin/omarchy-antigravity" adopt-native >/dev/null || true
+  fi
+  exit 0
+fi
+
 # 1. Restore defaults only if user previously selected Antigravity as default.
 # If the user has explicitly selected another agent, respect their choice.
 if [[ -f "$AGENT_FILE" ]]; then
