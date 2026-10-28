@@ -7,7 +7,7 @@
 
 Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://omarchy.org/) Linux:
 - 📊 **Real-time Quota Meters**: 5-hour session and weekly limits for the Gemini and Claude/GPT model groups, plus any per-model pool Antigravity reports (such as Gemini 4 Argon), directly in the Omarchy bar panel.
-- 🚨 **Broken-Usage Alerts**: If Antigravity stops reporting the Gemini or Claude/GPT quota (for example after an upstream format change), the bar lights up, the panel says `Usage incomplete`, and you get a single desktop notification.
+- 🚨 **Broken-Usage Alerts**: If Antigravity stops reporting a quota pool it reported during the last week (for example after an upstream format change), the bar lights up, the panel says `Usage incomplete`, and you get a single desktop notification. The bar alarm covers every agent in the panel, not only the one on screen.
 - ⚡ **Agent Integration**: Dedicated CLI helper `omarchy-antigravity` and dashboard support for default agent routing.
 - 🔔 **Status Bar Warnings**: The bar icon lights up in warning color with a tooltip when authentication is required or expired.
 - 🔑 **1-Click Authentication**: Interactive **"Sign In"** button in the dashboard opens a floating terminal to log in to Google immediately.
@@ -27,7 +27,7 @@ When not authenticated:
 - **Bar Icon**: Lights up in warning color with tooltip `"Antigravity: Waiting for auth"`.
 - **Panel Banner**: Shows an alert box with a direct **[ 󰌑 Sign In ]** button that launches the Google OAuth login with 1 click.
 
-When usage cannot be read completely (`Usage incomplete` or `Quota unavailable`), the bar lights up the same way and a desktop notification is sent once per problem; the panel banner explains what is missing, without the Sign In button.
+When usage cannot be read completely (`Usage incomplete`, `Quota unavailable`, or `Collector error`), the bar lights up the same way and opening the panel jumps to the agent with the problem. A desktop notification is sent once per problem, after it shows up on two refreshes in a row so a single network blip stays quiet; the panel banner explains what is missing, without the Sign In button.
 
 ---
 
@@ -118,13 +118,13 @@ Antigravity is completely optional and non-intrusive:
 ## ⚙️ How It Works Under the Hood
 
 1. **Dual-Source Credential & Quota Extraction**:
-   The collector [`omarchy-agent-usage-antigravity`](bin/omarchy-agent-usage-antigravity) securely resolves Google Cloud Code credentials by checking `~/.gemini/antigravity-cli/antigravity-oauth-token` first, falling back to the system keyring via `secret-tool`. If tokens are expiring, it auto-refreshes them with Google OAuth endpoints. It reads quota from the official CLI's structured `agy -p /usage --output-format json` output, which carries every group the CLI shows, and falls back to Google's internal Cloud Code quota endpoint when the CLI cannot answer. If either of the two shared pools (Gemini, Claude/GPT) is missing from the result, the record is marked `Usage incomplete` so a format change is never silent. Local prompt metrics and active session counts are parsed from `~/.gemini/antigravity-cli/history.jsonl` and `brain/`.
+   The collector [`omarchy-agent-usage-antigravity`](bin/omarchy-agent-usage-antigravity) securely resolves Google Cloud Code credentials by checking `~/.gemini/antigravity-cli/antigravity-oauth-token` first, falling back to the system keyring via `secret-tool`. agy's credentials are only ever read: when its access token is stale, the collector mints its own and keeps it in a private cache. Quota comes from Google's internal Cloud Code endpoint, which is fast but stopped reporting the Gemini pools; the pools it leaves out are filled in from the official CLI's structured `agy -p /usage --output-format json` output. Every `agy -p` call starts your MCP servers, so that answer is cached for 10 minutes. If a pool reported during the last week goes missing, the record is marked `Usage incomplete` so a format change is never silent, and the plan label comes from your account (for example `Google AI Pro`). Local prompt metrics and active session counts are parsed from `~/.gemini/antigravity-cli/history.jsonl` and `brain/`.
 2. **Session-Aware Refresh & Low-Latency Cache**:
-   To eliminate unnecessary network requests and idle disk writes, the collector inspects the OS process table (`pgrep -x agy`) and only queries remote servers when at least one active Antigravity session is running (or when `--force` is requested via manual refresh). While active, Quickshell polls every 60 seconds with a 120-second quota cache TTL (each `agy -p /usage` call takes a few seconds), and an optional systemd timer (`omarchy-agent-usage.timer`) keeps state refreshed on disk in the background.
+   To eliminate unnecessary network requests and idle disk writes, the collector inspects the OS process table (`pgrep -x agy`) and only queries remote servers when at least one active Antigravity session is running (or when `--force` is requested via manual refresh). While active, the bar refreshes Antigravity's limits every 2 minutes (`limitsRefreshIntervalSec`, default 120) and runs the full scan of every agent every 15 minutes (`refreshIntervalSec`, default 900), both configurable in `shell.json`; opening the panel also refreshes limits. The collector caches limits for 60 seconds and agy's `/usage` answer for 10 minutes, and every run finishes within a 50-second budget.
 3. **Dedicated CLI & Standard Permission Model**:
    Ships a plugin-specific `omarchy-antigravity` executable in `~/.local/bin/` providing `run`, `auth`, `status`, and `refresh` subcommands. Executes `agy` using its standard permission model without bypassing permission prompts.
 4. **Bar Widget & Status Alerts**:
-   Integrates into the Quickshell bar. When quota is low, authentication is missing, or usage could not be read completely, the bar button triggers an urgent visual alert, and a new problem also raises one desktop notification via `notify-send`.
+   Integrates into the Quickshell bar. When quota is low, authentication is missing, or usage could not be read completely, the bar button triggers an urgent visual alert for any agent in the panel, and a new problem also raises one desktop notification via `notify-send`. A spent window clears at its reset time, even while the panel is closed.
 5. **Update Hook**:
    Drops `90-antigravity.hook` into `~/.config/omarchy/hooks/post-update.d/` so every time you run `omarchy update`, your default agent and widgets remain active.
 
@@ -176,7 +176,7 @@ git config core.hooksPath .githooks
 ./uninstall.sh
 omarchy restart shell
 ```
-The uninstaller removes all installed binaries, hooks, cache files, and automatically restores your previous default agent backup if one was present.
+The uninstaller removes all installed binaries, hooks, and cache files, and restores your previous default agent backup if one was present. It only removes what is recognizably the plugin's: your own Antigravity status line and `statusLine` setting are left alone, and the agents plugin folder is removed only if the installer created it.
 
 ### If installed via Omarchy Plugin Manager:
 ```bash

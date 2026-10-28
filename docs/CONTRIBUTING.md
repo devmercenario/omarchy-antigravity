@@ -74,13 +74,13 @@ omarchy-antigravity/
                        ▼
 ┌──────────────────────────────────────────────┐
 │  bin/omarchy-agent-usage-antigravity         │
-│  1. Check token expiry (refresh if needed)   │
-│  2. Read `agy -p /usage` (JSON output)       │
-│     └─ Fallback: quota API on failure        │
+│  1. Read token (never writes agy's creds)    │
+│  2. Quota API, then `agy -p /usage` for the  │
+│     pools it leaves out (cached 10 min)      │
 │  3. Read local history (~/.gemini/...)       │
 │  4. Emit JSON to stdout                      │
 └──────────────────────┬───────────────────────┘
-                       │ Writes atomic record (TTL: 120s)
+                       │ Writes atomic record (TTL: 60s)
                        ▼
 ┌──────────────────────────────────────────────┐
 │  ~/.local/state/omarchy/agents/usage/        │
@@ -116,17 +116,20 @@ If `access_token` is expired or within 120 seconds of expiration:
   - `client_secret`: Standard Native Client Secret (configurable via `ANTIGRAVITY_CLIENT_SECRET`)
   - `grant_type`: `refresh_token`
   - `refresh_token`: `<stored_refresh_token>`
-- **Storage**: Updates both the token file (if present) and the system keyring via `secret-tool store`.
+- **Storage**: agy's token file and keyring entry are never written. The refreshed access token goes to the collector's own `0600` cache, `~/.cache/omarchy/agent-usage/antigravity-access-token.json`, keyed by a SHA-256 fingerprint of the refresh token so another account never reuses it.
 
-### 3.3. CLI Usage Source & Quota Endpoint Fallback
-- **Primary Source (`agy -p /usage --output-format json`)**: The collector runs the official CLI's `/usage` slash command (no model turn, no history entry; `--log-file /dev/null` keeps it from rotating the user's session logs) and reads `command.data.groups[].buckets[]` (`name`, `window`, `remaining_fraction`, `reset_time`). Every group is kept: the two shared pools are shortened to `Gemini` and `Claude/GPT`, and any other pool keeps its own name (for example `Gemini 4 Argon (Weekly)`). When an older CLI prints only the table, its tab-separated rows are parsed by shape instead:
+### 3.3. Quota API with CLI Supplement
+- **Quota API (first)**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`. Cheap, and the source for every pool it reports. Since October 2026 it returns only the `Claude and GPT models` group. 401/403 and other 4xx errors (except 408/429) are not retried.
+- **CLI supplement (`agy -p /usage --output-format json`)**: consulted only when the API result lacks a shared pool (`Gemini`, `Claude/GPT`) or a pool seen in the last week. The collector reads `command.data.groups[].buckets[]` (`name`, `window`, `remaining_fraction`, `reset_time`) and adds only the pools the API left out. Every `agy -p` call starts the user's MCP servers, so its answer (failures included) is cached for 10 minutes in `antigravity-agy-usage.json`; `--force` bypasses that cache. The call is a slash command (no model turn, no history entry), `--log-file /dev/null` keeps it from rotating the user's session logs, and it runs in its own process group so a timeout kills agy's MCP servers too. The two shared pools are shortened to `Gemini` and `Claude/GPT`; any other pool keeps its own name (for example `Gemini 4 Argon (Weekly)`). When an older CLI prints only the table, its tab-separated rows are parsed by shape:
   ```tsv
   Gemini Models	Weekly Limit Remaining	27%	2026-09-10T18:37:23Z
   Gemini 4 Argon	Gemini 4 Argon Weekly Limit	88%	2026-11-04T14:02:51Z
   ```
-- **Fallback Endpoint**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, used when the CLI is missing or fails. Since October 2026 it returns only the `Claude and GPT models` group.
-- **Completeness Check**: If either shared pool is missing from the final result, the record gets `usageStatusText: "Usage incomplete"` with an explanation in `authHelpText`. The bar lights up and `notify-send` fires once per distinct status (remembered in `~/.cache/omarchy/agent-usage/antigravity-alert.json`, re-armed when the status clears). `authRequired` is `true` only for `Waiting for auth`, which is the only status that shows the panel's Sign In button.
-- **Cache TTL**: Persisted to `~/.cache/omarchy/agent-usage/antigravity-limits.json` with a 120-second TTL (`CACHE_TTL_SECONDS = 120`); each `agy -p /usage` call takes several seconds, so the cache absorbs the panel's 60-second polling.
+- **Completeness Check**: pools are remembered for a week in `antigravity-groups.json`. A pool reported during that week that is now missing, or an empty result, sets `usageStatusText: "Usage incomplete"` with an explanation in `authHelpText`; a pool unseen for longer is treated as retired. A plan that never had a pool is never flagged.
+- **Notifications**: `notify-send` fires when the same problem status shows up on two consecutive runs, once per status (remembered in `antigravity-alert.json`, re-armed when it clears). The body is markup-escaped. `authRequired` is `true` only for `Waiting for auth`, which is the only status that shows the panel's Sign In button.
+- **Failures**: every run has a 50-second budget shared by all requests and helpers. Any unexpected exception still prints a record with `usageStatusText: "Collector error"` (keeping the last limits), so the panel never freezes silently on stale data.
+- **Account label**: `tierLabel` is `"<plan> · <email>"`: the plan from `loadCodeAssist` (`paidTier.name`, else `currentTier.name`, e.g. `Google AI Pro`) and the email from userinfo, cached in `antigravity-account.json` per account fingerprint so switching accounts in agy is picked up.
+- **Cache TTL**: the merged limits are cached for 60 seconds (`CACHE_TTL_SECONDS`), doubled for `--limits-only`.
 - **Fallback endpoint headers**:
   - `Authorization: Bearer <access_token>`
   - `Content-Type: application/json`
@@ -253,10 +256,14 @@ Antigravity is designed as a first-class, **optional** agent that coexists with 
 - **Multi-Collector Runner (`omarchy-agent-usage-update`)**:
   - Scans both `/usr/share/omarchy/bin/omarchy-agent-usage-*` and `~/.local/bin/omarchy-agent-usage-*` to execute all available collectors.
   - Supports `--limits-only` (rapid quota polling), `--force` (cache bypass), and `--except <id>` (skip providers disabled in `shell.json`).
-  - Writes atomically to `~/.local/state/omarchy/agents/usage/<id>.json` using temporary files and `jq` validation before replacement.
+  - Writes atomically to `${XDG_STATE_HOME:-~/.local/state}/omarchy/agents/usage/<id>.json` using temporary files and `jq` validation before replacement. Exit 0 with no output is a deliberate skip that keeps the previous record.
+  - Runs collectors in parallel from `${OMARCHY_PATH:-/usr/share/omarchy}/bin` and `~/.local/bin` (local wins), each under `timeout 60` and a non-blocking per-collector `flock` (`.<id>.lock`), so overlapping refreshes skip a collector that is still running.
+  - Only plain lowercase ids (`^[a-z0-9][a-z0-9-]*$`) not starting with `update` are run, and an `OMARCHY_AGENT_USAGE_UPDATE_ACTIVE` guard turns nested invocations into no-ops: a stray copy of the updater can never recurse.
+  - Forwards each collector's stderr as `<id>: ...` (control characters stripped, 50 lines max) and exits non-zero when a collector fails, times out, or prints invalid JSON.
+  - Keep the `# omarchy-antigravity: agent-usage-update` marker line (and the status line's `# omarchy-antigravity: statusline`) verbatim: install and uninstall use it to tell the plugin's copy from the user's.
 - **Refresh Intervals**:
-  - `ui/Main.qml` defaults to `refreshIntervalSec: 60` (1 minute), configurable in `shell.json`.
-  - The optional systemd user service and timer (`omarchy-agent-usage.service` / `.timer`) run every minute (`OnUnitActiveSec=1m`) to guarantee background freshness regardless of desktop shell state.
+  - `ui/Main.qml` runs the full refresh of every collector every `refreshIntervalSec` (default 900, matching stock Omarchy) and a limits-only refresh of Antigravity every `limitsRefreshIntervalSec` (default 120, minimum 60); both are set in `shell.json`. Opening the panel also refreshes limits.
+  - An optional systemd user timer (`omarchy-agent-usage.timer`, not installed by `install.sh`) may also run `omarchy-agent-usage-update --limits-only`; the updater's per-collector locks keep overlapping runs from colliding.
 - **Session-Aware Inactivity Suspension**:
   - The collector checks `pgrep -x agy` before polling remote Google endpoints. If no active Antigravity session is found in the OS process table and a local state file already exists, it cleanly exits with code 0 without stdout output.
   - This prevents unnecessary network bandwidth, quota polling, and disk writes when the agent is idle.
