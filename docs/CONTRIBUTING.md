@@ -75,12 +75,12 @@ omarchy-antigravity/
 ┌──────────────────────────────────────────────┐
 │  bin/omarchy-agent-usage-antigravity         │
 │  1. Check token expiry (refresh if needed)   │
-│  2. Fetch POST /v1internal:retrieveQuota     │
-│     └─ Fallback: `agy -p /usage` on failure  │
+│  2. Read `agy -p /usage` (JSON output)       │
+│     └─ Fallback: quota API on failure        │
 │  3. Read local history (~/.gemini/...)       │
 │  4. Emit JSON to stdout                      │
 └──────────────────────┬───────────────────────┘
-                       │ Writes atomic record (TTL: 30s)
+                       │ Writes atomic record (TTL: 120s)
                        ▼
 ┌──────────────────────────────────────────────┐
 │  ~/.local/state/omarchy/agents/usage/        │
@@ -118,15 +118,16 @@ If `access_token` is expired or within 120 seconds of expiration:
   - `refresh_token`: `<stored_refresh_token>`
 - **Storage**: Updates both the token file (if present) and the system keyring via `secret-tool store`.
 
-### 3.3. Authoritative Quota Endpoint & CLI Fallback
-- **Primary Endpoint**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
-- **CLI Fallback (`agy -p /usage`)**: If the API call fails or credentials are not yet initialized, the collector runs `agy -p /usage` and parses the tabular output:
+### 3.3. CLI Usage Source & Quota Endpoint Fallback
+- **Primary Source (`agy -p /usage --output-format json`)**: The collector runs the official CLI's `/usage` slash command (no model turn, no history entry; `--log-file /dev/null` keeps it from rotating the user's session logs) and reads `command.data.groups[].buckets[]` (`name`, `window`, `remaining_fraction`, `reset_time`). Every group is kept: the two shared pools are shortened to `Gemini` and `Claude/GPT`, and any other pool keeps its own name (for example `Gemini 4 Argon (Weekly)`). When an older CLI prints only the table, its tab-separated rows are parsed by shape instead:
   ```tsv
   Gemini Models	Weekly Limit Remaining	27%	2026-09-10T18:37:23Z
-  Gemini Models	Five Hour Limit Remaining	52%	2026-09-09T03:56:17Z
+  Gemini 4 Argon	Gemini 4 Argon Weekly Limit	88%	2026-11-04T14:02:51Z
   ```
-- **Cache TTL**: In-memory cache is persisted to `~/.cache/omarchy/agent-usage/antigravity-limits.json` with a 30-second TTL (`CACHE_TTL_SECONDS = 30`) to balance responsiveness and rate-limiting.
-- **Headers**:
+- **Fallback Endpoint**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, used when the CLI is missing or fails. Since October 2026 it returns only the `Claude and GPT models` group.
+- **Completeness Check**: If either shared pool is missing from the final result, the record gets `usageStatusText: "Usage incomplete"` with an explanation in `authHelpText`. The bar lights up and `notify-send` fires once per distinct status (remembered in `~/.cache/omarchy/agent-usage/antigravity-alert.json`, re-armed when the status clears). `authRequired` is `true` only for `Waiting for auth`, which is the only status that shows the panel's Sign In button.
+- **Cache TTL**: Persisted to `~/.cache/omarchy/agent-usage/antigravity-limits.json` with a 120-second TTL (`CACHE_TTL_SECONDS = 120`); each `agy -p /usage` call takes several seconds, so the cache absorbs the panel's 60-second polling.
+- **Fallback endpoint headers**:
   - `Authorization: Bearer <access_token>`
   - `Content-Type: application/json`
   - `User-Agent: antigravity`

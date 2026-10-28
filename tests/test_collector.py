@@ -202,6 +202,91 @@ class TestQuotaParsing(unittest.TestCase):
         self.assertEqual(limits[3]["title"], "Claude/GPT (Weekly)")
         self.assertEqual(limits[3]["percent"], 0.0)
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout")
+    def test_fetch_limits_via_agy_reads_structured_json(self, mock_bounded, _mock_which):
+        # Shape printed by `agy -p /usage --output-format json` (agy 1.4.9).
+        stdout = json.dumps({
+            "status": "SUCCESS",
+            "response": "ignored when structured data is present",
+            "command": {"name": "usage", "data": {"groups": [
+                {"name": "Gemini Models", "buckets": [
+                    {"id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+                     "remaining_fraction": 0.9995, "reset_time": "2026-11-04T14:19:21Z"},
+                    {"id": "gemini-5h", "name": "Five Hour Limit Remaining", "window": "5h",
+                     "remaining_fraction": 0.75, "reset_time": "2026-10-28T19:19:21Z"},
+                ]},
+                {"name": "Claude and GPT models", "buckets": [
+                    {"id": "3p-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+                     "remaining_fraction": 1, "reset_time": "2026-11-04T14:48:55Z"},
+                    {"id": "3p-5h", "name": "Five Hour Limit Remaining", "window": "5h",
+                     "remaining_fraction": 0, "reset_time": "2026-10-28T19:48:55Z"},
+                ]},
+                {"name": "Gemini 4 Argon", "buckets": [
+                    {"id": "gemini-argon-wtu-weekly", "name": "Gemini 4 Argon Weekly Limit",
+                     "window": "weekly", "remaining_fraction": 0.876, "reset_time": "2026-11-04T14:02:51Z"},
+                ]},
+            ]}},
+        })
+        mock_bounded.return_value = (0, stdout.encode("utf-8"), False)
+
+        limits = collector.fetch_limits_via_agy()
+
+        args = mock_bounded.call_args[0][0]
+        self.assertEqual(args[0], "/usr/bin/agy")
+        self.assertIn("--output-format", args)
+        self.assertEqual(args[args.index("--log-file") + 1], os.devnull)
+        self.assertEqual(
+            [(item["title"], item["percent"]) for item in limits],
+            [
+                ("Gemini (5h)", 0.25),
+                ("Gemini (Weekly)", 0.0005),
+                ("Claude/GPT (5h)", 1.0),
+                ("Claude/GPT (Weekly)", 0.0),
+                ("Gemini 4 Argon (Weekly)", 0.124),
+            ],
+        )
+        self.assertEqual(limits[4]["resetsAt"], "2026-11-04T14:02:51Z")
+        self.assertTrue(os.path.exists(collector.CACHE_FILE))
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout")
+    def test_fetch_limits_via_agy_skips_unusable_buckets(self, mock_bounded, _mock_which):
+        stdout = json.dumps({"command": {"data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"id": "no-fraction", "name": "Weekly Limit Remaining", "window": "weekly"},
+                {"id": "off", "name": "Five Hour Limit Remaining", "window": "5h",
+                 "remaining_fraction": 0.5, "disabled": True},
+                {"id": "ok", "name": "Five Hour Limit Remaining", "window": "5h",
+                 "remaining_fraction": 0.5},
+            ]},
+        ]}}})
+        mock_bounded.return_value = (0, stdout.encode("utf-8"), False)
+
+        limits = collector.fetch_limits_via_agy()
+        self.assertEqual([item["title"] for item in limits], ["Gemini (5h)"])
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout")
+    def test_fetch_limits_via_agy_text_keeps_unknown_groups(self, mock_bounded, _mock_which):
+        stdout = (
+            "Gemini Models\tFive Hour Limit Remaining\t90%\t2026-09-08T22:56:17Z\n"
+            "Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t88%\t2026-11-04T14:02:51Z\n"
+            "not a quota row\n"
+        )
+        mock_bounded.return_value = (0, stdout.encode("utf-8"), False)
+
+        limits = collector.fetch_limits_via_agy()
+        self.assertEqual(
+            [item["title"] for item in limits],
+            ["Gemini (5h)", "Gemini 4 Argon (Weekly)"],
+        )
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout", return_value=(2, b"flag provided but not defined", False))
+    def test_fetch_limits_via_agy_nonzero_exit_returns_none(self, _mock_bounded, _mock_which):
+        self.assertIsNone(collector.fetch_limits_via_agy())
+
     @patch("collector.resolve_tool")
     def test_fetch_limits_via_agy_not_installed(self, mock_which):
         mock_which.return_value = None
@@ -624,6 +709,10 @@ class TestMainExecutionScenarios(unittest.TestCase):
         # state file on the developer/CI machine.
         collector.STATE_DIR = self.temp_dir
         collector.STATE_FILE = os.path.join(self.temp_dir, "state.json")
+        # Never pop real desktop notifications from the test suite.
+        notify_patcher = patch("collector.notify_status_change")
+        self.mock_notify = notify_patcher.start()
+        self.addCleanup(notify_patcher.stop)
 
     def tearDown(self):
         collector.CACHE_DIR = self.orig_cache_dir
@@ -679,20 +768,26 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertTrue(record["ready"])
             self.assertEqual(record["usageStatusText"], "Waiting for auth")
             self.assertIn("No Antigravity credentials", record["authHelpText"])
+            self.assertTrue(record["authRequired"])
             self.assertEqual(record["limits"], [])
             self.assertEqual(record["tierLabel"], "Pro")
+            self.mock_notify.assert_called_once_with("Waiting for auth", record["authHelpText"])
+
+    COMPLETE_LIMITS = [
+        {"title": "Gemini (5h)", "label": "Session", "percent": 0.12, "resetsAt": ""},
+        {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
+    ]
 
     @patch("collector.resolve_tool")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
     @patch("collector.get_valid_access_token")
-    def test_main_authenticated_healthy(self, mock_auth, mock_email, mock_limits, mock_which):
+    def test_main_authenticated_healthy(self, mock_auth, mock_email, mock_limits, _mock_agy, mock_which):
         mock_which.return_value = "/usr/bin/agy"
         mock_auth.return_value = ("valid-token", "")
         mock_email.return_value = "developer@example.com"
-        mock_limits.return_value = [
-            {"title": "Gemini (5h)", "label": "Session", "percent": 0.12, "resetsAt": ""}
-        ]
+        mock_limits.return_value = self.COMPLETE_LIMITS
 
         with patch("builtins.print") as mock_print:
             collector.main(argv=[])
@@ -703,8 +798,48 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertEqual(record["schemaVersion"], 1)
             self.assertEqual(record["id"], "antigravity")
             self.assertEqual(record["usageStatusText"], "")
+            self.assertFalse(record["authRequired"])
             self.assertEqual(record["tierLabel"], "Pro · developer@example.com")
-            self.assertEqual(len(record["limits"]), 1)
+            self.assertEqual(len(record["limits"]), 2)
+            self.mock_notify.assert_called_once_with("", "")
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_cached_user_email", return_value="")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_flags_missing_quota_group(self, _auth, _email, mock_limits, _agy, _which):
+        # The quota API's current shape: only the Claude/GPT pool comes back.
+        mock_limits.return_value = [
+            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
+            {"title": "Claude/GPT (Weekly)", "label": "Weekly", "percent": 0.0, "resetsAt": ""},
+        ]
+
+        with patch("builtins.print") as mock_print:
+            collector.main(argv=["--force"])
+            record = json.loads(mock_print.call_args[0][0])
+
+        self.assertEqual(record["usageStatusText"], "Usage incomplete")
+        self.assertIn("Gemini", record["authHelpText"])
+        self.assertNotIn("Claude/GPT", record["authHelpText"])
+        self.assertFalse(record["authRequired"])
+        # What did come back is still shown.
+        self.assertEqual(len(record["limits"]), 2)
+        self.mock_notify.assert_called_once_with("Usage incomplete", record["authHelpText"])
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy", return_value=[])
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_cached_user_email", return_value="")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_flags_empty_quota_response(self, _auth, _email, mock_limits, _agy, _which):
+        with patch("builtins.print") as mock_print:
+            collector.main(argv=["--force"])
+            record = json.loads(mock_print.call_args[0][0])
+
+        mock_limits.assert_not_called()
+        self.assertEqual(record["usageStatusText"], "Usage incomplete")
+        self.assertIn("Gemini and Claude/GPT", record["authHelpText"])
 
     @patch("collector.resolve_tool")
     @patch("collector.fetch_limits_via_agy")
@@ -739,13 +874,13 @@ class TestMainExecutionScenarios(unittest.TestCase):
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
     @patch("collector.get_valid_access_token")
-    def test_main_quota_failure_falls_back_to_agy(self, mock_auth, mock_email, mock_limits, mock_agy, mock_which):
+    def test_main_prefers_agy_usage_over_api(self, mock_auth, mock_email, mock_limits, mock_agy, mock_which):
         mock_which.return_value = "/usr/bin/agy"
         mock_auth.return_value = ("valid-token", "")
         mock_email.return_value = "developer@example.com"
-        mock_limits.side_effect = urllib.error.URLError("Quota endpoint down")
         mock_agy.return_value = [
-            {"title": "Gemini (5h)", "label": "Session", "percent": 0.42, "resetsAt": "2026-09-08T22:56:17Z"}
+            {"title": "Gemini (5h)", "label": "Session", "percent": 0.42, "resetsAt": "2026-09-08T22:56:17Z"},
+            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
         ]
 
         with patch("builtins.print") as mock_print:
@@ -754,10 +889,11 @@ class TestMainExecutionScenarios(unittest.TestCase):
             output_str = mock_print.call_args[0][0]
             record = json.loads(output_str)
 
+            mock_limits.assert_not_called()
             self.assertEqual(record["schemaVersion"], 1)
             self.assertEqual(record["id"], "antigravity")
             self.assertEqual(record["usageStatusText"], "")
-            self.assertEqual(len(record["limits"]), 1)
+            self.assertEqual(len(record["limits"]), 2)
             self.assertEqual(record["limits"][0]["percent"], 0.42)
 
     @patch("collector.resolve_tool", return_value="/usr/bin/pgrep")
@@ -792,9 +928,10 @@ class TestMainExecutionScenarios(unittest.TestCase):
     @patch("os.path.exists")
     @patch("collector.resolve_tool")
     @patch("collector.get_valid_access_token")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
     @patch("collector.fetch_authoritative_limits")
     @patch("collector.get_cached_user_email")
-    def test_main_forced_bypasses_session_check(self, mock_email, mock_limits, mock_auth, mock_which, mock_exists, mock_running):
+    def test_main_forced_bypasses_session_check(self, mock_email, mock_limits, _mock_agy, mock_auth, mock_which, mock_exists, mock_running):
         mock_exists.side_effect = lambda path: True if path == collector.STATE_FILE else False
         mock_running.return_value = False
         mock_which.return_value = "/usr/bin/agy"
@@ -1066,6 +1203,13 @@ class TestLimitClassification(unittest.TestCase):
         self.assertEqual(entry[2]["label"], "Monthly Limit")
         self.assertEqual(entry[2]["resetsAt"], "R")
 
+    def test_per_model_gemini_pool_keeps_its_own_name(self):
+        # Folding "Gemini 4 Argon" into "Gemini" would overwrite the shared
+        # Gemini weekly meter with the per-model one.
+        entry = collector._limit_entry("Gemini 4 Argon", "weekly", "Gemini 4 Argon Weekly Limit", 0.1, "")
+        self.assertEqual(entry[0], 2)
+        self.assertEqual(entry[2]["title"], "Gemini 4 Argon (Weekly)")
+
     def test_claude_group_is_second_priority(self):
         entry = collector._limit_entry("Claude and GPT models", "Weekly", "", 0.3, "")
         self.assertEqual(entry[0], 1)
@@ -1082,6 +1226,47 @@ class TestLimitClassification(unittest.TestCase):
             [item["title"] for item in limits],
             ["Gemini (5h)", "Gemini (Weekly)", "Claude/GPT (5h)"],
         )
+
+
+class TestStatusNotification(unittest.TestCase):
+    """A broken usage display must notify once, not on every refresh."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_alert_file = collector.ALERT_STATE_FILE
+        collector.ALERT_STATE_FILE = os.path.join(self.temp_dir, "alert.json")
+
+    def tearDown(self):
+        collector.ALERT_STATE_FILE = self.orig_alert_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/notify-send")
+    @patch("subprocess.run")
+    def test_notifies_once_per_problem_and_rearms_after_recovery(self, mock_run, _tool):
+        collector.notify_status_change("", "")
+        mock_run.assert_not_called()
+
+        collector.notify_status_change("Usage incomplete", "Gemini missing")
+        collector.notify_status_change("Usage incomplete", "Gemini missing")
+        self.assertEqual(mock_run.call_count, 1)
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[0], "/usr/bin/notify-send")
+        self.assertIn("Antigravity: Usage incomplete", args)
+        self.assertIn("Gemini missing", args)
+
+        collector.notify_status_change("", "")
+        collector.notify_status_change("Usage incomplete", "Gemini missing")
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("collector.resolve_tool", return_value=None)
+    @patch("subprocess.run")
+    def test_missing_notify_send_is_silent(self, mock_run, _tool):
+        collector.notify_status_change("Quota unavailable", "down")
+        mock_run.assert_not_called()
+
+    def test_check_limits_complete_leaves_existing_status(self):
+        status, detail = collector._check_limits_complete([], "Waiting for auth", "sign in")
+        self.assertEqual((status, detail), ("Waiting for auth", "sign in"))
 
 
 class TestObservability(unittest.TestCase):

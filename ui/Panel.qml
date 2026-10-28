@@ -388,13 +388,14 @@ Panel {
     tooltipText: {
       if (!root.provider) return "Agents"
       if (root.authNeeded && String(root.provider.usageStatusText || "") !== "") {
-        return root.provider.name + ": " + (root.provider.usageStatusText || "Authentication required") + " (Click to resolve)"
+        var hint = root.provider.authRequired === true ? " (Click to resolve)" : " (Click for details)"
+        return root.provider.providerName + ": " + root.provider.usageStatusText + hint
       }
       if (root.headline) {
         var pct = Math.round((1.0 - root.headline.percent) * 100)
-        return root.provider.name + " (" + root.headline.title + "): " + pct + "% remaining"
+        return root.provider.providerName + " (" + root.headline.title + "): " + pct + "% remaining"
       }
-      return root.provider.name
+      return root.provider.providerName
     }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.launchAgent()
@@ -596,7 +597,8 @@ Panel {
 
               Button {
                 id: authActionBtn
-                visible: !!root.provider && (root.provider.providerId === "antigravity" || root.provider.providerId === "gemini")
+                visible: !!root.provider && root.provider.authRequired === true
+                  && (root.provider.providerId === "antigravity" || root.provider.providerId === "gemini")
                 anchors.verticalCenter: parent.verticalCenter
                 text: "Sign In"
                 iconText: "󰌑"
