@@ -73,6 +73,18 @@ run --pick
 [[ "$(calls)" == "launch-tui $HOME/Work --app-id=org.omarchy.agent agy" ]] \
   || fail "antigravity did not open agy via omarchy-launch-tui (got: $(calls))."
 
+echo "  ▶ 'agy' (the next Omarchy's id) opens agy until Omarchy's launcher handles it..."
+echo "agy" > "$HOME/agent"
+run
+[[ "$(calls)" == "launch-tui $HOME/Work --app-id=org.omarchy.agent agy" ]] \
+  || fail "agy was not opened while the stock launcher lacks it (got: $(calls))."
+cp "$OMARCHY_PATH/bin/omarchy-agent" "$ROOT/stock.bak"
+printf '#!/bin/bash\ncase "$1" in\nagy)\n  ;;\nesac\necho "stock $*" >> "%s"\n' "$CALLS" > "$OMARCHY_PATH/bin/omarchy-agent"
+run --pick
+[[ "$(calls)" == "stock --pick" ]] || fail "agy was not left to a stock launcher that handles it (got: $(calls))."
+cp "$ROOT/stock.bak" "$OMARCHY_PATH/bin/omarchy-agent"
+echo "antigravity" > "$HOME/agent"
+
 echo "  ▶ Prompts and --inline follow the stock launcher's flags..."
 run --prompt "fix the bug"
 [[ "$(calls)" == "launch-tui $HOME/Work --app-id=org.omarchy.agent agy -i fix the bug" ]] \

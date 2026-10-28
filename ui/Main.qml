@@ -33,9 +33,11 @@ Item {
 
   // "gemini" is Omarchy's Gemini CLI, not Antigravity: the plugin's legacy
   // "gemini" default is migrated to "antigravity" by install and the hook.
+  // "agy" is the id Omarchy's next release writes for Antigravity.
   function normalizeAgentId(content) {
     var raw = String(content || "").trim().toLowerCase()
     if (raw === "claude-code") return "claude"
+    if (raw === "agy" || raw === "antigravity-cli") return "antigravity"
     return raw
   }
 

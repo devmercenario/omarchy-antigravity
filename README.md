@@ -109,7 +109,7 @@ Antigravity is completely optional and non-intrusive:
   omarchy default agent claude   # any of Omarchy's own agents
   omarchy-antigravity default    # back to Antigravity
   ```
-  Omarchy's `omarchy default agent` only accepts its built-in agents, so Antigravity is set with `omarchy-antigravity default` (or `./install.sh --set-default`). Note that `gemini` is Omarchy's Gemini CLI, not Antigravity: a `gemini` default left by older releases of this plugin is moved to `antigravity` on install and on `omarchy update`.
+  Omarchy's `omarchy default agent` only accepts its built-in agents, so Antigravity is set with `omarchy-antigravity default` (or `./install.sh --set-default`). Note that `gemini` is Omarchy's Gemini CLI, not Antigravity: a `gemini` default left by older releases of this plugin is moved to `antigravity` on install and on `omarchy update`. From Omarchy 4.5 on, `omarchy default agent antigravity` works natively and saves `agy`; the panel recognizes it, and Omarchy's own launcher opens `agy` (in its unattended mode, `--dangerously-skip-permissions`) instead of the plugin's launcher.
 - **Real-Time Bar Sync**: The status bar panel automatically watches `~/.config/omarchy/defaults/agent`. When you switch default agents, the bar icon and panel immediately switch their active target to reflect your chosen agent without restarting the shell.
 - **Update Safety**: System updates via `omarchy update` will **never** overwrite your chosen default agent back to Antigravity if you have switched to another provider.
 

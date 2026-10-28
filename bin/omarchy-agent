@@ -15,7 +15,15 @@ set -euo pipefail
 
 stock="${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent"
 
-if [[ $(omarchy-default-agent 2>/dev/null || true) != "antigravity" ]]; then
+handled=false
+case "$(omarchy-default-agent 2>/dev/null || true)" in
+  antigravity) handled=true ;;
+  # The id Omarchy's next release uses for Antigravity. Once its own launcher
+  # has an entry for it, Omarchy's behaviour applies; until then, fill in.
+  agy) grep -qE '^[[:space:]]*agy\)' "$stock" 2>/dev/null || handled=true ;;
+esac
+
+if [[ $handled != true ]]; then
   # Never exec ourselves: an OMARCHY_PATH pointing back here would loop.
   if [[ ! -x $stock || $(realpath -- "$stock") == $(realpath -- "${BASH_SOURCE[0]}") ]]; then
     echo "Omarchy's omarchy-agent was not found at $stock" >&2
