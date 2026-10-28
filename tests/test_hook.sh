@@ -196,11 +196,22 @@ echo "  ✅ Test Case 5 passed!"
 # (opt-in marker present) moves to antigravity; a user's Gemini pick stays.
 echo "  ▶ Test Case 6: Legacy plugin-set 'gemini' default moves to antigravity..."
 AGENT_FILE="$TEST_HOME/.config/omarchy/defaults/agent"
-touch "$TEST_HOME/.config/omarchy/antigravity.default"
+# As the plugin writes it: the agent file first, then the marker.
 echo "gemini" > "$AGENT_FILE"
+touch "$TEST_HOME/.config/omarchy/antigravity.default"
 bash "$HOOK_SRC"
 [[ "$(cat "$AGENT_FILE")" == "antigravity" ]] \
   || { echo "❌ Assertion failed: hook kept the legacy plugin 'gemini' default." >&2; exit 1; }
+
+# Gemini picked by the user after the plugin's choice (agent file newer than
+# the marker) stays Gemini, and the plugin forgets its choice.
+touch -d '1 minute ago' "$TEST_HOME/.config/omarchy/antigravity.default"
+echo "gemini" > "$AGENT_FILE"
+bash "$HOOK_SRC"
+[[ "$(cat "$AGENT_FILE")" == "gemini" ]] \
+  || { echo "❌ Assertion failed: hook overrode a Gemini pick made after the plugin's." >&2; exit 1; }
+[[ ! -e "$TEST_HOME/.config/omarchy/antigravity.default" ]] \
+  || { echo "❌ Assertion failed: hook kept the marker after the user chose Gemini." >&2; exit 1; }
 
 rm -f "$TEST_HOME/.config/omarchy/antigravity.default"
 echo "gemini" > "$AGENT_FILE"

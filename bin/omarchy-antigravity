@@ -11,6 +11,90 @@ STATUSLINE_MARKER_RE='^# (omarchy-antigravity: statusline|Omarchy Antigravity CL
 UPDATER_MARKER_RE='^# (omarchy-antigravity: agent-usage-update|omarchy:summary=Update local usage records for all configured coding agents)$'
 AGENT_LAUNCHER_MARKER_RE='^# omarchy-antigravity: agent-launcher$'
 
+# Copy $1 to $1.bak.<epoch>, keeping its mode (a private file stays
+# private); a second backup in the same second takes the next free number
+# instead of overwriting the first.
+backup_file() {
+  local n
+  n=$(date +%s)
+  while [[ -e "$1.bak.$n" || -L "$1.bak.$n" ]]; do
+    n=$((n + 1))
+  done
+  cp -p -- "$1" "$1.bak.$n"
+}
+
+# Files the plugin installed, with the sha256 each had then, so an edit made
+# afterwards is told apart from an older plugin release before the file is
+# replaced or removed. Edited files are kept in PLUGIN_BACKUP_DIR, outside
+# PATH and outside the collector glob.
+INSTALL_MANIFEST="$HOME/.config/omarchy/antigravity.installed"
+PLUGIN_BACKUP_DIR="$HOME/.local/share/omarchy-antigravity/backups"
+
+file_sha() {
+  sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Returns 0 when $1 changed since it was installed, 1 when it is unchanged,
+# and 2 when it was never recorded (installed by an earlier release).
+installed_state() {
+  local recorded
+  recorded=$(awk -F'\t' -v p="$1" '$2 == p { sha = $1 } END { print sha }' "$INSTALL_MANIFEST" 2>/dev/null)
+  [[ -n "$recorded" ]] || return 2
+  [[ "$(file_sha "$1")" != "$recorded" ]]
+}
+
+# manifest_set FILE [record]: drop FILE's entry, then re-add it with its
+# current sha256 when asked to record it.
+manifest_set() {
+  local tmp
+  mkdir -p "${INSTALL_MANIFEST%/*}" || return 0
+  tmp=$(mktemp "$INSTALL_MANIFEST.XXXXXX") || return 0
+  {
+    awk -F'\t' -v p="$1" '$2 != p' "$INSTALL_MANIFEST" 2>/dev/null || true
+    if [[ "${2:-}" == record ]]; then
+      printf '%s\t%s\n' "$(file_sha "$1")" "$1"
+    fi
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$INSTALL_MANIFEST"
+}
+
+# Copy $1 into the backup folder under a name that is never reused.
+stash_file() {
+  local base n
+  mkdir -p "$PLUGIN_BACKUP_DIR" && chmod 700 "$PLUGIN_BACKUP_DIR" || return 0
+  base="$PLUGIN_BACKUP_DIR/${1##*/}"
+  n=$(date +%s)
+  while [[ -e "$base.$n" || -L "$base.$n" ]]; do
+    n=$((n + 1))
+  done
+  cp -p -- "$1" "$base.$n" && echo "ℹ️  Kept a copy of $1 (it may hold your own edits) as $base.$n" >&2
+}
+
+# keep_if_edited FILE [SHIPPED]: before a plugin-owned FILE is replaced or
+# removed, keep a copy when it was edited since install, or, with no record,
+# when it differs from SHIPPED (this release's copy, when there is one).
+keep_if_edited() {
+  local state=0
+  [[ -f "$1" && ! -L "$1" ]] || return 0
+  installed_state "$1" || state=$?
+  if (( state == 0 )); then
+    stash_file "$1"
+  elif (( state == 2 )) && ! { [[ -n "${2:-}" ]] && cmp -s -- "$1" "$2"; }; then
+    stash_file "$1"
+  fi
+}
+
+# The `gemini` shim releases before 88721ac installed (it ran agy with
+# --dangerously-skip-permissions). Only that exact file is the plugin's;
+# anything else at ~/.local/bin/gemini is the user's.
+is_legacy_gemini_shim() {
+  [[ -f "$1" && ! -L "$1" ]] && (( $(stat -c %s -- "$1") < 512 )) || return 1
+  [[ "$(cat -- "$1")" == "#!/bin/bash
+# Executable shim to run Antigravity CLI as Omarchy's gemini provider
+exec agy --dangerously-skip-permissions \"\$@\"" ]]
+}
+
 # Omarchy 4.5 and later ship Antigravity support of their own: agent id
 # "agy", a usage collector and the panel icon.
 native_antigravity() {
@@ -36,6 +120,11 @@ trap 'exit 143' TERM
 update_json() {
   local file="$1" filter="$2" tmp
   shift 2
+  # A config kept as a symlink (stow, chezmoi) stays one: the change is
+  # written to the file it points at.
+  if [[ -L "$file" ]]; then
+    file=$(realpath -e -- "$file") || return 1
+  fi
   tmp=$(mktemp "$file.XXXXXX") || return 1
   TMP_FILES+=("$tmp")
   if ! jq "$@" "($filter) as \$new | if \$new == . then empty else \$new end" "$file" > "$tmp"; then
@@ -76,29 +165,38 @@ case "$cmd" in
     ;;
   default)
     # `omarchy default agent` only accepts Omarchy's own agents, so this is
-    # the way to pick Antigravity; the plugin's omarchy-agent launcher then
-    # opens agy from the keybinding, the menu and the bar.
+    # how Antigravity becomes the default; the plugin's omarchy-agent launcher
+    # then opens agy, with its permission prompts, from the keybinding, the
+    # menu and the bar. The opt-in marker is touched after the write, so a
+    # later choice of the user's own is recognized as newer.
     config_dir="$HOME/.config/omarchy"
     agent_file="$config_dir/defaults/agent"
-    # Omarchy 4.5 knows Antigravity as "agy" and launches it itself.
-    wanted="antigravity"
-    native_antigravity && wanted="agy"
     mkdir -p "$config_dir/defaults"
     current=""
     [[ -f "$agent_file" ]] && current=$(tr -d '[:space:]' < "$agent_file")
-    if [[ "$current" != "$wanted" ]]; then
-      [[ -f "$agent_file" ]] && cp "$agent_file" "$agent_file.bak.$(date +%s)"
-      echo "$wanted" > "$agent_file"
+    if [[ "$current" != "antigravity" ]]; then
+      [[ -f "$agent_file" ]] && backup_file "$agent_file"
+      echo "antigravity" > "$agent_file"
     fi
     touch "$config_dir/antigravity.default"
     echo "Antigravity is now the default agent${current:+ (was: $current)}."
+    if native_antigravity; then
+      echo "Omarchy's own 'omarchy default agent antigravity' (saved as 'agy') would launch agy without permission prompts; this default keeps them."
+    fi
     ;;
   adopt-native)
     # Omarchy 4.5's updater only runs Omarchy's own collectors, and its panel
     # calls omarchy-agent-usage-update through PATH. This plugin's collector
-    # would add a second Antigravity tab, its 4.0-era updater would shadow
-    # 4.5's, and its launcher is no longer needed: hand all of that over and
-    # keep the status line and this helper. Safe to run more than once.
+    # would add a second Antigravity tab and its 4.0-era updater would shadow
+    # 4.5's: hand those over, and the bar back to Omarchy's own panel. The
+    # launcher, the default agent, the status line and this helper are left
+    # alone: changing the default to 4.5's "agy" would silently switch to a
+    # launch without permission prompts, and that is the user's call.
+    #
+    # The post-update hook runs this once (--notify reports it on the desktop,
+    # since nobody sees the hook's output) and records it, so a later choice
+    # of the user's own, such as going back to the plugin's panel for its
+    # Sign In button, is never undone by the next `omarchy update`.
     if ! native_antigravity; then
       echo "This Omarchy has no built-in Antigravity support; nothing to hand over."
       exit 0
@@ -106,51 +204,75 @@ case "$cmd" in
     bin_dir="$HOME/.local/bin"
     config_dir="$HOME/.config/omarchy"
     state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+    changes=()
 
-    # The collector's name is the plugin's own; the updater and launcher go
-    # only when they are the plugin's copies (marker), and a helper the
-    # plugin had backed up comes back.
-    rm -f "$bin_dir/omarchy-agent-usage-antigravity" \
-          "$state_dir/antigravity.json" "$state_dir/.antigravity.lock"
-    if has_marker "$bin_dir/omarchy-agent" "$AGENT_LAUNCHER_MARKER_RE"; then
-      rm -f "$bin_dir/omarchy-agent"
+    # The collector's name is the plugin's own; the updater goes only when it
+    # is the plugin's copy (marker). Either is kept in the backup folder first
+    # when it was edited since install. A helper the plugin had backed up
+    # predates 4.5 and would shadow its updater just the same, so it stays in
+    # its hidden backup (uninstall still restores it).
+    if [[ -e "$bin_dir/omarchy-agent-usage-antigravity" || -e "$state_dir/antigravity.json" ]]; then
+      keep_if_edited "$bin_dir/omarchy-agent-usage-antigravity"
+      rm -f "$bin_dir/omarchy-agent-usage-antigravity" "$state_dir/antigravity.json"
+      manifest_set "$bin_dir/omarchy-agent-usage-antigravity"
+      changes+=("removed the plugin's usage collector (Omarchy's own shows Antigravity)")
     fi
+    rm -f "$state_dir"/.antigravity.*
     if has_marker "$bin_dir/omarchy-agent-usage-update" "$UPDATER_MARKER_RE"; then
+      keep_if_edited "$bin_dir/omarchy-agent-usage-update"
       rm -f "$bin_dir/omarchy-agent-usage-update"
-      updater_bak="$bin_dir/.omarchy-agent-usage-update.bak"
-      if [[ -f "$updater_bak" ]] && ! has_marker "$updater_bak" "$UPDATER_MARKER_RE"; then
-        mv -f "$updater_bak" "$bin_dir/omarchy-agent-usage-update"
+      manifest_set "$bin_dir/omarchy-agent-usage-update"
+      changes+=("removed the plugin's omarchy-agent-usage-update")
+    fi
+
+    # Put Omarchy's agents widget back where the bar shows the panel this
+    # plugin installed (its <user>.agents copy, which carries the Sign In
+    # button); the copy itself stays in its folder. If the bar already has
+    # Omarchy's widget, the copy's entry is dropped instead of becoming a
+    # second one. One backup is taken before anything changes, and the
+    # plugin's provider switch, which means nothing to 4.5, goes too.
+    shell_json="$config_dir/shell.json"
+    widget_id="${USER:-$(id -un)}.agents"
+    if [[ -f "$shell_json" ]]; then
+      switch_widget=0
+      if grep -q 'authActionBtn' "$config_dir/plugins/$widget_id/Panel.qml" 2>/dev/null &&
+         jq -e --arg id "$widget_id" 'any(.bar.layout[]?[]?; type == "object" and .id? == $id)' "$shell_json" >/dev/null 2>&1; then
+        switch_widget=1
+      fi
+      stale_provider=$(jq '[.bar.layout[]?[]? | objects
+        | select(.id? == "omarchy.agents" and .providers?.antigravity == {"enabled": true})] | length' "$shell_json" 2>/dev/null || echo 0)
+      if (( switch_widget || stale_provider > 0 )); then
+        backup_file "$shell_json"
+        if update_json "$shell_json" '
+          def fork: type == "object" and .id? == $id and $switch;
+          (if any(.bar.layout[]?[]?; type == "object" and .id? == "omarchy.agents")
+           then .bar.layout |= with_entries(.value |= (if type == "array" then map(select(fork | not)) else . end))
+           else (.bar.layout[]?[]? | select(fork)) |= (.id = "omarchy.agents")
+           end)
+          | (.bar.layout[]?[]? | objects
+              | select(.id? == "omarchy.agents" and .providers?.antigravity == {"enabled": true}))
+            |= del(.providers.antigravity)
+        ' --arg id "$widget_id" --argjson switch "$( (( switch_widget )) && echo true || echo false)"; then
+          (( switch_widget )) && changes+=("bar switched back to Omarchy's agents widget (the panel copy stays in its folder; shell.json backed up)")
+        else
+          echo "⚠️  Could not update $shell_json; left it unchanged." >&2
+        fi
       fi
     fi
+    touch "$config_dir/antigravity.native-adopted" 2>/dev/null || true
 
-    # The plugin's "antigravity" default becomes Omarchy's own "agy".
-    agent_file="$config_dir/defaults/agent"
-    if [[ -f "$agent_file" && "$(tr -d '[:space:]' < "$agent_file")" == "antigravity" ]]; then
-      echo "agy" > "$agent_file"
+    if (( ${#changes[@]} == 0 )); then
+      echo "Already handed over: Antigravity usage comes from Omarchy itself."
+      exit 0
     fi
-
-    # Put Omarchy's agents widget back where the bar shows this plugin's copy
-    # of the 4.0 panel (it carries the Sign In button); the copy itself stays
-    # in its folder. The plugin's provider switch means nothing to 4.5.
-    shell_json="$config_dir/shell.json"
-    if [[ -f "$shell_json" ]]; then
-      while IFS= read -r widget_id; do
-        [[ -n "$widget_id" ]] || continue
-        if grep -q 'authActionBtn' "$config_dir/plugins/$widget_id/Panel.qml" 2>/dev/null; then
-          cp -p "$shell_json" "$shell_json.bak.$(date +%s)"
-          update_json "$shell_json" \
-            '(.bar.layout[]?[]? | objects | select(.id? == $id)) |= (.id = "omarchy.agents")' \
-            --arg id "$widget_id" || echo "⚠️  Could not switch $widget_id back in $shell_json." >&2
-        fi
-      done < <(jq -r '[.bar.layout[]?[]? | objects | .id? | strings
-        | select(endswith(".agents") and . != "omarchy.agents")] | unique[]' "$shell_json" 2>/dev/null)
-      update_json "$shell_json" '
-        (.bar.layout[]?[]? | objects
-          | select(.id? == "omarchy.agents" and .providers?.antigravity == {"enabled": true}))
-        |= del(.providers.antigravity)
-      ' || echo "⚠️  Could not update $shell_json." >&2
+    echo "Handed Antigravity's usage over to Omarchy's built-in support:"
+    printf '  - %s\n' "${changes[@]}"
+    echo "The launcher, the default agent, the status line and omarchy-antigravity stay."
+    if [[ "${2:-}" == "--notify" ]] && command -v notify-send >/dev/null 2>&1; then
+      notify-send --app-name=Antigravity "Antigravity: usage now built into Omarchy" \
+        "The plugin handed its usage collector and panel over to Omarchy (shell.json was backed up first). Your default agent and its permission prompts are unchanged." \
+        >/dev/null 2>&1 || true
     fi
-    echo "Antigravity usage and launching now come from Omarchy itself; the status line and this helper stay."
     ;;
   auth|login)
     echo "Launching Antigravity authentication..."
@@ -241,10 +363,28 @@ case "$cmd" in
           if [[ -f "$statusline_script" && ! -e "$statusline_script.bak" ]] &&
              ! cmp -s "$statusline_src" "$statusline_script" &&
              ! has_marker "$statusline_script" "$STATUSLINE_MARKER_RE"; then
-            cp "$statusline_script" "$statusline_script.bak" 2>/dev/null || true
+            cp -p "$statusline_script" "$statusline_script.bak" 2>/dev/null || true
+          elif has_marker "$statusline_script" "$STATUSLINE_MARKER_RE"; then
+            keep_if_edited "$statusline_script" "$statusline_src"
           fi
           cp -f --remove-destination "$statusline_src" "$statusline_script"
           chmod +x "$statusline_script"
+          manifest_set "$statusline_script" record
+        fi
+        # A statusLine entry of the user's own is kept aside once, privately,
+        # so uninstall can put it back.
+        statusline_previous="$agy_dir/statusline.omarchy-antigravity.previous.json"
+        if [[ -f "$settings_file" && ! -e "$statusline_previous" ]]; then
+          (
+            umask 077
+            prev_tmp=$(mktemp "$statusline_previous.XXXXXX") || exit 0
+            if jq -e --arg s "$statusline_script" \
+                 '.statusLine | select(type == "object" and .command? != $s)' "$settings_file" > "$prev_tmp" 2>/dev/null; then
+              mv -f "$prev_tmp" "$statusline_previous"
+            else
+              rm -f "$prev_tmp"
+            fi
+          )
         fi
         statusline_filter='.statusLine = {"type":"command","command":$s,"enabled":true}'
         if [[ -f "$settings_file" ]]; then

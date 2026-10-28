@@ -161,6 +161,9 @@ run_uninstall
 [[ ! -e "$TEST_HOME/.local/bin/.omarchy-agent-usage-update.bak" ]] || fail "plugin-copy backup was left behind."
 
 fresh_home legacy-user-bak
+# An earlier release installed its helper and kept the stock one as a
+# visible .bak next to it: that .bak is the pre-install helper.
+cp "$PROJECT_ROOT/bin/omarchy-agent-usage-update" "$TEST_HOME/.local/bin/omarchy-agent-usage-update"
 printf '#!/bin/bash\necho "old stock"\n' > "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak"
 chmod +x "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak"
 run_install --no-default --no-statusline
@@ -181,9 +184,18 @@ grep -qx "$USER_PLUGIN_ID --yes" "$HOME/plugin-remove.calls" || fail "uninstall 
 
 fresh_home cloned-plugin-fallback
 stub omarchy-plugin-remove 'exit 1'
+jq -n --arg id "$USER_PLUGIN_ID" '{bar: {layout: {right: [{id: $id}]}}}' > "$SHELL_JSON"
 run_install --no-default --no-statusline
+printf '// edited after install\n' >> "$PLUGIN_DIR/Panel.qml"
 run_uninstall
-[[ ! -e "$PLUGIN_DIR" ]] || fail "uninstall did not delete the clone when omarchy-plugin-remove failed."
+[[ ! -e "$PLUGIN_DIR" ]] || fail "uninstall left the clone in place when omarchy-plugin-remove failed."
+shopt -s nullglob
+aside=("$TEST_HOME/.config/omarchy/plugins/.$USER_PLUGIN_ID".bak.*)
+shopt -u nullglob
+(( ${#aside[@]} == 1 )) || fail "without omarchy-plugin-remove the clone was deleted instead of moved aside."
+grep -q 'edited after install' "${aside[0]}/Panel.qml" || fail "the moved-aside clone lost the user's edits."
+jq -e '.bar.layout.right[0].id == "omarchy.agents"' "$SHELL_JSON" >/dev/null \
+  || fail "the bar still points at the removed clone."
 
 fresh_home existing-plugin
 mkdir -p "$PLUGIN_DIR"
@@ -191,8 +203,15 @@ printf '// my panel\n' > "$PLUGIN_DIR/Panel.qml"
 printf '// my notes\n' > "$PLUGIN_DIR/notes.txt"
 run_install --no-default --no-statusline
 [[ ! -e "$PLUGIN_DIR/.omarchy-antigravity-cloned" ]] || fail "install marked a folder it did not create."
+# Edits made to the installed panel survive a reinstall and the uninstall.
+printf '// tweak one\n' >> "$PLUGIN_DIR/Panel.qml"
+run_install --no-default --no-statusline
+grep -q 'my panel' "$PLUGIN_DIR/Panel.qml.bak" || fail "the reinstall replaced the pre-install backup."
+grep -lq 'tweak one' "$PLUGIN_DIR"/Panel.qml.bak.* 2>/dev/null || fail "the reinstall discarded edits made after install."
+printf '// tweak two\n' >> "$PLUGIN_DIR/Panel.qml"
 run_uninstall
 grep -q 'my panel' "$PLUGIN_DIR/Panel.qml" || fail "user Panel.qml was not restored."
+grep -lq 'tweak two' "$PLUGIN_DIR"/Panel.qml.bak.* 2>/dev/null || fail "uninstall discarded edits made after install."
 [[ -f "$PLUGIN_DIR/notes.txt" ]] || fail "uninstall removed a plugin folder the user owned."
 [[ ! -e "$HOME/plugin-remove.calls" ]] || fail "uninstall removed a plugin the user owned."
 
@@ -273,6 +292,59 @@ run_uninstall
 [[ -e "$TEST_HOME/.cache/omarchy/agent-usage/claude-usage.json" ]] || fail "uninstall removed another agent's cache."
 [[ "$(cat "$TEST_HOME/.config/omarchy/defaults/agent")" == "claude" ]] || fail "previous default agent was not restored."
 
+echo "  ▶ A user's own helper next to their own old .bak: neither is lost..."
+fresh_home user-helpers
+printf '#!/bin/bash\necho v2\n' > "$TEST_HOME/.local/bin/omarchy-agent-usage-update"
+printf '#!/bin/bash\necho v1\n' > "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak"
+chmod +x "$TEST_HOME/.local/bin/omarchy-agent-usage-update" "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak"
+run_install --no-default --no-statusline
+grep -q v1 "$TEST_HOME/.local/bin/omarchy-agent-usage-update.bak" || fail "the user's own old .bak was moved or lost."
+run_uninstall
+[[ "$("$TEST_HOME/.local/bin/omarchy-agent-usage-update")" == "v2" ]] \
+  || fail "uninstall did not bring back the user's current helper (v2)."
+
+echo "  ▶ Edited plugin files are kept on reinstall and uninstall; the user's statusLine comes back..."
+fresh_home edits
+mkdir -p "$AGY_DIR"
+jq -n '{theme: "dark", statusLine: {type: "command", command: "/home/me/my-line.sh", enabled: true, padding: 1}}' > "$AGY_DIR/settings.json"
+run_install --no-default --statusline
+printf '# my tweak\n' >> "$TEST_HOME/.local/bin/omarchy-antigravity"
+printf '# my colours\n' >> "$AGY_DIR/statusline.sh"
+run_install --no-default --statusline
+grep -lq 'my tweak' "$TEST_HOME/.local/share/omarchy-antigravity/backups"/omarchy-antigravity.* 2>/dev/null \
+  || fail "a reinstall discarded an edit to an installed helper."
+printf '# my colours\n' >> "$AGY_DIR/statusline.sh"
+run_uninstall
+grep -lq 'my colours' "$TEST_HOME/.local/share/omarchy-antigravity/backups"/statusline.sh.* 2>/dev/null \
+  || fail "uninstall discarded an edited status line."
+jq -e '.statusLine == {type: "command", command: "/home/me/my-line.sh", enabled: true, padding: 1} and .theme == "dark"' \
+  "$AGY_DIR/settings.json" >/dev/null || fail "uninstall did not restore the user's own statusLine entry."
+shopt -s nullglob
+bin_baks=("$TEST_HOME/.local/bin"/omarchy-*.[0-9]*)
+shopt -u nullglob
+(( ${#bin_baks[@]} == 0 )) || fail "backups landed on PATH: ${bin_baks[*]}"
+
+echo "  ▶ A symlinked shell.json stays a symlink..."
+fresh_home symlinked
+mkdir -p "$TEST_HOME/dotfiles"
+mv "$SHELL_JSON" "$TEST_HOME/dotfiles/shell.json" 2>/dev/null || jq -n --arg id "$USER_PLUGIN_ID" '{bar: {layout: {right: [{id: $id}]}}}' > "$TEST_HOME/dotfiles/shell.json"
+ln -s "$TEST_HOME/dotfiles/shell.json" "$SHELL_JSON"
+run_install --no-default --no-statusline
+[[ -L "$SHELL_JSON" ]] || fail "install replaced a symlinked shell.json with a regular file."
+run_uninstall
+[[ -L "$SHELL_JSON" ]] || fail "uninstall replaced a symlinked shell.json with a regular file."
+
+echo "  ▶ Only the exact legacy gemini shim is removed..."
+fresh_home gemini-shim
+git -C "$PROJECT_ROOT" show 6d232c6:bin/gemini > "$TEST_HOME/.local/bin/gemini" 2>/dev/null \
+  || printf '#!/bin/bash\n# Executable shim to run Antigravity CLI as Omarchy'"'"'s gemini provider\nexec agy --dangerously-skip-permissions "$@"\n' > "$TEST_HOME/.local/bin/gemini"
+run_install --no-default --no-statusline
+[[ ! -e "$TEST_HOME/.local/bin/gemini" ]] || fail "install kept the legacy gemini shim."
+printf '#!/bin/bash\nexec agy --dangerously-skip-permissions --model x "$@"\n' > "$TEST_HOME/.local/bin/gemini"
+run_install --no-default --no-statusline
+run_uninstall
+[[ -f "$TEST_HOME/.local/bin/gemini" ]] || fail "a gemini wrapper of the user's own was deleted."
+
 echo "  ▶ The agent launcher is installed, never clobbers the user's, and leaves on uninstall..."
 fresh_home launcher
 run_install --no-default --no-statusline
@@ -304,6 +376,21 @@ echo "gemini" > "$TEST_HOME/.config/omarchy/defaults/agent"
 run_install --no-default --no-statusline
 [[ "$(cat "$TEST_HOME/.config/omarchy/defaults/agent")" == "gemini" ]] \
   || fail "install overrode a user's own Gemini default."
+
+echo "  ▶ Status line debug dumps are private, old public ones included..."
+fresh_home dump
+mkdir -p "$AGY_DIR"
+printf '{"cwd": "/secret/project"}\n' > "$AGY_DIR/last_statusline_input.json"
+chmod 644 "$AGY_DIR/last_statusline_input.json"
+run_install --no-default --no-statusline
+[[ "$(stat -c %a "$AGY_DIR/last_statusline_input.json")" == "600" ]] \
+  || fail "install left an old public status line dump readable by others."
+rm -f "$AGY_DIR/last_statusline_input.json"
+printf '{"cwd": "/tmp"}' > "$AGY_DIR/old-public.json" && chmod 644 "$AGY_DIR/old-public.json"
+mv "$AGY_DIR/old-public.json" "$AGY_DIR/last_statusline_input.json"
+echo '{"cwd": "/tmp", "width": 80}' | OMARCHY_STATUSLINE_DEBUG=1 "$PROJECT_ROOT/bin/omarchy-antigravity-statusline" >/dev/null
+[[ "$(stat -c %a "$AGY_DIR/last_statusline_input.json")" == "600" ]] \
+  || fail "a debug dump rewritten over an old public one kept its 0644 mode."
 
 echo "  ✅ Reinstall & uninstall safety checks passed!"
 echo "🎉 Reinstall & uninstall safety tests passed successfully!"

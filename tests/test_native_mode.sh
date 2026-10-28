@@ -79,27 +79,31 @@ file_id() {
   stat -c '%i %Y' "$1"
 }
 
-echo "  ▶ A fresh install on Omarchy 4.5 keeps only the status line and the helper..."
+echo "  ▶ A fresh install on Omarchy 4.5 keeps the launcher, the status line and the helper..."
 fresh_home fresh
 make_native
 run_install --set-default --statusline
 [[ -x "$BIN/omarchy-antigravity" ]] || fail "the helper was not installed."
 grep -q 'omarchy-antigravity: statusline' "$TEST_HOME/.gemini/antigravity-cli/statusline.sh" \
   || fail "the status line was not installed."
-for f in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-agent; do
+for f in omarchy-agent-usage-antigravity omarchy-agent-usage-update; do
   [[ ! -e "$BIN/$f" ]] || fail "$f was installed although Omarchy 4.5 provides its own."
 done
+grep -qx '# omarchy-antigravity: agent-launcher' "$BIN/omarchy-agent" \
+  || fail "the launcher that keeps agy's permission prompts was not installed on 4.5."
 [[ ! -d "$TEST_HOME/.config/omarchy/plugins/$USER_PLUGIN_ID" ]] || fail "the 4.0 panel copy was installed on 4.5."
-[[ "$(cat "$AGENT_FILE")" == "agy" ]] || fail "the default agent was not set to Omarchy's own 'agy'."
+# The plugin's prompt-guarded default, not 4.5's own "agy" (which skips them).
+[[ "$(cat "$AGENT_FILE")" == "antigravity" ]] || fail "the default agent is not the plugin's prompt-guarded 'antigravity'."
 jq -e '[.. | objects | .antigravity? // empty] | length == 0' "$SHELL_JSON" >/dev/null \
   || fail "the plugin's provider switch was added to Omarchy 4.5's widget."
 grep -qx 'stock-update --force agy' "$TEST_HOME/stock-update.calls" \
   || fail "the initial refresh did not use Omarchy's updater for agy."
 
-echo "  ▶ 'omarchy-antigravity default' writes 'agy' on 4.5..."
+echo "  ▶ 'omarchy-antigravity default' keeps permission prompts on 4.5 and says so..."
 echo "claude" > "$AGENT_FILE"
-"$BIN/omarchy-antigravity" default >/dev/null
-[[ "$(cat "$AGENT_FILE")" == "agy" ]] || fail "default did not write 'agy' on 4.5."
+out=$("$BIN/omarchy-antigravity" default)
+[[ "$(cat "$AGENT_FILE")" == "antigravity" ]] || fail "default did not write the plugin's 'antigravity' on 4.5."
+grep -q "without permission prompts" <<<"$out" || fail "default did not explain 4.5's own 'agy' default."
 
 echo "  ▶ 'omarchy update' to 4.5 hands the 4.0 setup over (post-update hook)..."
 fresh_home upgrade
@@ -115,24 +119,31 @@ echo '{"id":"claude"}' > "$STATE/claude.json"
 make_native
 bash "$TEST_HOME/.config/omarchy/hooks/post-update.d/90-antigravity.hook"
 
-for f in omarchy-agent-usage-antigravity omarchy-agent-usage-update omarchy-agent; do
+for f in omarchy-agent-usage-antigravity omarchy-agent-usage-update; do
   [[ ! -e "$BIN/$f" ]] || fail "the hook left the plugin's $f in place on 4.5."
 done
-[[ -x "$BIN/omarchy-antigravity" && -x "$BIN/omarchy-antigravity-statusline" ]] || fail "the hook removed what 4.5 lacks."
+[[ -x "$BIN/omarchy-antigravity" && -x "$BIN/omarchy-antigravity-statusline" && -x "$BIN/omarchy-agent" ]] \
+  || fail "the hook removed what 4.5 lacks (helper, status line, prompt-guarded launcher)."
 [[ ! -e "$STATE/antigravity.json" ]] || fail "the plugin's Antigravity record would show as a second tab."
 [[ -e "$STATE/claude.json" ]] || fail "another agent's record was removed."
-[[ "$(cat "$AGENT_FILE")" == "agy" ]] || fail "the antigravity default did not become 'agy'."
+# No silent switch to 4.5's own launch, which skips permission prompts.
+[[ "$(cat "$AGENT_FILE")" == "antigravity" ]] || fail "the hand-over changed the default agent behind the user's back."
 jq -e --arg id "$USER_PLUGIN_ID" '
   ([.bar.layout.right[].id] == ["omarchy.clock", "omarchy.agents"])
   and (.bar.layout.right[1].providers == {claude: {enabled: true}})
 ' "$SHELL_JSON" >/dev/null || fail "the bar was not switched back to Omarchy's agents widget with its settings."
 [[ -d "$TEST_HOME/.config/omarchy/plugins/$USER_PLUGIN_ID" ]] || fail "the panel copy's folder was deleted."
 
-echo "  ▶ The hand-over is idempotent..."
+echo "  ▶ The hand-over is idempotent, and later updates never undo the user's choice..."
 before=$(file_id "$SHELL_JSON")
 "$BIN/omarchy-antigravity" adopt-native >/dev/null
-bash "$TEST_HOME/.config/omarchy/hooks/post-update.d/90-antigravity.hook"
 [[ "$(file_id "$SHELL_JSON")" == "$before" ]] || fail "a repeated hand-over rewrote shell.json."
+# The user goes back to the plugin's panel (for its Sign In button); the next
+# `omarchy update` must leave that alone.
+jq --arg id "$USER_PLUGIN_ID" '.bar.layout.right[1].id = $id' "$SHELL_JSON" > "$SHELL_JSON.new" && mv "$SHELL_JSON.new" "$SHELL_JSON"
+before=$(file_id "$SHELL_JSON")
+bash "$TEST_HOME/.config/omarchy/hooks/post-update.d/90-antigravity.hook"
+[[ "$(file_id "$SHELL_JSON")" == "$before" ]] || fail "a later update undid the user's own widget choice."
 
 echo "  ▶ A user's own launcher and updater are never touched..."
 fresh_home foreign
@@ -145,6 +156,33 @@ make_native
   || fail "adopt-native removed files the plugin did not write."
 jq -e --arg id "$USER_PLUGIN_ID" '.bar.layout.right[1].id == $id' "$SHELL_JSON" >/dev/null \
   || fail "a widget without the plugin's panel was switched."
+# Another agents widget that happens to contain a Sign In button is not the
+# plugin's and stays.
+mkdir -p "$TEST_HOME/.config/omarchy/plugins/other.agents"
+echo "Button { id: authActionBtn }" > "$TEST_HOME/.config/omarchy/plugins/other.agents/Panel.qml"
+jq '.bar.layout.left = [{id: "other.agents"}]' "$SHELL_JSON" > "$SHELL_JSON.new" && mv "$SHELL_JSON.new" "$SHELL_JSON"
+"$PROJECT_ROOT/bin/omarchy-antigravity" adopt-native >/dev/null
+jq -e '.bar.layout.left[0].id == "other.agents"' "$SHELL_JSON" >/dev/null \
+  || fail "adopt-native switched an agents widget the plugin did not install."
+
+echo "  ▶ A bar that already has Omarchy's widget gets no second one; old helper backups stay put..."
+fresh_home both
+run_install --no-default --no-statusline
+printf '#!/bin/bash\necho old-user-helper\n' > "$BIN/.omarchy-agent-usage-update.bak"
+jq --arg id "$USER_PLUGIN_ID" '.bar.layout.left = [{id: "omarchy.agents"}]' "$SHELL_JSON" > "$SHELL_JSON.new" && mv "$SHELL_JSON.new" "$SHELL_JSON"
+make_native
+"$BIN/omarchy-antigravity" adopt-native >/dev/null
+jq -e '[.bar.layout[][] | select(.id == "omarchy.agents")] | length == 1' "$SHELL_JSON" >/dev/null \
+  || fail "the hand-over left two Omarchy agents widgets in the bar."
+jq -e --arg id "$USER_PLUGIN_ID" '[.bar.layout[][] | select(.id == $id)] | length == 0' "$SHELL_JSON" >/dev/null \
+  || fail "the panel copy's bar entry was kept next to Omarchy's widget."
+[[ ! -e "$BIN/omarchy-agent-usage-update" ]] || fail "a pre-4.5 helper backup was restored over Omarchy 4.5's updater."
+[[ -f "$BIN/.omarchy-agent-usage-update.bak" ]] || fail "the helper backup was not kept for uninstall."
+shopt -s nullglob
+shell_baks=("$SHELL_JSON".bak.*)
+shopt -u nullglob
+(( ${#shell_baks[@]} >= 1 )) || fail "shell.json was changed without a backup."
+grep -q '"left"' "${shell_baks[-1]}" || fail "the newest shell.json backup is not the pre-hand-over file."
 
 echo "  ▶ Without native support adopt-native changes nothing..."
 fresh_home no-native

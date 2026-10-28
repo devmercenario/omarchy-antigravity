@@ -6,41 +6,54 @@ set -euo pipefail
 
 CONFIG_DIR="$HOME/.config/omarchy"
 AGENT_FILE="$CONFIG_DIR/defaults/agent"
+# Touched by the plugin right after every write of the default agent: while
+# the agent file is not newer, the default is still the plugin's choice.
+DEFAULT_MARKER="$CONFIG_DIR/antigravity.default"
 
-# Omarchy 4.5 and later handle Antigravity themselves (agent id "agy", usage
-# collector, panel). After the update that brings them, hand the plugin's
-# collector, updater, launcher and panel over; the status line stays.
-if [[ -x "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent-usage-agy" ]]; then
-  if [[ ! -f "$AGENT_FILE" && -f "$CONFIG_DIR/antigravity.default" ]]; then
+# 1. The default agent. A choice the user made after the plugin's (the agent
+# file is newer than the marker, or holds a value the plugin never writes) is
+# theirs: the marker goes, nothing changes.
+# A file an update wiped is restored. Releases before the Antigravity CLI set
+# "gemini", served by a ~/.local/bin/gemini shim to agy that has since been
+# removed, so Omarchy now opens the deprecated Gemini CLI for it: the
+# plugin's own "gemini" moves to "antigravity" (Omarchy 4.5's own migration
+# handles "gemini" there).
+NATIVE_ANTIGRAVITY=0
+[[ -x "${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent-usage-agy" ]] && NATIVE_ANTIGRAVITY=1
+if [[ -f "$DEFAULT_MARKER" ]]; then
+  if [[ ! -f "$AGENT_FILE" ]]; then
     mkdir -p "$CONFIG_DIR/defaults"
-    echo "agy" > "$AGENT_FILE"
+    echo "antigravity" > "$AGENT_FILE"
+    touch "$DEFAULT_MARKER"
+  elif [[ "$AGENT_FILE" -nt "$DEFAULT_MARKER" ]] ||
+       ! [[ "$(tr -d '[:space:]' < "$AGENT_FILE")" =~ ^(antigravity|gemini)$ ]]; then
+    rm -f "$DEFAULT_MARKER"
+  elif (( ! NATIVE_ANTIGRAVITY )) && [[ "$(tr -d '[:space:]' < "$AGENT_FILE")" == "gemini" ]]; then
+    echo "antigravity" > "$AGENT_FILE"
+    touch "$DEFAULT_MARKER"
   fi
-  if [[ -x "$HOME/.local/bin/omarchy-antigravity" ]]; then
-    "$HOME/.local/bin/omarchy-antigravity" adopt-native >/dev/null || true
+fi
+
+# Clean up the legacy gemini permission-bypass shim: only that exact file,
+# never a wrapper of the user's own.
+gemini_shim="$HOME/.local/bin/gemini"
+if [[ -f "$gemini_shim" && ! -L "$gemini_shim" ]] && (( $(stat -c %s -- "$gemini_shim") < 512 )) &&
+   [[ "$(cat -- "$gemini_shim")" == "#!/bin/bash
+# Executable shim to run Antigravity CLI as Omarchy's gemini provider
+exec agy --dangerously-skip-permissions \"\$@\"" ]]; then
+  rm -f "$gemini_shim"
+fi
+
+# Omarchy 4.5 and later handle Antigravity's usage themselves. After the
+# update that brings them, hand the plugin's collector, updater and panel
+# over, once: a later choice of the user's own (going back to the plugin's
+# panel, say) is never undone by the next update. The launcher, the default
+# agent and the status line stay.
+if (( NATIVE_ANTIGRAVITY )); then
+  if [[ ! -e "$CONFIG_DIR/antigravity.native-adopted" && -x "$HOME/.local/bin/omarchy-antigravity" ]]; then
+    "$HOME/.local/bin/omarchy-antigravity" adopt-native --notify >/dev/null || true
   fi
   exit 0
-fi
-
-# 1. Restore defaults only if user previously selected Antigravity as default.
-# If the user has explicitly selected another agent, respect their choice.
-if [[ -f "$AGENT_FILE" ]]; then
-  current_agent=$(tr -d '[:space:]' < "$AGENT_FILE")
-  if [[ "$current_agent" == "gemini" && -f "$CONFIG_DIR/antigravity.default" ]]; then
-    # Releases before the Antigravity CLI set "gemini", served by a
-    # ~/.local/bin/gemini shim to agy that has since been removed; Omarchy now
-    # opens the deprecated Gemini CLI for it. The plugin's own choice moves on.
-    echo "antigravity" > "$AGENT_FILE"
-  elif [[ "$current_agent" != "gemini" && "$current_agent" != "antigravity" ]]; then
-    rm -f "$CONFIG_DIR/antigravity.default"
-  fi
-elif [[ -f "$CONFIG_DIR/antigravity.default" ]]; then
-  mkdir -p "$CONFIG_DIR/defaults"
-  echo "antigravity" > "$AGENT_FILE"
-fi
-
-# Clean up legacy gemini permission-bypass shim if present
-if [[ -f "$HOME/.local/bin/gemini" ]] && grep -q -- '--dangerously-skip-permissions' "$HOME/.local/bin/gemini" 2>/dev/null; then
-  rm -f "$HOME/.local/bin/gemini"
 fi
 
 # 2. Ensure shell.json has antigravity enabled. This runs on every
@@ -48,7 +61,12 @@ fi
 # only when the filter actually changes it, via a temp file in the same
 # directory (atomic rename, original mode kept).
 SHELL_CONFIG="$CONFIG_DIR/shell.json"
-if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+# A config kept as a symlink (stow, chezmoi) stays one: write the file it
+# points at.
+if [[ -L "$SHELL_CONFIG" ]]; then
+  SHELL_CONFIG=$(realpath -e -- "$SHELL_CONFIG" 2>/dev/null) || SHELL_CONFIG=""
+fi
+if [[ -n "$SHELL_CONFIG" && -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
   tmp=$(mktemp "$SHELL_CONFIG.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
   trap 'exit 130' INT

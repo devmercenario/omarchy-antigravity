@@ -42,6 +42,90 @@ trap cleanup_tmp EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Copy $1 to $1.bak.<epoch>, keeping its mode (a private file stays
+# private); a second backup in the same second takes the next free number
+# instead of overwriting the first.
+backup_file() {
+  local n
+  n=$(date +%s)
+  while [[ -e "$1.bak.$n" || -L "$1.bak.$n" ]]; do
+    n=$((n + 1))
+  done
+  cp -p -- "$1" "$1.bak.$n"
+}
+
+# Files the plugin installed, with the sha256 each had then, so an edit made
+# afterwards is told apart from an older plugin release before the file is
+# replaced or removed. Edited files are kept in PLUGIN_BACKUP_DIR, outside
+# PATH and outside the collector glob.
+INSTALL_MANIFEST="$HOME/.config/omarchy/antigravity.installed"
+PLUGIN_BACKUP_DIR="$HOME/.local/share/omarchy-antigravity/backups"
+
+file_sha() {
+  sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Returns 0 when $1 changed since it was installed, 1 when it is unchanged,
+# and 2 when it was never recorded (installed by an earlier release).
+installed_state() {
+  local recorded
+  recorded=$(awk -F'\t' -v p="$1" '$2 == p { sha = $1 } END { print sha }' "$INSTALL_MANIFEST" 2>/dev/null)
+  [[ -n "$recorded" ]] || return 2
+  [[ "$(file_sha "$1")" != "$recorded" ]]
+}
+
+# manifest_set FILE [record]: drop FILE's entry, then re-add it with its
+# current sha256 when asked to record it.
+manifest_set() {
+  local tmp
+  mkdir -p "${INSTALL_MANIFEST%/*}" || return 0
+  tmp=$(mktemp "$INSTALL_MANIFEST.XXXXXX") || return 0
+  {
+    awk -F'\t' -v p="$1" '$2 != p' "$INSTALL_MANIFEST" 2>/dev/null || true
+    if [[ "${2:-}" == record ]]; then
+      printf '%s\t%s\n' "$(file_sha "$1")" "$1"
+    fi
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$INSTALL_MANIFEST"
+}
+
+# Copy $1 into the backup folder under a name that is never reused.
+stash_file() {
+  local base n
+  mkdir -p "$PLUGIN_BACKUP_DIR" && chmod 700 "$PLUGIN_BACKUP_DIR" || return 0
+  base="$PLUGIN_BACKUP_DIR/${1##*/}"
+  n=$(date +%s)
+  while [[ -e "$base.$n" || -L "$base.$n" ]]; do
+    n=$((n + 1))
+  done
+  cp -p -- "$1" "$base.$n" && echo "ℹ️  Kept a copy of $1 (it may hold your own edits) as $base.$n" >&2
+}
+
+# keep_if_edited FILE [SHIPPED]: before a plugin-owned FILE is replaced or
+# removed, keep a copy when it was edited since install, or, with no record,
+# when it differs from SHIPPED (this release's copy, when there is one).
+keep_if_edited() {
+  local state=0
+  [[ -f "$1" && ! -L "$1" ]] || return 0
+  installed_state "$1" || state=$?
+  if (( state == 0 )); then
+    stash_file "$1"
+  elif (( state == 2 )) && ! { [[ -n "${2:-}" ]] && cmp -s -- "$1" "$2"; }; then
+    stash_file "$1"
+  fi
+}
+
+# The `gemini` shim releases before 88721ac installed (it ran agy with
+# --dangerously-skip-permissions). Only that exact file is the plugin's;
+# anything else at ~/.local/bin/gemini is the user's.
+is_legacy_gemini_shim() {
+  [[ -f "$1" && ! -L "$1" ]] && (( $(stat -c %s -- "$1") < 512 )) || return 1
+  [[ "$(cat -- "$1")" == "#!/bin/bash
+# Executable shim to run Antigravity CLI as Omarchy's gemini provider
+exec agy --dangerously-skip-permissions \"\$@\"" ]]
+}
+
 # Keep only the three most recent <file>.bak.<epoch> backups of $1.
 prune_backups() {
   local f
@@ -72,9 +156,15 @@ update_json() {
   file="$1"
   filter="$2"
   shift 2
-  tmp=$(mktemp "$file.XXXXXX") || return 1
+  # A config kept as a symlink (stow, chezmoi) stays one: the change is
+  # written to the file it points at; a backup still lands next to the link.
+  local real="$file"
+  if [[ -L "$file" ]]; then
+    real=$(realpath -e -- "$file") || return 1
+  fi
+  tmp=$(mktemp "$real.XXXXXX") || return 1
   TMP_FILES+=("$tmp")
-  if ! jq "$@" "($filter) as \$new | if \$new == . then empty else \$new end" "$file" > "$tmp"; then
+  if ! jq "$@" "($filter) as \$new | if \$new == . then empty else \$new end" "$real" > "$tmp"; then
     rm -f "$tmp"
     return 1
   fi
@@ -82,11 +172,11 @@ update_json() {
     rm -f "$tmp"
     return 0
   fi
-  chmod --reference="$file" "$tmp" 2>/dev/null || true
+  chmod --reference="$real" "$tmp" 2>/dev/null || true
   if (( backup )); then
-    cp -p "$file" "$file.bak.$(date +%s)" || return 1
+    backup_file "$file" || return 1
   fi
-  mv -f "$tmp" "$file"
+  mv -f "$tmp" "$real"
 }
 
 ASSUME_YES=0
@@ -164,12 +254,15 @@ mkdir -p "$BIN_DIR"
 UPDATER_BAK="$BIN_DIR/.omarchy-agent-usage-update.bak"
 LEGACY_UPDATER_BAK="$BIN_DIR/omarchy-agent-usage-update.bak"
 # Earlier releases kept the backup under a visible name. A plugin copy there
-# is useless (and was what the collector glob re-executed); a genuine stock or
-# user helper moves to the hidden name.
+# is useless (and was what the collector glob re-executed). A stock or user
+# helper there is the pre-install one only while the plugin's helper is in
+# place, so only then does it move to the hidden name; next to a helper of the
+# user's own it is a file of theirs and stays put (the updater never runs a
+# name starting with "update").
 if [[ -f "$LEGACY_UPDATER_BAK" && ! -L "$LEGACY_UPDATER_BAK" ]]; then
   if has_marker "$LEGACY_UPDATER_BAK" "$UPDATER_MARKER_RE"; then
     rm -f "$LEGACY_UPDATER_BAK"
-  elif [[ ! -e "$UPDATER_BAK" ]]; then
+  elif [[ ! -e "$UPDATER_BAK" ]] && has_marker "$BIN_DIR/omarchy-agent-usage-update" "$UPDATER_MARKER_RE"; then
     mv "$LEGACY_UPDATER_BAK" "$UPDATER_BAK"
   fi
 fi
@@ -178,11 +271,15 @@ fi
 if has_marker "$UPDATER_BAK" "$UPDATER_MARKER_RE"; then
   rm -f "$UPDATER_BAK"
 fi
-BIN_SOURCES=("$SCRIPT_DIR/bin/omarchy-antigravity" "$SCRIPT_DIR/bin/omarchy-antigravity-statusline")
+# The launcher stays on Omarchy 4.5 too: it keeps the plugin's "antigravity"
+# default opening agy with its permission prompts, while 4.5's own "agy"
+# default goes to Omarchy's launcher.
+BIN_SOURCES=("$SCRIPT_DIR/bin/omarchy-agent"
+             "$SCRIPT_DIR/bin/omarchy-antigravity"
+             "$SCRIPT_DIR/bin/omarchy-antigravity-statusline")
 if (( ! NATIVE_ANTIGRAVITY )); then
   BIN_SOURCES=("$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity"
                "$SCRIPT_DIR/bin/omarchy-agent-usage-update"
-               "$SCRIPT_DIR/bin/omarchy-agent"
                "${BIN_SOURCES[@]}")
 fi
 for bin_src in "${BIN_SOURCES[@]}"; do
@@ -210,16 +307,26 @@ for bin_src in "${BIN_SOURCES[@]}"; do
   # `omarchy-agent-usage-*` (which that helper itself uses) can never mistake
   # the backup for a collector and re-execute it recursively. On a reinstall
   # the target is the plugin's own copy, which is never backed up.
-  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" && ! -e "$UPDATER_BAK" ]] &&
+  # A helper of the user's own when that slot is already taken (by the
+  # pre-install one) goes to the backup folder instead of being lost.
+  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" ]] &&
      ! cmp -s "$bin_src" "$target" && ! has_marker "$target" "$UPDATER_MARKER_RE"; then
-    cp "$target" "$UPDATER_BAK" 2>/dev/null || true
+    if [[ ! -e "$UPDATER_BAK" ]]; then
+      cp -p "$target" "$UPDATER_BAK" 2>/dev/null || true
+    elif ! cmp -s "$target" "$UPDATER_BAK"; then
+      stash_file "$target"
+    fi
+  elif [[ -f "$target" ]]; then
+    # The plugin's own copy (by name or marker): keep it if it was edited.
+    keep_if_edited "$target" "$bin_src"
   fi
   cp -f "$bin_src" "$target"
   chmod +x "$target"
+  manifest_set "$target" record
 done
 
 # Safely clean up legacy gemini permission-bypass shim from prior versions
-if [[ -f "$BIN_DIR/gemini" ]] && grep -q -- '--dangerously-skip-permissions' "$BIN_DIR/gemini" 2>/dev/null; then
+if is_legacy_gemini_shim "$BIN_DIR/gemini"; then
   echo "🧹 Cleaning up legacy gemini permission-bypass shim..."
   rm -f "$BIN_DIR/gemini"
 fi
@@ -228,7 +335,7 @@ fi
 export PATH="$BIN_DIR:$PATH"
 
 if (( NATIVE_ANTIGRAVITY )); then
-  echo "🤝 Omarchy supports Antigravity natively; handing usage and launching over to it..."
+  echo "🤝 Omarchy supports Antigravity natively; handing usage over to it..."
   "$BIN_DIR/omarchy-antigravity" adopt-native
 fi
 
@@ -237,18 +344,25 @@ mkdir -p "$CONFIG_DIR/defaults"
 AGENT_FILE="$CONFIG_DIR/defaults/agent"
 CURRENT_AGENT=""
 [[ -f "$AGENT_FILE" ]] && CURRENT_AGENT=$(tr -d '[:space:]' < "$AGENT_FILE")
-# Omarchy 4.5 knows Antigravity as "agy" and launches it itself.
+# "antigravity" on Omarchy 4.5 as well: the plugin's launcher opens agy with
+# its permission prompts, where 4.5's own "agy" default would skip them.
 DEFAULT_AGENT_ID="antigravity"
-(( NATIVE_ANTIGRAVITY )) && DEFAULT_AGENT_ID="agy"
+# The opt-in marker is touched right after every write the plugin makes, so
+# the default is still the plugin's only while the agent file is not newer.
+DEFAULT_MARKER="$CONFIG_DIR/antigravity.default"
+plugin_owns_default() {
+  [[ -f "$DEFAULT_MARKER" && -f "$AGENT_FILE" && ! "$AGENT_FILE" -nt "$DEFAULT_MARKER" ]]
+}
 
 # Releases before the Antigravity CLI set "gemini", served by a
 # ~/.local/bin/gemini shim to agy that has since been removed; Omarchy now
-# opens the deprecated Gemini CLI for it. Move a default this plugin set (its
-# opt-in marker is there) to "antigravity"; a user's own Gemini pick has no
-# marker and stays.
-if (( ! NATIVE_ANTIGRAVITY )) && [[ "$CURRENT_AGENT" == "gemini" && -f "$CONFIG_DIR/antigravity.default" ]]; then
+# opens the deprecated Gemini CLI for it. Move a "gemini" default this plugin
+# set to "antigravity"; a Gemini pick of the user's own (no marker, or made
+# after it) stays. Omarchy 4.5's own migration handles "gemini" there.
+if (( ! NATIVE_ANTIGRAVITY )) && [[ "$CURRENT_AGENT" == "gemini" ]] && plugin_owns_default; then
   echo "⚙️  Moving the legacy 'gemini' default agent to 'antigravity'..."
   echo "antigravity" > "$AGENT_FILE"
+  touch "$DEFAULT_MARKER"
   CURRENT_AGENT="antigravity"
 fi
 
@@ -279,10 +393,10 @@ fi
 if [[ "$should_set_default" == true ]]; then
   echo "⚙️  Setting default agent to Antigravity..."
   if [[ -f "$AGENT_FILE" && "$CURRENT_AGENT" != "$DEFAULT_AGENT_ID" ]]; then
-    cp "$AGENT_FILE" "$AGENT_FILE.bak.$(date +%s)"
+    backup_file "$AGENT_FILE"
   fi
   echo "$DEFAULT_AGENT_ID" > "$AGENT_FILE"
-  touch "$CONFIG_DIR/antigravity.default"
+  touch "$DEFAULT_MARKER"
 else
   echo "ℹ️  Keeping '$CURRENT_AGENT' as default agent."
 fi
@@ -327,20 +441,29 @@ if (( ! NATIVE_ANTIGRAVITY )); then
   fi
 
   if [[ -d "$USER_PLUGIN_DIR" ]]; then
-    # Preserve any pre-existing user UI edits (idempotent single-slot backups)
-    # before installing this plugin's Panel/Main and assets.
-    for ui_file in Panel.qml Main.qml; do
-      if [[ -f "$USER_PLUGIN_DIR/$ui_file" && ! -f "$USER_PLUGIN_DIR/$ui_file.bak" ]]; then
-        cp "$USER_PLUGIN_DIR/$ui_file" "$USER_PLUGIN_DIR/$ui_file.bak" 2>/dev/null || true
+    # The first install keeps what was there as <file>.bak (uninstall puts it
+    # back). On a reinstall that .bak exists already, so a file that differs
+    # from both this release's copy and the .bak (edits made after the last
+    # install) gets a timestamped backup of its own before it is replaced.
+    install_ui_file() {
+      local src="$1" dst="$2"
+      if [[ -f "$dst" ]] && ! cmp -s "$src" "$dst"; then
+        if [[ ! -f "$dst.bak" ]]; then
+          cp -p "$dst" "$dst.bak" 2>/dev/null || true
+        elif ! cmp -s "$dst" "$dst.bak"; then
+          backup_file "$dst" || true
+          prune_backups "$dst"
+        fi
       fi
-      cp -f --remove-destination "$SCRIPT_DIR/ui/$ui_file" "$USER_PLUGIN_DIR/$ui_file"
+      cp -f --remove-destination "$src" "$dst"
+      manifest_set "$dst" record
+    }
+    for ui_file in Panel.qml Main.qml; do
+      install_ui_file "$SCRIPT_DIR/ui/$ui_file" "$USER_PLUGIN_DIR/$ui_file"
     done
     mkdir -p "$USER_PLUGIN_DIR/assets"
     for asset in antigravity.svg antigravity-light.svg; do
-      if [[ -f "$USER_PLUGIN_DIR/assets/$asset" && ! -f "$USER_PLUGIN_DIR/assets/$asset.bak" ]]; then
-        cp "$USER_PLUGIN_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset.bak" 2>/dev/null || true
-      fi
-      cp -f --remove-destination "$SCRIPT_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset"
+      install_ui_file "$SCRIPT_DIR/assets/$asset" "$USER_PLUGIN_DIR/assets/$asset"
     done
     if command -v omarchy-shell >/dev/null 2>&1; then
       omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
@@ -349,6 +472,13 @@ if (( ! NATIVE_ANTIGRAVITY )); then
 fi
 
 # 6. Configure Antigravity CLI (agy) bottom status bar
+# Releases before the status line's debug switch dumped every agy context it
+# received (working directory, session details) with the default 0644 mode,
+# and rewriting it in place would keep that mode: make an old dump private.
+LEGACY_STATUSLINE_DUMP="$HOME/.gemini/antigravity-cli/last_statusline_input.json"
+if [[ -f "$LEGACY_STATUSLINE_DUMP" && ! -L "$LEGACY_STATUSLINE_DUMP" ]]; then
+  chmod 600 "$LEGACY_STATUSLINE_DUMP" 2>/dev/null || true
+fi
 should_install_statusline=false
 if [[ "$INSTALL_STATUSLINE" == "yes" ]]; then
   should_install_statusline=true
@@ -385,12 +515,30 @@ if [[ "$should_install_statusline" == true ]]; then
   fi
   if [[ -f "$STATUSLINE_DST" && ! -e "$STATUSLINE_DST.bak" ]] &&
      ! cmp -s "$STATUSLINE_SRC" "$STATUSLINE_DST" && ! has_marker "$STATUSLINE_DST" "$STATUSLINE_MARKER_RE"; then
-    cp "$STATUSLINE_DST" "$STATUSLINE_DST.bak" 2>/dev/null || true
+    cp -p "$STATUSLINE_DST" "$STATUSLINE_DST.bak" 2>/dev/null || true
+  elif has_marker "$STATUSLINE_DST" "$STATUSLINE_MARKER_RE"; then
+    keep_if_edited "$STATUSLINE_DST" "$STATUSLINE_SRC"
   fi
   cp -f --remove-destination "$STATUSLINE_SRC" "$STATUSLINE_DST"
   chmod +x "$STATUSLINE_DST"
+  manifest_set "$STATUSLINE_DST" record
 
   AGY_SETTINGS="$AGY_CLI_DIR/settings.json"
+  # A statusLine entry of the user's own (pointing anywhere but the plugin's
+  # script) is kept aside once, privately, so uninstall can put it back.
+  STATUSLINE_PREVIOUS="$AGY_CLI_DIR/statusline.omarchy-antigravity.previous.json"
+  if [[ -f "$AGY_SETTINGS" && ! -e "$STATUSLINE_PREVIOUS" ]]; then
+    (
+      umask 077
+      prev_tmp=$(mktemp "$STATUSLINE_PREVIOUS.XXXXXX") || exit 0
+      if jq -e --arg script "$STATUSLINE_DST" \
+           '.statusLine | select(type == "object" and .command? != $script)' "$AGY_SETTINGS" > "$prev_tmp" 2>/dev/null; then
+        mv -f "$prev_tmp" "$STATUSLINE_PREVIOUS"
+      else
+        rm -f "$prev_tmp"
+      fi
+    )
+  fi
   if [[ -f "$AGY_SETTINGS" ]]; then
     if ! update_json --backup "$AGY_SETTINGS" '
       .statusLine = {
