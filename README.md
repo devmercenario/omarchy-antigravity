@@ -103,12 +103,12 @@ omarchy-antigravity statusline disable
 
 ## 🆕 Omarchy 4.5 and later
 
-Omarchy 4.5 supports Antigravity natively: `omarchy default agent antigravity` works (saved as `agy`), and Omarchy ships its own Antigravity usage collector and panel icon. Its updater only runs Omarchy's own collectors, and its panel calls the updater through `PATH`, so on 4.5 the plugin steps aside instead of duplicating or shadowing it:
+Omarchy 4.5 supports Antigravity natively: `omarchy default agent antigravity` works (saved as `agy`), and Omarchy ships its own Antigravity usage collector and panel icon. Its updater only runs Omarchy's own collectors, and its panel calls the updater through `PATH`, so on 4.5 the plugin steps aside where it would duplicate or shadow Omarchy:
 
-- **Handed over to Omarchy:** the usage collector, the `omarchy-agent-usage-update` and `omarchy-agent` copies, and the agents panel copy (the bar switches back to Omarchy's own `omarchy.agents` widget; the copy's folder is left in place). A plugin-set `antigravity` default becomes `agy`.
-- **Kept:** the theme-aware status line for `agy` and the `omarchy-antigravity` helper (`auth`, `status`, `refresh`, `default`).
+- **Handed over to Omarchy:** the usage collector and the `omarchy-agent-usage-update` copy, and the bar goes back to Omarchy's own `omarchy.agents` widget (the plugin's panel copy stays in its folder; `shell.json` is backed up first).
+- **Kept:** the theme-aware status line for `agy`, the `omarchy-antigravity` helper, and the `omarchy-agent` launcher. Your default agent is not changed: the plugin's `antigravity` default keeps opening `agy` **with** its permission prompts, while Omarchy's own `agy` default launches it with `--dangerously-skip-permissions`. Which one you use is your choice (`omarchy-antigravity default` or `omarchy default agent antigravity`).
 
-This happens on a fresh `./install.sh` on 4.5, and automatically through the post-update hook when `omarchy update` brings 4.5 (or run `omarchy-antigravity adopt-native` yourself). Things only the plugin did on 4.0 are then up to Omarchy: the native collector does not yet report the Gemini pools correctly or show Gemini 4 Argon (omacom/omarchy#16906), its panel has no Sign In button or broken-usage notification, and Omarchy launches `agy` with `--dangerously-skip-permissions`.
+This happens on a fresh `./install.sh` on 4.5, and once, automatically, through the post-update hook when `omarchy update` brings 4.5 (with a desktop notification); later updates never undo a choice you make afterwards, such as switching back to the plugin's panel for its Sign In button. You can also run `omarchy-antigravity adopt-native` yourself. Things only the plugin did on 4.0 are then up to Omarchy: the native collector does not yet report the Gemini pools correctly or show Gemini 4 Argon (omacom/omarchy#16906), and its panel has no Sign In button or broken-usage notification.
 
 ---
 
