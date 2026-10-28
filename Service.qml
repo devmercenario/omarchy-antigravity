@@ -2,12 +2,17 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Omarchy Service for Antigravity integration
+// Omarchy Service for Antigravity integration. It only answers IPC: the
+// agents bar schedules every refresh itself (and honors the provider being
+// switched off), so a timer here would just race it.
 Item {
   id: root
   visible: false
 
   readonly property string home: Quickshell.env("HOME") || ""
+  // This plugin's updater has to win over the stock one on PATH; without a
+  // HOME, fall back to whichever updater PATH finds.
+  readonly property string updateScript: home !== "" ? home + "/.local/bin/omarchy-agent-usage-update" : "omarchy-agent-usage-update"
 
   IpcHandler {
     target: "devmercenario.antigravity"
@@ -36,16 +41,6 @@ Item {
   Process {
     id: refreshProcess
     running: false
-    command: [home + "/.local/bin/omarchy-agent-usage-update", "--limits-only", "antigravity"]
-  }
-
-  Timer {
-    id: periodicRefresh
-    interval: 900000 // 15 minutes
-    running: true
-    repeat: true
-    onTriggered: {
-      if (!refreshProcess.running) refreshProcess.running = true
-    }
+    command: [root.updateScript, "--limits-only", "antigravity"]
   }
 }

@@ -3,6 +3,7 @@ import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 Panel {
@@ -11,55 +12,26 @@ Panel {
   ipcTarget: "omarchy.agents"
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color surface: Color.popups.background
-  readonly property color track: Style.selectedFillFor(foreground, Color.accent)
+  readonly property color surface: Commons.Color.popups.background
+  readonly property color track: Style.selectedFillFor(foreground, Commons.Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property string home: Quickshell.env("HOME") || ""
   readonly property var providers: usage.enabledProviders
-  property string defaultAgentName: ""
   // The selection follows the provider, not the slot it happens to sit in: a
   // provider whose first scan lands while the panel is open would otherwise
   // shift the list underneath you and swap out what you were reading.
   property string selectedProviderId: ""
-
-  FileView {
-    id: defaultAgentWatcher
-    path: root.home + "/.config/omarchy/defaults/agent"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.updateDefaultAgent(typeof text === "function" ? text() : text)
-    onLoadFailed: root.defaultAgentName = ""
-  }
-
-  function updateDefaultAgent(content) {
-    var raw = String(content || "").trim().toLowerCase()
-    if (raw === "gemini" || raw === "antigravity") {
-      defaultAgentName = "antigravity"
-    } else if (raw === "claude" || raw === "claude-code") {
-      defaultAgentName = "claude"
-    } else if (raw === "codex") {
-      defaultAgentName = "codex"
-    } else if (raw === "fireworks") {
-      defaultAgentName = "fireworks"
-    } else {
-      defaultAgentName = raw
-    }
-
-    if (!root.opened && defaultAgentName !== "") {
-      selectedProviderId = defaultAgentName
-    }
-  }
-
+  // The default agent only stands in until something is chosen, so a pick
+  // made with a middle click survives closing and reopening the panel.
   readonly property int providerIndex: {
-    var target = selectedProviderId !== "" ? selectedProviderId : defaultAgentName
-    if (target !== "") {
+    var wanted = [selectedProviderId, usage.defaultAgentId]
+    for (var w = 0; w < wanted.length; w++) {
+      if (wanted[w] === "") continue
       for (var i = 0; i < providers.length; i++)
-        if (providers[i].providerId === target) return i
+        if (providers[i].providerId === wanted[w]) return i
     }
     return 0
   }
@@ -75,12 +47,29 @@ Panel {
   readonly property var models: modelRows(provider)
   readonly property var headline: bindingWindow(provider)
   readonly property var balance: provider ? (provider.balance || null) : null
-  readonly property bool authNeeded: !!root.provider && String(root.provider.usageStatusText || "") !== ""
+  // Any switched-on agent with a problem to report lights the bar, not just
+  // the one on screen: the selection usually rests on the default agent, and
+  // a lapsed sign-in or a broken usage format elsewhere would otherwise wait
+  // unseen. The agent on screen wins when it is one of them, then one a
+  // sign-in can fix.
+  readonly property var problemProvider: {
+    if (provider && String(provider.usageStatusText || "") !== "") return provider
+    var first = null
+    for (var i = 0; i < providers.length; i++) {
+      var p = providers[i]
+      if (String(p.usageStatusText || "") === "") continue
+      if (p.authRequired === true) return p
+      if (!first) first = p
+    }
+    return first
+  }
+  // What a day's count in the weekly chart means for this agent.
+  readonly property bool countsPrompts: !!provider && provider.recentDaysUnit === "prompts"
   // A prepaid account runs low the way a subscription window fills up: the
   // last 10% of the funded credits lights the same alarm.
   readonly property bool balanceAlarming: !!balance && balance.funded > 0
     && balance.remaining / balance.funded <= 0.1
-  readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming || authNeeded
+  readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming || !!problemProvider
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
@@ -138,10 +127,12 @@ Panel {
   // titled after its model, and a name like "Opus 5 (1M context)" would parse
   // as a one-minute window.
   function limitWindow(label, percent, resetAt, title) {
+    var reset = new Date(String(resetAt || "")).getTime()
+    var expired = isFinite(reset) && reset <= root.nowMs
     return {
       title: String(title || "") !== "" ? String(title) : windowTitle(label),
-      percent: Number(percent),
-      resetAt: String(resetAt || "")
+      percent: expired ? 0 : Number(percent),
+      resetAt: expired ? "" : String(resetAt || "")
     }
   }
 
@@ -248,13 +239,16 @@ Panel {
     var label = isNaN(parsed.getTime())
       ? String(day.date)
       : dayName(day.date) + " " + (parsed.getMonth() + 1) + "/" + parsed.getDate()
-    var text = label + " · " + usage.formatTokenCount(Number(day.messageCount || 0)) + " tokens"
+    var count = Number(day.messageCount || 0)
+    var text = label + " · " + (root.countsPrompts ? count + " prompts" : usage.formatTokenCount(count) + " tokens")
     // Prompt and session counts only exist for today, so they ride along here
     // instead of taking a section of their own. Billing-API agents never
     // count prompts, and "0 prompts" would read as a quiet day, not a gap.
-    if (today && provider && provider.hasPromptStats !== false)
-      text += " · " + Number(provider.todayPrompts || 0) + " prompts · "
-        + Number(provider.todaySessions || 0) + " sessions"
+    // An agent whose days already count prompts has just said today's.
+    if (today && provider && provider.hasPromptStats !== false) {
+      if (!root.countsPrompts) text += " · " + Number(provider.todayPrompts || 0) + " prompts"
+      text += " · " + Number(provider.todaySessions || 0) + " sessions"
+    }
     return text
   }
 
@@ -324,7 +318,7 @@ Panel {
   function iconCandidatesForProvider(p, surfaceColor) {
     if (!p) return []
     var candidates = []
-    if (colorLuminance(surfaceColor || Color.background) >= 0.5)
+    if (colorLuminance(surfaceColor || Commons.Color.background) >= 0.5)
       candidates.push(Qt.resolvedUrl("assets/" + p.providerId + "-light.svg"))
     candidates.push(Qt.resolvedUrl("assets/" + p.providerId + ".svg"))
     return candidates
@@ -342,16 +336,17 @@ Panel {
     cursorActive = false
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
-    if (defaultAgentName !== "") {
-      for (var i = 0; i < providers.length; i++) {
-        if (providers[i].providerId === defaultAgentName) {
-          selectedProviderId = defaultAgentName
-          break
-        }
-      }
-    }
+    // The bar lit up for a reason; open on the agent it is about.
+    if (problemProvider) selectedProviderId = problemProvider.providerId
     usage.refreshLimits()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // The bar's alarm outlives the panel, so the clock that expires a spent
+  // window has to move while it is closed too: fresh data catches it up.
+  onProvidersChanged: {
+    nowMs = Date.now()
+    armResetClock()
   }
 
   Main {
@@ -366,6 +361,38 @@ Panel {
     running: root.opened
     repeat: true
     onTriggered: root.nowMs = Date.now()
+  }
+
+  // And a window that resets between refreshes: one shot at the earliest
+  // pending reset among the agents in the bar, re-armed as data arrives,
+  // and idle when nothing is waiting to reset.
+  Timer {
+    id: resetClock
+    repeat: false
+    onTriggered: {
+      root.nowMs = Date.now()
+      root.armResetClock()
+    }
+  }
+
+  function armResetClock() {
+    var now = Date.now()
+    var next = 0
+    for (var i = 0; i < providers.length; i++) {
+      var list = providers[i].limits || []
+      for (var j = 0; j < list.length; j++) {
+        var ms = new Date(String((list[j] || {}).resetsAt || "")).getTime()
+        if (isFinite(ms) && ms > now && (next === 0 || ms < next)) next = ms
+      }
+    }
+    if (next === 0) {
+      resetClock.stop()
+      return
+    }
+    // Capped at a day: a monthly reset would overflow the timer's interval,
+    // and waking early only re-arms. The extra second lands past the reset.
+    resetClock.interval = Math.min(next - now + 1000, 24 * 3600 * 1000)
+    resetClock.restart()
   }
 
   IpcHandler {
@@ -386,11 +413,14 @@ Panel {
     text: "󱚣"
     active: root.alarming
     tooltipText: {
-      if (!root.provider) return "Agents"
-      if (root.authNeeded && String(root.provider.usageStatusText || "") !== "") {
-        var hint = root.provider.authRequired === true ? " (Click to resolve)" : " (Click for details)"
-        return root.provider.providerName + ": " + root.provider.usageStatusText + hint
+      // Named after the agent that lit the bar, which need not be the one
+      // the panel last showed.
+      var problem = root.problemProvider
+      if (problem) {
+        var hint = problem.authRequired === true ? " (Click to resolve)" : " (Click for details)"
+        return problem.providerName + ": " + problem.usageStatusText + hint
       }
+      if (!root.provider) return "Agents"
       if (root.headline) {
         var pct = Math.round((1.0 - root.headline.percent) * 100)
         return root.provider.providerName + " (" + root.headline.title + "): " + pct + "% remaining"
@@ -724,7 +754,7 @@ Panel {
 
             PanelSectionHeader {
               width: parent.width
-              text: "TOKENS BY DAY"
+              text: root.countsPrompts ? "PROMPTS BY DAY" : "TOKENS BY DAY"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }

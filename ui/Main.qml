@@ -14,6 +14,10 @@ Item {
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
+
+  // The agent `omarchy-agent` launches by default. It only picks which tab
+  // the panel opens on while nothing else is chosen; it never switches an
+  // agent on or puts an empty one in the bar. The panel reads it from here.
   property string defaultAgentId: ""
 
   FileView {
@@ -22,14 +26,16 @@ Item {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: {
-      var str = typeof text === "function" ? text() : text
-      var raw = String(str || "").trim().toLowerCase()
-      if (raw === "gemini" || raw === "antigravity") root.defaultAgentId = "antigravity"
-      else if (raw === "claude" || raw === "claude-code") root.defaultAgentId = "claude"
-      else root.defaultAgentId = raw
-      root.recordsChanged()
-    }
+    onLoaded: root.defaultAgentId = root.normalizeAgentId(typeof text === "function" ? text() : text)
+    // A deleted file means no default, not the last one it held.
+    onLoadFailed: root.defaultAgentId = ""
+  }
+
+  function normalizeAgentId(content) {
+    var raw = String(content || "").trim().toLowerCase()
+    if (raw === "gemini") return "antigravity"
+    if (raw === "claude-code") return "claude"
+    return raw
   }
 
   // ------------------------------------------------------------- discovery
@@ -126,12 +132,13 @@ Item {
 
   Component.onCompleted: {
     rescanAgents()
-    if (syncConfigured()) scheduleSync()
+    // Also reports a sync folder setting that can never work.
+    syncSettingsChanged()
   }
 
   // -------------------------------------------------------------- refresh
 
-  property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 60)))
+  property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
   property string pendingUpdateKind: ""
 
   Timer {
@@ -140,6 +147,27 @@ Item {
     repeat: true
     triggeredOnStart: true
     onTriggered: root.runUpdate("normal")
+  }
+
+  // The full run walks every transcript on disk, so it keeps the slow
+  // interval above. Antigravity's quota pools drain within minutes and its
+  // collector returns at once when no agy session is running, so it alone
+  // also gets a short limits-only cadence.
+  readonly property var fastRefreshAgentIds: ["antigravity"]
+  property int limitsRefreshIntervalSec: Math.max(60, Number(setting("limitsRefreshIntervalSec", 120)) || 120)
+
+  Timer {
+    interval: root.limitsRefreshIntervalSec * 1000
+    running: true
+    repeat: true
+    onTriggered: {
+      // A run already in flight either covers these agents or ends before
+      // the next tick; queueing behind it would widen this cheap run into a
+      // limits pass over every collector.
+      if (updateProcess.running) return
+      var ids = root.fastRefreshAgentIds.filter(function(id) { return root.providerEnabled(id) })
+      if (ids.length > 0) root.runUpdate("limits", ids)
+    }
   }
 
   Process {
@@ -161,7 +189,10 @@ Item {
   }
 
   function updateCommand(kind, agentIds) {
-    var updateScript = home + "/.local/bin/omarchy-agent-usage-update"
+    // This plugin's updater lives in ~/.local/bin and has to win over the
+    // stock one on PATH; without a HOME that path would point at /.local/bin,
+    // so fall back to whichever updater PATH finds.
+    var updateScript = home !== "" ? home + "/.local/bin/omarchy-agent-usage-update" : "omarchy-agent-usage-update"
     var command = [updateScript]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
@@ -228,15 +259,19 @@ Item {
   }
 
   function providerEnabled(id) {
-    if (root.defaultAgentId !== "" && id === root.defaultAgentId) return true
     if (!settings || !settings.providers || !settings.providers[id]) return true
     return settings.providers[id].enabled !== false
   }
 
   // All-time keeps a quiet day from hiding an agent; today's counts admit a
   // machine whose only source is history.jsonl, which knows nothing older.
+  // An agent waiting for a sign-in has no numbers yet, but needs its tab for
+  // the Sign In button. Other problems still need numbers first: the stock
+  // defaults switch Codex and Fireworks on everywhere, and a machine that
+  // never installed them reports both "unavailable" — that must not grow a
+  // tab or light the bar.
   function providerHasData(p) {
-    return (root.defaultAgentId !== "" && p.providerId === root.defaultAgentId)
+    return p.authRequired === true
       || numberValue(p.totalPrompts) > 0 || numberValue(p.totalSessions) > 0
       || numberValue(p.activeDays) > 0 || numberValue(p.todayPrompts) > 0
       || numberValue(p.todaySessions) > 0 || (p.limits && p.limits.length > 0)
@@ -283,6 +318,9 @@ Item {
       todayTotalTokens: synced ? numberValue(stats.todayTotalTokens) : numberValue(record.todayTotalTokens),
       todayTokensByModel: synced ? (stats.todayTokensByModel || ({})) : (record.todayTokensByModel || ({})),
       recentDays: synced ? (stats.recentDays || []) : (record.recentDays || []),
+      // What a day's messageCount counts. Token-based collectors predate the
+      // field and never send it; Antigravity counts prompts.
+      recentDaysUnit: String((synced && stats.recentDaysUnit) || record.recentDaysUnit || "tokens"),
       totalPrompts: synced ? numberValue(stats.totalPrompts) : numberValue(record.totalPrompts),
       totalSessions: synced ? numberValue(stats.totalSessions) : numberValue(record.totalSessions),
       activeDays: synced ? numberValue(stats.activeDays) : numberValue(record.activeDays),
@@ -388,8 +426,15 @@ Item {
     return text === "on" || text === "enabled" || text === "true" || text === "yes" || text === "1"
   }
 
+  // Validates the folder rather than trusting the setting: expandPath refuses
+  // a path that climbs with "..", and syncing into its empty result would
+  // only surface as a misleading mkdir failure.
   function syncConfigured() {
-    return root.syncEnabled === true && String(root.syncDir || "").trim() !== ""
+    return root.syncEnabled === true && expandPath(root.syncDir) !== ""
+  }
+
+  function syncDirRejected() {
+    return root.syncEnabled === true && String(root.syncDir || "").trim() !== "" && expandPath(root.syncDir) === ""
   }
 
   function syncSettingsChanged() {
@@ -399,7 +444,7 @@ Item {
       syncDebounce.stop()
       syncRequestedWhileRunning = false
       aggregateData = ({})
-      syncStatusText = ""
+      syncStatusText = syncDirRejected() ? "Usage sync folder can't contain \"..\"" : ""
       syncRevision++
     }
   }
@@ -435,13 +480,34 @@ Item {
     Qt.callLater(root.startSyncScan)
   }
 
+  // The sync folder is shared with other machines and whatever else lands in
+  // it, and the whole scan is parsed on the GUI thread. A real snapshot is a
+  // few kilobytes from one of a handful of machines, so these bounds only
+  // ever bite on junk.
+  readonly property int syncMaxSnapshotBytes: 1048576
+  readonly property int syncMaxSnapshots: 64
+  readonly property int syncMaxProviders: 16
+
   function startSyncScan() {
     if (!syncConfigured()) {
       finishSyncRun()
       return
     }
-    var script = "dir=$0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; printf '===%s===\\n' \"$f\"; cat \"$f\"; printf '\\n=== EOM ===\\n'; done"
-    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir]
+    var script = [
+      "dir=$0 max_bytes=$1 max_files=$2 count=0",
+      "[[ -d \"$dir\" ]] || exit 0",
+      "shopt -s nullglob",
+      "for f in \"$dir\"/*.json; do",
+      "  [[ -f \"$f\" ]] || continue",
+      "  size=$(stat -L -c %s -- \"$f\" 2>/dev/null) || continue",
+      "  if (( size > max_bytes )); then echo \"skipping $f: larger than $max_bytes bytes\" >&2; continue; fi",
+      "  if (( count >= max_files )); then echo \"reading only the first $max_files snapshots\" >&2; break; fi",
+      "  count=$((count + 1))",
+      "  printf '===%s===\\n' \"$f\"; head -c \"$max_bytes\" -- \"$f\"; printf '\\n=== EOM ===\\n'",
+      "done"
+    ].join("\n")
+    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir,
+                               String(root.syncMaxSnapshotBytes), String(root.syncMaxSnapshots)]
     syncScanProcess.running = true
   }
 
@@ -580,14 +646,20 @@ Item {
     var dates = recentDateStrings()
     var devices = Object.create(null)
     var providers = Object.create(null)
+    var providerCount = 0
 
+    // Null once the merge holds syncMaxProviders agents: any further ids are
+    // dropped rather than each growing its own tab.
     function providerAcc(id) {
       if (providers[id]) return providers[id]
+      if (providerCount >= root.syncMaxProviders) return null
+      providerCount++
       var recentByDay = Object.create(null)
       for (var d = 0; d < dates.length; d++) recentByDay[dates[d]] = 0
       providers[id] = {
         providerId: id,
         providerName: "",
+        recentDaysUnit: "",
         ready: false,
         hasLocalStats: false,
         hasPromptStats: false,
@@ -614,8 +686,10 @@ Item {
       for (var providerId in snapshotProviders) {
         var stats = snapshotProviders[providerId] || {}
         var acc = providerAcc(String(providerId))
+        if (!acc) continue
         acc.devices[device] = true
         if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)
+        if (stats.recentDaysUnit && acc.recentDaysUnit === "") acc.recentDaysUnit = String(stats.recentDaysUnit)
         acc.ready = acc.ready || stats.ready === true
         acc.hasLocalStats = acc.hasLocalStats || stats.hasLocalStats !== false
         // Snapshots from before the field existed only came from agents that
@@ -661,6 +735,7 @@ Item {
       outProviders[id] = {
         providerId: acc.providerId,
         providerName: acc.providerName,
+        recentDaysUnit: acc.recentDaysUnit,
         ready: acc.ready || providerDevices.length > 0,
         hasLocalStats: acc.hasLocalStats,
         hasPromptStats: acc.hasPromptStats,
@@ -689,9 +764,11 @@ Item {
   }
 
   // Snapshots keep the field names older Omarchy versions wrote, so a fleet
-  // of machines on mixed versions still merges cleanly in both directions.
+  // of machines on mixed versions still merges cleanly in both directions;
+  // recentDaysUnit is an addition they ignore, and its absence reads as
+  // tokens.
   function providerSnapshot(record) {
-    return {
+    var snapshot = {
       providerId: String(record.id),
       providerName: String(record.name || record.id),
       ready: record.ready === true,
@@ -709,6 +786,8 @@ Item {
       activeDates: cloneValue(record.activeDates, []),
       modelUsage: cloneValue(record.modelUsage, ({}))
     }
+    if (record.recentDaysUnit) snapshot.recentDaysUnit = String(record.recentDaysUnit)
+    return snapshot
   }
 
   function localSnapshot() {
