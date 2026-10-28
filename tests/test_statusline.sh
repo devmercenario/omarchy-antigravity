@@ -130,5 +130,22 @@ echo '{"theme":"dark"}' > "$HOME/.gemini/antigravity-cli/settings.json"
 jq -e 'has("statusLine") | not' "$HOME/.gemini/antigravity-cli/settings.json" >/dev/null \
   || fail "statusline disable created a statusLine entry."
 
+# A repository's own clean filter must never run because the status line
+# rendered inside it (an untrusted checkout would otherwise run its commands
+# through `git status`), and the branch must still show.
+echo "  ▶ Testing that a repository's own filter commands never run..."
+evil="$TEST_HOME/evil-repo"
+git init -q -b main "$evil"
+printf 'data\n' > "$evil/f.txt"
+printf '* filter=x\n' > "$evil/.gitattributes"
+git -C "$evil" add -A
+git -C "$evil" -c user.email=t@t -c user.name=t commit -q -m init
+git -C "$evil" config filter.x.clean "sh -c 'touch $TEST_HOME/FILTER_RAN; cat'"
+touch -d '2 minutes ago' "$evil/f.txt"
+rm -f "$TEST_HOME/FILTER_RAN"
+evil_out=$(echo "{\"cwd\": \"$evil\", \"width\": 100}" | bash "$STATUSLINE" | strip_ansi)
+[[ ! -e "$TEST_HOME/FILTER_RAN" ]] || fail "rendering ran the repository's clean filter."
+[[ "$evil_out" == *" main "* ]] || fail "the branch was not shown for a repository with its own filters: $evil_out"
+
 echo "  ✅ All statusline assertions passed!"
 echo "🎉 Statusline tests passed successfully!"

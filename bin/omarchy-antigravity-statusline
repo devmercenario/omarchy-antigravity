@@ -24,10 +24,14 @@ WIDTH=""
 # Parse input from stdin (agy passes context JSON) in a single jq call.
 if [ -n "$INPUT" ]; then
     if [ -n "${OMARCHY_STATUSLINE_DEBUG:-}" ]; then
+        # Through a new private file renamed into place: rewriting an
+        # existing dump in place would keep whatever mode it already had.
         (
             umask 077
-            mkdir -p "$HOME/.gemini/antigravity-cli" 2>/dev/null || true
-            echo "$INPUT" > "$HOME/.gemini/antigravity-cli/last_statusline_input.json" 2>/dev/null || true
+            dump_dir="$HOME/.gemini/antigravity-cli"
+            mkdir -p "$dump_dir" 2>/dev/null || exit 0
+            dump=$(mktemp "$dump_dir/.last_statusline_input.XXXXXX" 2>/dev/null) || exit 0
+            printf '%s\n' "$INPUT" > "$dump" && mv -f "$dump" "$dump_dir/last_statusline_input.json" || rm -f "$dump"
         )
     fi
     # @tsv escapes tabs, newlines, CRs and backslashes inside each field, so
@@ -60,29 +64,53 @@ fi
 valid_width "$WIDTH" || WIDTH=100
 WIDTH=$((10#$WIDTH))
 
-# Branch and change counts from a single `git status`. GIT_OPTIONAL_LOCKS=0
-# stops it from refreshing (writing) .git/index, and the empty core.fsmonitor
-# keeps a repository's fsmonitor hook from running just because the status
-# line rendered inside it.
-GIT_STATUS=$(GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor= -C "$CWD" status --porcelain=v2 --branch 2>/dev/null) || GIT_STATUS=""
+# Branch and change counts. Every git call is time-boxed (the status line
+# renders constantly, and a huge or network-mounted repository must not stack
+# hung processes) and its output capped. GIT_OPTIONAL_LOCKS=0 stops git from
+# refreshing (writing) .git/index, and the empty core.fsmonitor keeps a
+# repository's fsmonitor hook from running.
+#
+# `git status` re-reads files whose stat data changed and runs them through
+# any clean filter the repository configures, so opening agy in an untrusted
+# checkout (an extracted archive, say) would run its commands. When the
+# repository's own config (local or worktree scope) defines filters, only
+# what needs no file contents is shown: branch, staged and untracked counts.
+# Filters from the user's global or system config (git-lfs) are the user's.
+GIT_TIMEOUT=()
+command -v timeout >/dev/null 2>&1 && GIT_TIMEOUT=(timeout -k 1 2)
+git_q() {
+    "${GIT_TIMEOUT[@]}" env GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor= -C "$CWD" "$@" 2>/dev/null | head -c 1048576
+}
 BRANCH=""
 OID=""
 ADDED=0
 MODIFIED=0
 UNTRACKED=0
-while IFS= read -r line; do
-    case "$line" in
-        "# branch.head "*) BRANCH="${line#\# branch.head }" ;;
-        "# branch.oid "*) OID="${line#\# branch.oid }" ;;
-        # Changed entries are "<type> XY ...": X is the index (staged)
-        # status, Y the worktree status.
-        "1 "*|"2 "*|"u "*)
-            case "${line:2:1}" in [MADRC]) ADDED=$((ADDED + 1)) ;; esac
-            case "${line:3:1}" in [MD]) MODIFIED=$((MODIFIED + 1)) ;; esac
-            ;;
-        "? "*) UNTRACKED=$((UNTRACKED + 1)) ;;
-    esac
-done <<<"$GIT_STATUS"
+if git_q config --show-scope --get-regexp '^filter\.' | grep -qE '^(local|worktree)[[:space:]]'; then
+    BRANCH=$(git_q symbolic-ref -q --short HEAD)
+    [ -n "$BRANCH" ] || BRANCH=$(git_q rev-parse --short=7 HEAD)
+    while IFS= read -r line; do
+        [ -n "$line" ] && ADDED=$((ADDED + 1))
+    done < <(git_q diff-index --cached --name-only HEAD --)
+    while IFS= read -r line; do
+        [ -n "$line" ] && UNTRACKED=$((UNTRACKED + 1))
+    done < <(git_q ls-files --others --exclude-standard --directory --no-empty-directory)
+else
+    GIT_STATUS=$(git_q status --porcelain=v2 --branch --ignore-submodules=all) || GIT_STATUS=""
+    while IFS= read -r line; do
+        case "$line" in
+            "# branch.head "*) BRANCH="${line#\# branch.head }" ;;
+            "# branch.oid "*) OID="${line#\# branch.oid }" ;;
+            # Changed entries are "<type> XY ...": X is the index (staged)
+            # status, Y the worktree status.
+            "1 "*|"2 "*|"u "*)
+                case "${line:2:1}" in [MADRC]) ADDED=$((ADDED + 1)) ;; esac
+                case "${line:3:1}" in [MD]) MODIFIED=$((MODIFIED + 1)) ;; esac
+                ;;
+            "? "*) UNTRACKED=$((UNTRACKED + 1)) ;;
+        esac
+    done <<<"$GIT_STATUS"
+fi
 if [ "$BRANCH" = "(detached)" ]; then
     # Detached HEAD: show the abbreviated commit instead.
     BRANCH=""
