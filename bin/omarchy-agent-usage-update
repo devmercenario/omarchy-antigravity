@@ -73,6 +73,8 @@ else
   done
 fi
 
+MAX_RECORD_BYTES=$((4 * 1024 * 1024))
+
 have_timeout=0
 command -v timeout >/dev/null 2>&1 && have_timeout=1
 have_flock=0
@@ -103,36 +105,52 @@ collect() {
   [[ -n "$limits_only" ]] && cmd+=("$limits_only")
 
   # Bound each collector so one hung or misbehaving script cannot stall the
-  # whole refresh indefinitely.
+  # whole refresh indefinitely: SIGTERM after 60 s, and SIGKILL 5 s later for
+  # one that ignores or outlives the TERM.
   if (( have_timeout )); then
-    cmd=(timeout 60 "${cmd[@]}")
+    cmd=(timeout --kill-after=5 60 "${cmd[@]}")
   fi
 
   tmp_file=$(mktemp "$STATE_DIR/.${id}.json.tmp.XXXXXX")
   err_file=$(mktemp "$STATE_DIR/.${id}.err.XXXXXX")
+  # This runs in its own background subshell: an interrupted refresh must not
+  # leave temp files behind in the state directory.
+  trap 'rm -f -- "$tmp_file" "$err_file"' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
 
   # The collector does not inherit the lock fd: a process it leaves behind
   # must not keep the next refresh locked out.
   "${cmd[@]}" >"$tmp_file" 2>"$err_file" 9>&- || rc=$?
 
   # Forward the collector's stderr tagged with its id, without control
-  # characters, and bounded so a chatty collector cannot flood the log.
+  # characters, and bounded so a chatty collector cannot flood the log: only
+  # the first 64 KiB are read (never a whole runaway file into memory), at
+  # most 50 lines of at most 500 characters each.
   while IFS= read -r line || [[ -n "$line" ]]; do
     if (( ++lines > 50 )); then
       echo "$id: ... (further output truncated)" >&2
       break
     fi
-    printf '%s: %s\n' "$id" "${line//[[:cntrl:]]/}" >&2
-  done <"$err_file"
+    line=${line//[[:cntrl:]]/}
+    printf '%s: %s\n' "$id" "${line:0:500}" >&2
+  done < <(head -c 65536 -- "$err_file")
   rm -f "$err_file"
 
   if (( rc != 0 )); then
     rm -f "$tmp_file"
-    if (( have_timeout && rc == 124 )); then
+    if (( have_timeout && (rc == 124 || rc == 137) )); then
       echo "omarchy-agent-usage-update: $id: collector timed out after 60s" >&2
     else
       echo "omarchy-agent-usage-update: $id: collector failed (exit $rc)" >&2
     fi
+    return 1
+  fi
+
+  # A record is a few kilobytes; never hand jq (or the bar) a runaway one.
+  if (( $(stat -c %s -- "$tmp_file") > MAX_RECORD_BYTES )); then
+    rm -f "$tmp_file"
+    echo "omarchy-agent-usage-update: $id: collector printed more than $MAX_RECORD_BYTES bytes; record discarded" >&2
     return 1
   fi
 

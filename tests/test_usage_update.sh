@@ -169,5 +169,28 @@ done
 timeout 60 "$UPDATER" ping pong || fail "collectors did not run in parallel"
 [[ -f "$STATE_DIR/ping.json" && -f "$STATE_DIR/pong.json" ]] || fail "parallel collectors did not publish"
 
+# 6. Output is bounded before it is parsed or logged: a runaway record is
+# discarded without reaching jq, a runaway stderr line is cut, and no temp
+# file is left behind either way.
+echo "  ▶ Runaway output is bounded and temp files are cleaned up..."
+cat > "$BIN/omarchy-agent-usage-huge" <<'EOF'
+#!/bin/bash
+printf '{"pad":"'; head -c $((5 * 1024 * 1024)) /dev/zero | tr '\0' x; printf '"}\n'
+head -c 200000 /dev/zero | tr '\0' y >&2
+EOF
+chmod +x "$BIN/omarchy-agent-usage-huge"
+rc=0
+err=$(timeout 60 "$UPDATER" huge 2>&1 >/dev/null) || rc=$?
+(( rc != 0 )) || fail "a runaway record was not reported as a failure"
+grep -q "more than $((4 * 1024 * 1024)) bytes" <<<"$err" || fail "the runaway record was not discarded with a message"
+[[ ! -e "$STATE_DIR/huge.json" ]] || fail "a runaway record was published"
+longest=$(awk '{ if (length > m) m = length } END { print m }' <<<"$err")
+(( longest < 600 )) || fail "a runaway stderr line was forwarded at full length ($longest)"
+shopt -s nullglob
+leftovers=("$STATE_DIR"/.huge.json.tmp.* "$STATE_DIR"/.huge.err.*)
+shopt -u nullglob
+(( ${#leftovers[@]} == 0 )) || fail "temp files were left behind: ${leftovers[*]}"
+rm -f "$BIN/omarchy-agent-usage-huge"
+
 echo "  ✅ Usage updater passed all assertions!"
 echo "🎉 Usage-updater tests passed successfully!"
