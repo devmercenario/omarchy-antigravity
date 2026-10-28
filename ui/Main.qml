@@ -41,6 +41,13 @@ Item {
     return raw
   }
 
+  // Agent ids end up in the updater's argv and in asset paths, so only a
+  // plain lowercase name is ever used there: a record or a synced snapshot
+  // must not smuggle in "--force", "../", "?" or "#".
+  function isSafeAgentId(id) {
+    return typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(id)
+  }
+
   // ------------------------------------------------------------- discovery
 
   property var agentIds: []
@@ -124,9 +131,12 @@ Item {
   function scheduleLimitsRetry() {
     var advising = []
     for (var i = 0; i < agents.length; i++) {
-      var record = agents[i] ? agents[i].record : null
-      if (record && record.retryAdvised === true && providerEnabled(String(record.id || "")))
-        advising.push(String(record.id))
+      var agent = agents[i]
+      var record = agent ? agent.record : null
+      // The id comes from the record's file name, never from what it says.
+      var id = agent ? String(agent.agentId || "") : ""
+      if (record && record.retryAdvised === true && isSafeAgentId(id) && providerEnabled(id))
+        advising.push(id)
     }
     retryAgentIds = advising
     if (advising.length > 0) limitsRetry.restart()
@@ -201,15 +211,20 @@ Item {
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}
     for (var id in providers) {
-      if (providers[id] && providers[id].enabled === false) command.push("--except", id)
+      if (isSafeAgentId(id) && providers[id] && providers[id].enabled === false) command.push("--except", id)
     }
     if (agentIds) {
-      for (var i = 0; i < agentIds.length; i++) command.push(agentIds[i])
+      for (var i = 0; i < agentIds.length; i++) {
+        if (isSafeAgentId(agentIds[i])) command.push(agentIds[i])
+      }
     }
     return command
   }
 
   function runUpdate(kind, agentIds) {
+    // A run aimed at agents none of which has a usable id must not widen
+    // into a run of every collector.
+    if (agentIds && agentIds.filter(function(id) { return root.isSafeAgentId(id) }).length === 0) return
     if (updateProcess.running) {
       // Collapse queued requests to one full rerun; a forced refresh outranks
       // the cheaper kinds it might have been queued behind.
@@ -261,6 +276,8 @@ Item {
     return result
   }
 
+  readonly property int maxLimitsPerAgent: 32
+
   function providerEnabled(id) {
     if (!settings || !settings.providers || !settings.providers[id]) return true
     return settings.providers[id].enabled !== false
@@ -311,8 +328,9 @@ Item {
       authRequired: record.authRequired === true,
 
       // Rate limits and balances stay per-account and are never merged
-      // across devices.
-      limits: Array.isArray(record.limits) ? record.limits : [],
+      // across devices. A record is laid out on the GUI thread, so a runaway
+      // list is cut to what a panel could ever show.
+      limits: Array.isArray(record.limits) ? record.limits.slice(0, root.maxLimitsPerAgent) : [],
       tierLabel: String(record.tierLabel || ""),
       balance: balanceValue(record.balance),
 
@@ -687,8 +705,11 @@ Item {
       devices[device] = true
       var snapshotProviders = snapshot.providers || {}
       for (var providerId in snapshotProviders) {
+        // Synced ids become tabs and icon paths; anything but a plain
+        // lowercase name is dropped here, before it can reach either.
+        if (!isSafeAgentId(providerId)) continue
         var stats = snapshotProviders[providerId] || {}
-        var acc = providerAcc(String(providerId))
+        var acc = providerAcc(providerId)
         if (!acc) continue
         acc.devices[device] = true
         if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)
@@ -797,7 +818,7 @@ Item {
     var providerMap = Object.create(null)
     for (var i = 0; i < agents.length; i++) {
       var record = agents[i] ? agents[i].record : null
-      if (!record || !record.id) continue
+      if (!record || !isSafeAgentId(String(record.id || ""))) continue
       if (!providerEnabled(String(record.id))) continue
       providerMap[String(record.id)] = providerSnapshot(record)
     }

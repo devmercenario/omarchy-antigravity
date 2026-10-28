@@ -127,23 +127,33 @@ Panel {
   // titled after its model, and a name like "Opus 5 (1M context)" would parse
   // as a one-minute window.
   function limitWindow(label, percent, resetAt, title) {
-    var reset = new Date(String(resetAt || "")).getTime()
+    // Records are untrusted input laid out on the GUI thread; no meter needs
+    // a longer name or timestamp than these.
+    var labelText = String(label || "").substring(0, root.maxLimitTextChars)
+    var titleText = String(title || "").substring(0, root.maxLimitTextChars)
+    var resetText = String(resetAt || "").substring(0, 64)
+    var reset = new Date(resetText).getTime()
     var expired = isFinite(reset) && reset <= root.nowMs
     return {
-      title: String(title || "") !== "" ? String(title) : windowTitle(label),
+      title: titleText !== "" ? titleText : windowTitle(labelText),
       percent: expired ? 0 : Number(percent),
-      resetAt: expired ? "" : String(resetAt || "")
+      resetAt: expired ? "" : resetText
     }
   }
+
+  // A handful of meters is all the panel ever shows; a runaway list from a
+  // record is cut here rather than grown into thousands of rows.
+  readonly property int maxLimitRows: 32
+  readonly property int maxLimitTextChars: 120
 
   function limitWindows(p) {
     if (!p) return []
     var out = []
-    var list = p.limits || []
-    for (var i = 0; i < list.length; i++) {
+    var list = Array.isArray(p.limits) ? p.limits : []
+    for (var i = 0; i < list.length && i < root.maxLimitRows; i++) {
       var entry = list[i] || {}
       var percent = Number(entry.percent)
-      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
+      if (percent >= 0 && isFinite(percent)) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
     }
     return out
   }
@@ -317,10 +327,15 @@ Panel {
   // if it doesn't.
   function iconCandidatesForProvider(p, surfaceColor) {
     if (!p) return []
+    // The id becomes a file path: only a plain lowercase name, checked again
+    // here, so no id (synced or not) can climb out of assets/ with "../" or
+    // cut the path short with "?" or "#". Anything else gets the bar glyph.
+    var id = String(p.providerId || "")
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) return []
     var candidates = []
     if (colorLuminance(surfaceColor || Commons.Color.background) >= 0.5)
-      candidates.push(Qt.resolvedUrl("assets/" + p.providerId + "-light.svg"))
-    candidates.push(Qt.resolvedUrl("assets/" + p.providerId + ".svg"))
+      candidates.push(Qt.resolvedUrl("assets/" + id + "-light.svg"))
+    candidates.push(Qt.resolvedUrl("assets/" + id + ".svg"))
     return candidates
   }
 
@@ -379,8 +394,8 @@ Panel {
     var now = Date.now()
     var next = 0
     for (var i = 0; i < providers.length; i++) {
-      var list = providers[i].limits || []
-      for (var j = 0; j < list.length; j++) {
+      var list = Array.isArray(providers[i].limits) ? providers[i].limits : []
+      for (var j = 0; j < list.length && j < root.maxLimitRows; j++) {
         var ms = new Date(String((list[j] || {}).resetsAt || "")).getTime()
         if (isFinite(ms) && ms > now && (next === 0 || ms < next)) next = ms
       }
