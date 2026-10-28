@@ -4,10 +4,15 @@
 # omarchy:hidden=true
 
 import argparse
+import fcntl
+import grp
 import hashlib
+import heapq
 import html
 import json
+import math
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -60,8 +65,17 @@ CACHE_TTL_SECONDS = 60
 AGY_USAGE_TTL_SECONDS = 600
 AGY_USAGE_TIMEOUT_SECONDS = 20
 # Whole-run wall-clock budget, kept under the updater's `timeout 60` so a slow
-# network ends in a record that says so instead of a killed collector.
-RUN_BUDGET_SECONDS = 50
+# network ends in a record that says so instead of a killed collector. Every
+# request and helper is cut to what is left of it; one socket read already in
+# progress (at most 10 s) and the 5 s notification are the only overrun.
+RUN_BUDGET_SECONDS = 40
+# DNS, connect, TLS and a trickled status line are not cut by the budget, and
+# signal handlers cannot run while Python is blocked in C: a watchdog thread
+# ends the run this long after the budget, still well inside `timeout 60`.
+WATCHDOG_GRACE_SECONDS = 10
+# Serializes collector runs (the bar's updater, `omarchy-antigravity status`,
+# a manual run): they share the caches and the notification state.
+RUN_LOCK_FILE = os.path.join(CACHE_DIR, "antigravity-run.lock")
 # The shared pools agy is consulted for whenever the API leaves one out.
 SHARED_LIMIT_GROUPS = ("Gemini", "Claude/GPT")
 # A pool that stops being reported is flagged for this long after it was last
@@ -75,6 +89,20 @@ MAX_TOKEN_FILE_SIZE = 64 * 1024
 MAX_CACHE_FILE_SIZE = 1024 * 1024
 MAX_HISTORY_FILE_SIZE = 16 * 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
+# A response within its byte ceiling can still hold tens of thousands of tiny
+# buckets. The panel shows a handful, and every cache has to stay small enough
+# to be read back, so parsed limits and their strings are capped.
+MAX_LIMIT_ENTRIES = 32
+MAX_LIMIT_NAME_CHARS = 48
+MAX_LIMIT_TITLE_CHARS = 2 * MAX_LIMIT_NAME_CHARS + 3
+MAX_RESET_TEXT_CHARS = 40
+MAX_TRACKED_GROUPS = 64
+# Text bound for the panel, a desktop notification or the shell log.
+MAX_MESSAGE_CHARS = 512
+MAX_LOG_CHARS = 1024
+# OAuth access and refresh tokens are short printable ASCII; anything else is
+# corrupt and would end up in an HTTP header error instead of a request.
+MAX_TOKEN_CHARS = 4096
 MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 2
 
@@ -97,17 +125,55 @@ class BoundedReadError(Exception):
 class HttpFetchError(Exception):
     """Raised when a remote HTTP request fails or returns an invalid body."""
 
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, retryable=True):
         super().__init__(message)
         self.status = status
+        self.retryable = retryable
+
+
+class HelperTimeout(Exception):
+    """Raised when a helper ran out of time; not an answer worth caching."""
+
+
+# C0/C1 controls, line/paragraph separators and invisible bidi/format marks.
+_CONTROL_CHARS = re.compile(
+    "[\x00-\x1f\x7f-\x9f​-‏ -‮⁠-⁯﻿]+"
+)
+
+
+def clean_text(value, limit):
+    """``value`` as one line of at most ``limit`` characters, controls removed.
+
+    Everything bound for the panel, a notification or the shell log goes
+    through here: server error bodies, redirect targets, exception text and
+    cached strings are not trusted to be short or printable.
+    """
+    text = _CONTROL_CHARS.sub(" ", str(value)).strip()
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text
+
+
+def _text_field(value, limit):
+    """A string field from a remote or cached document, cleaned; "" otherwise."""
+    return clean_text(value, limit) if isinstance(value, str) else ""
+
+
+_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,%d}" % MAX_TOKEN_CHARS)
+
+
+def valid_token(value):
+    """True for a plausible OAuth token: bounded printable ASCII, no whitespace."""
+    return isinstance(value, str) and _TOKEN_RE.fullmatch(value) is not None
 
 
 _deadline = None
 
 
-def start_run_budget(seconds=RUN_BUDGET_SECONDS):
+def start_run_budget(seconds=None):
     global _deadline
-    _deadline = time.monotonic() + seconds
+    # Read at call time, like the watchdog's delay, so both follow one value.
+    _deadline = time.monotonic() + (RUN_BUDGET_SECONDS if seconds is None else seconds)
 
 
 def remaining_budget(cap):
@@ -122,7 +188,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(
-            req.full_url, code, f"refusing redirect to {newurl}", headers, fp
+            req.full_url, code, f"refusing redirect to {clean_text(newurl, 200)}", headers, fp
         )
 
 
@@ -140,11 +206,14 @@ def debug_enabled():
 
 def log_debug(message):
     if debug_enabled():
-        sys.stderr.write(f"omarchy-agent-usage-antigravity: [debug] {message}\n")
+        sys.stderr.write(
+            f"omarchy-agent-usage-antigravity: [debug] {clean_text(message, MAX_LOG_CHARS)}\n"
+        )
 
 
 def log_warn(message):
-    sys.stderr.write(f"omarchy-agent-usage-antigravity: {message}\n")
+    # The updater forwards stderr to the Quickshell log: one clean line each.
+    sys.stderr.write(f"omarchy-agent-usage-antigravity: {clean_text(message, MAX_LOG_CHARS)}\n")
 
 
 def read_bounded(resp, max_bytes):
@@ -177,6 +246,10 @@ def read_bounded(resp, max_bytes):
     chunks = []
     remaining = limit + 1
     while remaining > 0:
+        # The socket timeout only bounds each read; a server trickling bytes
+        # would otherwise keep this loop going past the run's total deadline.
+        if remaining_budget(1) <= 0:
+            raise HttpFetchError("HTTP response not received within the run time budget")
         chunk = resp.read(min(65536, remaining))
         if not chunk:
             break
@@ -202,8 +275,15 @@ def fetch_json(req, timeout, max_bytes, error_label):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = read_bounded(resp, max_bytes)
+    except (ValueError, TypeError):
+        # http.client rejects a header it cannot send with the value quoted in
+        # the message, i.e. the bearer token: never pass that text on. The
+        # same request fails the same way, so it is not retried either.
+        raise HttpFetchError(
+            f"{error_label}: the request could not be built", retryable=False
+        ) from None
     except urllib.error.HTTPError as e:
-        detail = f"{error_label}: HTTP {e.code} {e.reason}".strip()
+        detail = f"{error_label}: HTTP {e.code} {clean_text(e.reason, 200)}".strip()
         snippet = ""
         try:
             snippet = read_bounded(e, min(max_bytes, HTTP_ERROR_BODY_MAX_BYTES)).decode(
@@ -217,26 +297,27 @@ def fetch_json(req, timeout, max_bytes, error_label):
             except Exception:
                 pass
         if snippet:
-            detail = f"{detail}: {snippet[:512]}"
+            detail = f"{detail}: {clean_text(snippet, 512)}"
         raise HttpFetchError(detail, status=e.code) from e
 
     try:
         return json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
         raise HttpFetchError(f"{error_label}: invalid JSON response") from e
 
 
 def is_agy_running():
     """Check via OS process table (pgrep) if at least one agy process is active."""
     pgrep = resolve_tool("pgrep")
-    if pgrep is None:
+    timeout = remaining_budget(2)
+    if pgrep is None or timeout <= 0:
         return True
     try:
         res = subprocess.run(
             [pgrep, "-x", "agy"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=2
+            timeout=timeout,
         )
         return res.returncode == 0
     except Exception:
@@ -244,38 +325,78 @@ def is_agy_running():
 
 
 def ensure_dir(path):
+    """Create ``path`` as this user's private directory, or refuse to use it.
+
+    An existing path must be a real directory (not a symlink) owned by this
+    user. It is narrowed to 0700 and refused when it stays group- or
+    world-accessible, so a cache is never published where others can read it
+    or swap it out.
+    """
     os.makedirs(path, mode=0o700, exist_ok=True)
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return
+    st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode):
         raise OSError(f"Refusing to use a non-directory or symlink path: {path}")
+    if st.st_uid != os.getuid():
+        raise OSError(f"Refusing a directory owned by uid {st.st_uid}: {path}")
+    if st.st_mode & 0o077:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o077:
+            raise OSError(
+                "Refusing a directory that stays group/world accessible "
+                f"({oct(stat.S_IMODE(st.st_mode))}): {path}"
+            )
+
+
+def _user_private_group(gid):
+    """True when ``gid`` is this user's primary group and holds no one else.
+
+    umask-002 setups give every user a private group, and ~/.local/bin (and
+    what is installed in it) ends up group-writable; that is only as safe as
+    0755 while the group is this user's alone.
+    """
+    if gid != os.getgid():
+        return False
     try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
+        user = pwd.getpwuid(os.getuid()).pw_name
+        group = grp.getgrgid(gid)
+    except (KeyError, OSError):
+        return False
+    return group.gr_name == user and set(group.gr_mem) <= {user}
+
+
+def _trusted_owner_and_mode(st):
+    """Owned by root or this user, and writable by no one else.
+
+    Group write is tolerated only on this user's own entries in their private
+    group (see :func:`_user_private_group`).
+    """
+    uid = os.getuid()
+    if st.st_uid not in (0, uid) or st.st_mode & 0o002:
+        return False
+    if st.st_mode & 0o020:
+        return st.st_uid == uid and _user_private_group(st.st_gid)
+    return True
 
 
 def _trusted_parent_chain(path):
     """True when every ancestor directory of ``path`` is trusted.
 
-    Rejects world-writable directories and directories owned by neither root
-    nor the current user, so a binary reached through an attacker-writable
-    directory cannot be trusted even if its immediate parent looks safe.
+    Rejects directories someone else could write to (see
+    :func:`_trusted_owner_and_mode`), so a binary reached through an
+    attacker-writable directory cannot be trusted even if its immediate parent
+    looks safe.
     """
     current = os.path.dirname(path) or "/"
-    uid = os.getuid()
     while True:
         try:
             st = os.stat(current)
         except OSError:
             return False
-        if not stat.S_ISDIR(st.st_mode):
-            return False
-        if st.st_mode & 0o002:
-            return False
-        if st.st_uid not in (0, uid):
+        if not stat.S_ISDIR(st.st_mode) or not _trusted_owner_and_mode(st):
             return False
         parent = os.path.dirname(current)
         if parent == current:
@@ -288,10 +409,10 @@ def resolve_tool(name):
 
     ``shutil.which`` honours ``PATH``; a poisoned ``PATH`` entry could otherwise
     substitute an attacker-controlled ``agy`` or ``secret-tool``. Reject
-    candidates that are not executable regular files or whose parent chain
-    contains a world-writable directory or a directory owned by neither root
-    nor this user. Returns the resolved path, or ``None`` when nothing trusted
-    is found.
+    candidates that are not executable regular files, that are owned by
+    neither root nor this user or writable by someone else, or whose parent
+    chain holds a directory someone else could write to. Returns the resolved
+    path, or ``None`` when nothing trusted is found.
     """
     path = shutil.which(name)
     if not path:
@@ -303,7 +424,7 @@ def resolve_tool(name):
         return None
     if not stat.S_ISREG(st.st_mode) or not os.access(path, os.X_OK):
         return None
-    if not _trusted_parent_chain(path):
+    if not _trusted_owner_and_mode(st) or not _trusted_parent_chain(path):
         return None
     return path
 
@@ -445,7 +566,12 @@ def atomic_write_private(file_path, data, max_bytes=None, error_label="private f
 
 
 def save_private_json(file_path, data):
-    return atomic_write_private(file_path, data)
+    # Capped at what read_private_json accepts: a cache too big to be read
+    # back would never hit and only cost a rewrite on every run.
+    return atomic_write_private(
+        file_path, data, max_bytes=MAX_CACHE_FILE_SIZE,
+        error_label=os.path.basename(file_path),
+    )
 
 
 def read_token():
@@ -460,7 +586,7 @@ def read_token():
 def account_id(token):
     """Short, non-secret fingerprint of the signed-in account's credentials."""
     refresh_token = token.get("refresh_token") if isinstance(token, dict) else None
-    if not isinstance(refresh_token, str) or not refresh_token:
+    if not valid_token(refresh_token):
         return ""
     return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()[:16]
 
@@ -504,11 +630,14 @@ def _refresh_access_token(refresh_token):
         max_bytes=OAUTH_TOKEN_RESPONSE_MAX_BYTES,
         error_label="OAuth token refresh failed",
     )
-    new_token = res.get("access_token")
-    if not new_token:
-        raise HttpFetchError("OAuth token refresh failed: no access_token in response")
+    new_token = res.get("access_token") if isinstance(res, dict) else None
+    if not valid_token(new_token):
+        raise HttpFetchError(
+            "OAuth token refresh failed: no usable access_token in response", retryable=False
+        )
     expires_in = res.get("expires_in", 3600)
-    if not isinstance(expires_in, (int, float)):
+    if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)) \
+            or not 0 <= expires_in <= 86400:
         expires_in = 3600
     expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
     return new_token, expiry.isoformat()
@@ -525,23 +654,27 @@ def get_valid_access_token(token, token_err=""):
     if not isinstance(token, dict):
         return None, token_err or "No Antigravity credentials found"
 
+    # A corrupt token (a stray newline, binary junk) is treated as missing:
+    # sent on, it only fails as a header error quoting the token itself.
     access_token = token.get("access_token")
+    if not valid_token(access_token):
+        access_token = None
     if access_token and _token_fresh(token.get("expiry")):
         return access_token, ""
 
     account = account_id(token)
-    cached, _ = read_private_json(ACCESS_TOKEN_CACHE_FILE)
+    cached, _ = read_private_json(ACCESS_TOKEN_CACHE_FILE, require_private=True)
     if (
         account
         and isinstance(cached, dict)
         and cached.get("account") == account
-        and cached.get("access_token")
+        and valid_token(cached.get("access_token"))
         and _token_fresh(cached.get("expiry"))
     ):
         return cached["access_token"], ""
 
     refresh_token = token.get("refresh_token")
-    if refresh_token:
+    if valid_token(refresh_token):
         try:
             new_token, expiry = _refresh_access_token(refresh_token)
             save_private_json(ACCESS_TOKEN_CACHE_FILE, {
@@ -559,12 +692,15 @@ def get_valid_access_token(token, token_err=""):
     return None, "Unable to obtain valid access token"
 
 
-def read_private_json(file_path, max_bytes=MAX_CACHE_FILE_SIZE):
+def read_private_json(file_path, max_bytes=MAX_CACHE_FILE_SIZE, require_private=False):
     """Read a user-owned JSON file through a bounded, no-follow descriptor.
 
     Rejects symlinks, non-regular files, files owned by another user, and
     payloads larger than ``max_bytes`` before any decoding or parsing happens.
-    Returns ``(data, stat_result)`` on success and ``(None, None)`` otherwise.
+    With ``require_private`` a file any group or other user can access is
+    rejected too, as the token file is: a secret that may have leaked is
+    replaced rather than used. Returns ``(data, stat_result)`` on success and
+    ``(None, None)`` otherwise.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -577,6 +713,8 @@ def read_private_json(file_path, max_bytes=MAX_CACHE_FILE_SIZE):
         if not stat.S_ISREG(st.st_mode):
             return None, None
         if st.st_uid != os.getuid():
+            return None, None
+        if require_private and st.st_mode & 0o077:
             return None, None
         if st.st_size > max_bytes:
             return None, None
@@ -593,51 +731,71 @@ def read_private_json(file_path, max_bytes=MAX_CACHE_FILE_SIZE):
 def run_bounded_stdout(args, timeout, max_bytes=MAX_SUBPROCESS_OUTPUT_BYTES):
     """Run a command and capture a bounded amount of stdout.
 
-    Returns ``(returncode, stdout_bytes, truncated)``. The child is killed when
-    it produces more than ``max_bytes`` or exceeds ``timeout`` seconds (cut to
-    the run budget) so a misbehaving helper cannot force unbounded allocation.
-    The child gets its own process group and the whole group is killed, so
-    helpers it started (agy's MCP servers) are not left orphaned.
+    Returns ``(returncode, stdout_bytes, truncated)``, where ``truncated`` is
+    False or says why the output is incomplete: ``"size"`` (more than
+    ``max_bytes``), ``"time"`` (``timeout``, cut to the run budget, ran out, or
+    no budget was left to start) or ``"held"`` (a descendant that left the
+    group kept the pipe open). The child is killed on size and time, so a
+    misbehaving helper cannot force unbounded allocation.
+
+    The child gets its own process group. Once it exits (or is killed),
+    whatever is left of that group is killed too, so a descendant (one of
+    agy's MCP servers) can neither outlive the run nor hold the pipe open and
+    stall it past its deadline. The group is tracked for signals and the
+    watchdog from the moment it exists until its output is drained, is killed
+    on any exception (a signal's SystemExit, KeyboardInterrupt), and the pipe
+    is closed only after the reader is done, so closing can never block.
     """
     timeout = remaining_budget(timeout)
     if timeout <= 0:
-        return None, b"", True
+        return None, b"", "time"
     try:
-        proc = subprocess.Popen(
-            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
-        )
+        proc = _spawn_tracked(args)
     except OSError:
         return None, b"", False
-    _active_procs.add(proc)
 
     state = {"data": bytearray(), "truncated": False}
+    stdout_fd = proc.stdout.fileno()
 
     def _reader():
+        # Raw reads: they return whatever is available and never hold the
+        # buffered reader's lock that a close() would wait on.
         try:
             while True:
-                chunk = proc.stdout.read(65536)
+                chunk = os.read(stdout_fd, 65536)
                 if not chunk:
                     break
                 if len(state["data"]) + len(chunk) > max_bytes:
-                    state["truncated"] = True
+                    state["truncated"] = "size"
                     kill_process_tree(proc)
                     break
                 state["data"].extend(chunk)
-        except Exception:
+        except OSError:
             pass
 
     reader = threading.Thread(target=_reader, daemon=True)
     reader.start()
     try:
-        returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        state["truncated"] = True
+        if not _wait_exited(proc, timeout):
+            state["truncated"] = "time"
+        # The exited helper is still unreaped, so its zombie keeps the group id
+        # reserved and this reaches exactly the helper and its descendants.
         kill_process_tree(proc)
         returncode = proc.wait()
+        reader.join(timeout=HELPER_DRAIN_SECONDS)
+    except BaseException:
+        # A signal's SystemExit, a KeyboardInterrupt: the group goes too.
+        kill_process_tree(proc)
+        raise
     finally:
         _active_procs.discard(proc)
-    reader.join(timeout=2)
-    if proc.stdout is not None:
+    if reader.is_alive():
+        # Only a descendant that left the group (setsid) can still hold the
+        # pipe. Closing under a blocked read could block or let a reused fd be
+        # read, so the daemon thread and the fd are left to the process exit.
+        state["truncated"] = state["truncated"] or "held"
+        log_warn(f"{os.path.basename(str(args[0]))}: output still held open after exit; abandoned")
+    else:
         try:
             proc.stdout.close()
         except OSError:
@@ -645,11 +803,69 @@ def run_bounded_stdout(args, timeout, max_bytes=MAX_SUBPROCESS_OUTPUT_BYTES):
     return returncode, bytes(state["data"]), state["truncated"]
 
 
+HELPER_DRAIN_SECONDS = 2
+
+
+def _wait_exited(proc, timeout):
+    """Wait up to ``timeout`` seconds for ``proc`` to exit, without reaping it."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except ChildProcessError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 _active_procs = set()
+# Held while a helper is started and registered, and by the watchdog from its
+# sweep to the exit, so no helper can start untracked or after the sweep.
+_procs_lock = threading.Lock()
+_spawning = False
+_deferred_signals = []
+# `timeout` in the updater, Ctrl-C or a closed terminal under
+# `omarchy-antigravity status`, and a quit key all reach only our own group.
+CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)
+
+
+def _spawn_tracked(args):
+    """Start ``args`` in its own session and track it, as one step.
+
+    A signal handled between Popen returning and the registration would exit
+    without killing the new group, which lives in its own session and would
+    outlive the run. The handler therefore defers while this runs (Python
+    runs handlers only between bytecodes of the main thread, so nothing gets
+    in between), and a deferred signal is acted on once the group is tracked.
+    Blocking the signals with pthread_sigmask instead would leak the blocked
+    mask into the helper: exec keeps it, so agy and its MCP servers would
+    ignore SIGTERM, SIGINT and SIGHUP for life.
+    """
+    global _spawning
+    with _procs_lock:
+        _spawning = True
+        try:
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
+            )
+            _active_procs.add(proc)
+        finally:
+            _spawning = False
+            if _deferred_signals:
+                _terminate_children(_deferred_signals[0], None)
+    return proc
 
 
 def kill_process_tree(proc):
-    """SIGKILL a child started by :func:`run_bounded_stdout` and its group."""
+    """SIGKILL a child started by :func:`run_bounded_stdout` and its group.
+
+    A reaped child's group was killed before it was reaped, and its id may
+    name someone else's group by now: it is left alone.
+    """
+    if proc.returncode is not None:
+        return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -659,11 +875,77 @@ def kill_process_tree(proc):
 
 
 def _terminate_children(signum, _frame):
-    # `timeout` in the updater signals only our own process group; the
-    # helpers live in their own groups and would outlive us otherwise.
+    # The helpers live in their own sessions and would outlive us otherwise.
+    if _spawning:
+        _deferred_signals.append(signum)
+        return
     for proc in list(_active_procs):
         kill_process_tree(proc)
     sys.exit(128 + signum)
+
+
+def install_signal_handlers():
+    for signum in CLEANUP_SIGNALS:
+        signal.signal(signum, _terminate_children)
+
+
+_record_lock = threading.Lock()
+_record_emitted = False
+
+
+def emit_record(record, wait=-1):
+    """Print the run's one record; any later one (the watchdog's) is dropped.
+
+    Returns False when a record was already printed or, with ``wait``, the
+    lock could not be had in time.
+    """
+    global _record_emitted
+    if not _record_lock.acquire(timeout=wait):
+        return False
+    try:
+        if _record_emitted:
+            return False
+        _record_emitted = True
+        print(json.dumps(record, separators=(",", ":")), flush=True)
+        return True
+    finally:
+        _record_lock.release()
+
+
+def start_watchdog(seconds):
+    """Arm the run's last resort; set the returned event to disarm it."""
+    disarmed = threading.Event()
+
+    def _watch():
+        if not disarmed.wait(seconds):
+            _expire_run()
+
+    threading.Thread(target=_watch, name="run-watchdog", daemon=True).start()
+    return disarmed
+
+
+def _expire_run():
+    """End a run stuck past its budget: kill the helpers, say so, exit.
+
+    The main thread may be blocked in C (getaddrinfo, connect, a TLS
+    handshake, a trickled status line), where neither the budget nor a signal
+    handler reaches it, so only os._exit ends the run in time.
+    """
+    try:
+        log_warn("run time budget exhausted; giving up")
+        _procs_lock.acquire(timeout=2)
+        for proc in list(_active_procs):
+            kill_process_tree(proc)
+        emit_record(_fallback_record(
+            "Quota unavailable",
+            "The Antigravity usage collector ran out of time (slow network, DNS "
+            "or agy); it tries again on the next refresh.",
+        ), wait=2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        # Whatever failed above, the run ends here and now.
+        os._exit(0)
 
 
 def get_cached_limits(max_age_seconds=CACHE_TTL_SECONDS, path=None):
@@ -673,6 +955,33 @@ def get_cached_limits(max_age_seconds=CACHE_TTL_SECONDS, path=None):
     if time.time() - st.st_mtime > max_age_seconds:
         return None
     return data
+
+
+def _valid_limits(value):
+    """``value`` when it is a list of limit records as this collector writes them.
+
+    Anything else is ``None``, i.e. a cache miss: a cached record of the wrong
+    shape would otherwise crash every run for the cache's lifetime, or reach
+    the panel as it is.
+    """
+    if not isinstance(value, list) or len(value) > MAX_LIMIT_ENTRIES:
+        return None
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        for key, limit in (
+            ("title", MAX_LIMIT_TITLE_CHARS),
+            ("label", MAX_LIMIT_NAME_CHARS),
+            ("resetsAt", MAX_RESET_TEXT_CHARS),
+        ):
+            text = item.get(key, "")
+            if not isinstance(text, str) or len(text) > limit or _CONTROL_CHARS.search(text):
+                return None
+        percent = item.get("percent")
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)) \
+                or not 0 <= percent <= 1:
+            return None
+    return value
 
 
 def _fetch_email(access_token):
@@ -737,7 +1046,9 @@ def resolve_account(account, get_access_token):
         return "", ""
     cached, _ = read_private_json(ACCOUNT_CACHE_FILE)
     if isinstance(cached, dict) and cached.get("account") == account:
-        return str(cached.get("email") or ""), str(cached.get("tier") or "")
+        email, tier = cached.get("email"), cached.get("tier") or ""
+        if isinstance(email, str) and isinstance(tier, str):
+            return email, tier
     access_token = get_access_token()
     if not access_token:
         return "", ""
@@ -752,6 +1063,21 @@ def resolve_account(account, get_access_token):
 
 def _used_fraction(remaining):
     return round(max(0.0, min(1.0, 1.0 - remaining)), 4)
+
+
+def _finite_number(value):
+    """A JSON number as a finite float; ``None`` for anything else (bools too).
+
+    float() of a huge integer overflows, and NaN/Infinity parse as JSON in
+    Python: neither may reach arithmetic or the record.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _group_display(group_name):
@@ -774,10 +1100,14 @@ def _limit_entry(group_name, window, bucket_name, used_pct, reset_time):
     """Classify one quota bucket into an ordered, display-ready limit record.
 
     Shared by the authoritative API parser and the ``agy -p /usage`` reader so
-    both express identical group/window precedence.
+    both express identical group/window precedence. Names are cut to
+    MAX_LIMIT_NAME_CHARS before the title is built from them, so the group
+    can still be read back from the title.
     """
-    bucket = (bucket_name or "").upper()
-    win = (window or "").upper()
+    group_name = _text_field(group_name, MAX_LIMIT_NAME_CHARS)
+    bucket_name = _text_field(bucket_name, MAX_LIMIT_NAME_CHARS)
+    bucket = bucket_name.upper()
+    win = _text_field(window, MAX_LIMIT_NAME_CHARS).upper()
     prefix, group_priority = _group_display(group_name)
 
     if win in ("5H", "FIVE HOUR") or "FIVE HOUR" in bucket or "5-HOUR" in bucket:
@@ -791,13 +1121,18 @@ def _limit_entry(group_name, window, bucket_name, used_pct, reset_time):
         "title": title,
         "label": label,
         "percent": used_pct,
-        "resetsAt": reset_time,
+        "resetsAt": _text_field(reset_time, MAX_RESET_TEXT_CHARS),
     })
 
 
 def _finalize_limits(parsed_items):
-    parsed_items.sort(key=lambda x: (x[0], x[1]))
-    return [item[2] for item in parsed_items]
+    """Display order, first MAX_LIMIT_ENTRIES only.
+
+    ``heapq.nsmallest`` is a stable sort cut short; fed a generator, it never
+    holds more than that many records, however many buckets came in.
+    """
+    first = heapq.nsmallest(MAX_LIMIT_ENTRIES, parsed_items, key=lambda x: (x[0], x[1]))
+    return [item[2] for item in first]
 
 
 def limit_group(limit):
@@ -815,8 +1150,9 @@ def _limit_sort_key(limit):
 
 
 def _retryable(error):
-    if isinstance(error, BoundedReadError):
-        # An oversized response is deterministic: retrying cannot help.
+    if isinstance(error, BoundedReadError) or getattr(error, "retryable", True) is False:
+        # An oversized response or a request that cannot be built is
+        # deterministic: retrying cannot help.
         return False
     status = getattr(error, "status", None)
     return not (status and 400 <= status < 500 and status not in RETRYABLE_CLIENT_STATUSES)
@@ -853,55 +1189,61 @@ def fetch_authoritative_limits(access_token):
     if not isinstance(data, dict):
         raise last_err or HttpFetchError("quota request failed: unexpected response shape")
 
-    parsed_items = []
-    for group in data.get("groups") or []:
-        if not isinstance(group, dict):
-            continue
-        gname = group.get("displayName", "")
-        for b in group.get("buckets") or []:
-            if not isinstance(b, dict):
+    def entries():
+        for group in _list_field(data, "groups"):
+            if not isinstance(group, dict):
                 continue
-            parsed_items.append(_limit_entry(
-                gname,
-                b.get("window", ""),
-                b.get("displayName", ""),
-                _used_fraction(b.get("remainingFraction", 1.0)),
-                b.get("resetTime", ""),
-            ))
+            for b in _list_field(group, "buckets"):
+                if not isinstance(b, dict):
+                    continue
+                remaining = _finite_number(b.get("remainingFraction", 1.0))
+                if remaining is None:
+                    continue
+                yield _limit_entry(
+                    group.get("displayName", ""),
+                    b.get("window", ""),
+                    b.get("displayName", ""),
+                    _used_fraction(remaining),
+                    b.get("resetTime", ""),
+                )
 
-    return _finalize_limits(parsed_items)
+    return _finalize_limits(entries())
+
+
+def _list_field(doc, key):
+    value = doc.get(key)
+    return value if isinstance(value, list) else []
 
 
 def _parse_agy_usage_text(text):
-    """Parse the ``/usage`` table: group, bucket, remaining %, reset time.
+    """Parse the ``/usage`` table (group, bucket, remaining %, reset time).
 
     Rows are matched by shape rather than by known group names so a pool the
-    CLI adds later still reaches the panel.
+    CLI adds later still reaches the panel. Returns finalized limits.
     """
-    parsed_items = []
-    for line in text.splitlines():
-        fields = re.split(r"\t+|\s{2,}", line.strip())
-        if len(fields) != 4:
-            continue
-        group, bucket, pct, reset = fields
-        m = re.fullmatch(r"(\d+)%", pct)
-        if not m:
-            continue
-        parsed_items.append(_limit_entry(
-            group, "", bucket, _used_fraction(int(m.group(1)) / 100.0), reset
-        ))
-    return parsed_items
+    def entries():
+        for line in text.splitlines():
+            fields = re.split(r"\t+|\s{2,}", line.strip())
+            if len(fields) != 4:
+                continue
+            group, bucket, pct, reset = fields
+            m = re.fullmatch(r"(\d{1,3})%", pct)
+            if not m:
+                continue
+            yield _limit_entry(group, "", bucket, _used_fraction(int(m.group(1)) / 100.0), reset)
+
+    return _finalize_limits(entries())
 
 
 def _parse_agy_usage_json(raw):
-    """Parse ``agy -p /usage --output-format json``.
+    """Parse ``agy -p /usage --output-format json`` into finalized limits.
 
     Returns ``None`` when ``raw`` is not JSON at all so the caller can read it
     as the plain table an older CLI prints.
     """
     try:
         doc = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(doc, dict):
         return None
@@ -909,27 +1251,29 @@ def _parse_agy_usage_json(raw):
     data = command.get("data") if isinstance(command, dict) else None
     groups = data.get("groups") if isinstance(data, dict) else None
     if not isinstance(groups, list):
-        return _parse_agy_usage_text(str(doc.get("response") or ""))
+        response = doc.get("response")
+        return _parse_agy_usage_text(response if isinstance(response, str) else "")
 
-    parsed_items = []
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for b in group.get("buckets") or []:
-            if not isinstance(b, dict) or b.get("disabled"):
+    def entries():
+        for group in groups:
+            if not isinstance(group, dict):
                 continue
-            rem = b.get("remaining_fraction")
-            if isinstance(rem, bool) or not isinstance(rem, (int, float)):
-                log_debug(f"skipping bucket without remaining_fraction: {b.get('id')}")
-                continue
-            parsed_items.append(_limit_entry(
-                group.get("name", ""),
-                b.get("window", ""),
-                b.get("name", ""),
-                _used_fraction(rem),
-                b.get("reset_time", ""),
-            ))
-    return parsed_items
+            for b in _list_field(group, "buckets"):
+                if not isinstance(b, dict) or b.get("disabled"):
+                    continue
+                remaining = _finite_number(b.get("remaining_fraction"))
+                if remaining is None:
+                    log_debug(f"skipping bucket without remaining_fraction: {b.get('id')}")
+                    continue
+                yield _limit_entry(
+                    group.get("name", ""),
+                    b.get("window", ""),
+                    b.get("name", ""),
+                    _used_fraction(remaining),
+                    b.get("reset_time", ""),
+                )
+
+    return _finalize_limits(entries())
 
 
 def fetch_limits_via_agy():
@@ -938,6 +1282,8 @@ def fetch_limits_via_agy():
     Its structured output carries every pool the CLI shows, including the
     Gemini ones the quota API stopped returning. Each call starts the user's
     MCP servers, so callers go through :func:`get_agy_limits` and its cache.
+    Raises :class:`HelperTimeout` when agy was cut short (or never started)
+    for lack of time, which says nothing about agy itself.
     """
     agy = resolve_tool("agy")
     if agy is None:
@@ -949,18 +1295,22 @@ def fetch_limits_via_agy():
             [agy, "--log-file", os.devnull, "-p", "/usage", "--output-format", "json"],
             timeout=AGY_USAGE_TIMEOUT_SECONDS,
         )
+        if truncated == "time":
+            raise HelperTimeout("agy -p /usage did not answer within the run's time budget")
         if truncated:
-            log_warn("agy -p /usage output exceeded size or time limit")
+            log_warn("agy -p /usage output exceeded its size limit or was held open")
             return None
         if code != 0:
             log_debug(f"agy -p /usage exited with {code}")
             return None
         raw = stdout_bytes.decode("utf-8", errors="replace").strip()
-        parsed_items = _parse_agy_usage_json(raw)
-        if parsed_items is None:
-            parsed_items = _parse_agy_usage_text(raw)
-        if parsed_items:
-            return _finalize_limits(parsed_items)
+        limits = _parse_agy_usage_json(raw)
+        if limits is None:
+            limits = _parse_agy_usage_text(raw)
+        if limits:
+            return limits
+    except HelperTimeout:
+        raise
     except Exception as e:
         log_warn(f"agy -p /usage error: {e}")
     return None
@@ -969,18 +1319,27 @@ def fetch_limits_via_agy():
 def get_agy_limits(force=False):
     """agy's /usage answer, reused for AGY_USAGE_TTL_SECONDS unless forced.
 
-    A failed call is cached too: an agy that cannot answer would otherwise be
-    relaunched, MCP servers and all, on every refresh.
+    Returns ``(limits, timed_out)``. A failed call (non-zero exit, unusable
+    output) is cached too: an agy that cannot answer would otherwise be
+    relaunched, MCP servers and all, on every refresh. Running out of time is
+    not an answer, though: cached, it would hide the pools only agy reports,
+    and raise a false "Usage incomplete", for the whole TTL.
     """
     if not force:
         cached = get_cached_limits(AGY_USAGE_TTL_SECONDS, AGY_CACHE_FILE)
         if cached is not None and "limits" in cached:
-            log_debug("agy usage cache hit")
             limits = cached["limits"]
-            return limits if isinstance(limits, list) else None
-    limits = fetch_limits_via_agy()
+            # Anything but a failure marker or well-formed limits is a miss.
+            if limits is None or _valid_limits(limits) is not None:
+                log_debug("agy usage cache hit")
+                return limits, False
+    try:
+        limits = fetch_limits_via_agy()
+    except HelperTimeout as e:
+        log_warn(str(e))
+        return None, True
     save_private_json(AGY_CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
-    return limits
+    return limits, False
 
 
 def count_dir_entries(directory, limit=10000):
@@ -1067,6 +1426,30 @@ def _scan_history(history_file, today_str, recent_days_map):
     return total_prompts, today_prompts, len(today_conversations) + int(today_without_id)
 
 
+def _is_count(value):
+    # Never more than one prompt per byte of the history file.
+    return isinstance(value, int) and not isinstance(value, bool) \
+        and 0 <= value <= MAX_HISTORY_FILE_SIZE
+
+
+def _valid_history_cache(cached, key):
+    """True when ``cached`` is the aggregation for ``key``, shaped as written.
+
+    Anything else is a miss and the history is rescanned, instead of crashing
+    every run until the history file or the day changes.
+    """
+    if not isinstance(cached, dict) or cached.get("historyKey") != key:
+        return False
+    if not all(_is_count(cached.get(k)) for k in ("totalPrompts", "todayPrompts", "todaySessions")):
+        return False
+    days = cached.get("recentDays")
+    return isinstance(days, list) and len(days) <= 7 and all(
+        isinstance(day, dict) and isinstance(day.get("date"), str)
+        and _is_count(day.get("messageCount"))
+        for day in days
+    )
+
+
 def collect_local_stats():
     now = datetime.now().astimezone()
     today_str = now.strftime("%Y-%m-%d")
@@ -1088,19 +1471,13 @@ def collect_local_stats():
     history_key = _history_cache_key(history_file)
     cached, _ = read_private_json(HISTORY_CACHE_FILE)
     cache_hit = False
-    if (
-        history_key is not None
-        and isinstance(cached, dict)
-        and cached.get("historyKey") == history_key + [today_str]
-        and "todaySessions" in cached
-    ):
-        total_prompts = int(cached.get("totalPrompts", 0))
-        today_prompts = int(cached.get("todayPrompts", 0))
-        today_sessions = int(cached.get("todaySessions", 0))
-        for day in cached.get("recentDays", []):
-            date = day.get("date")
-            if date in recent_days_map:
-                recent_days_map[date] = int(day.get("messageCount", 0))
+    if history_key is not None and _valid_history_cache(cached, history_key + [today_str]):
+        total_prompts = cached["totalPrompts"]
+        today_prompts = cached["todayPrompts"]
+        today_sessions = cached["todaySessions"]
+        for day in cached["recentDays"]:
+            if day["date"] in recent_days_map:
+                recent_days_map[day["date"]] = day["messageCount"]
         cache_hit = True
         log_debug(f"history cache hit ({history_key[1]} bytes)")
 
@@ -1157,9 +1534,9 @@ def _resolve_limits(get_token, force, status_text, auth_help):
 
     have = {limit_group(item) for item in api_limits or []}
     wanted = set(SHARED_LIMIT_GROUPS) | known_limit_groups()
-    agy_limits = None
+    agy_limits, agy_timed_out = None, False
     if api_limits is None or not wanted <= have:
-        agy_limits = get_agy_limits(force)
+        agy_limits, agy_timed_out = get_agy_limits(force)
 
     if api_limits is None and agy_limits is None:
         if not status_text and access_token:
@@ -1172,19 +1549,31 @@ def _resolve_limits(get_token, force, status_text, auth_help):
 
     merged = list(api_limits or [])
     merged += [item for item in agy_limits or [] if limit_group(item) not in have]
-    limits = sorted(merged, key=_limit_sort_key)
-    save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
+    limits = sorted(merged, key=_limit_sort_key)[:MAX_LIMIT_ENTRIES]
+    # Without agy's pools only for lack of time, the merge is not cached
+    # either: the next run asks again instead of reporting them missing.
+    if not agy_timed_out:
+        save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
     return limits, status_text, auth_help
 
 
 def _read_seen_groups():
+    """Pools seen recently, as ``{group: last seen}``; malformed entries skipped.
+
+    A file holding more groups than limits can name is not this collector's
+    and is ignored as a whole.
+    """
     seen, _ = read_private_json(GROUPS_STATE_FILE)
-    if not isinstance(seen, dict):
+    if not isinstance(seen, dict) or len(seen) > MAX_TRACKED_GROUPS:
         return {}
-    return {
-        str(group): float(ts) for group, ts in seen.items()
-        if isinstance(ts, (int, float)) and not isinstance(ts, bool)
-    }
+    groups = {}
+    for group, ts in seen.items():
+        if len(group) > MAX_LIMIT_NAME_CHARS or _CONTROL_CHARS.search(group):
+            continue
+        ts = _finite_number(ts)
+        if ts is not None:
+            groups[group] = ts
+    return groups
 
 
 def known_limit_groups(now=None):
@@ -1242,12 +1631,19 @@ def notify_status_change(status_text, detail):
     stays quiet; it then stays quiet until the status changes, and recovering
     re-arms the alert.
     """
+    status_text = clean_text(status_text or "", MAX_LIMIT_NAME_CHARS)
+    detail = clean_text(detail or "", MAX_MESSAGE_CHARS)
     state, _ = read_private_json(ALERT_STATE_FILE)
     state = state if isinstance(state, dict) else {}
     if state.get("status", "") != status_text:
         save_private_json(ALERT_STATE_FILE, {"status": status_text, "notified": False})
         return
     if not status_text or state.get("notified"):
+        return
+    timeout = remaining_budget(5)
+    if timeout <= 0:
+        # Left armed: the next run, with time to spare, sends it.
+        log_warn("no time left to send the desktop notification")
         return
     save_private_json(ALERT_STATE_FILE, {"status": status_text, "notified": True})
     notify_send = resolve_tool("notify-send")
@@ -1258,18 +1654,25 @@ def notify_status_change(status_text, detail):
         subprocess.run(
             [
                 notify_send, "--app-name=Antigravity",
-                f"Antigravity: {status_text}", html.escape(detail or "", quote=False),
+                f"Antigravity: {status_text}", html.escape(detail, quote=False),
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=5,
+            timeout=timeout,
         )
     except Exception as e:
         log_warn(f"failed to send desktop notification: {e}")
 
 
 def _build_record(email, tier, status_text, auth_help, limits, local_stats):
-    """Assemble the display-ready usage record emitted on stdout."""
+    """Assemble the display-ready usage record emitted on stdout.
+
+    Every text field is cleaned and capped here, since it carries server
+    error bodies, exception text and cached values to the panel.
+    """
+    tier = clean_text(tier or "", MAX_LIMIT_NAME_CHARS)
+    email = clean_text(email or "", 254)
+    status_text = clean_text(status_text or "", MAX_LIMIT_NAME_CHARS)
     record = {
         "schemaVersion": 1,
         "id": AGENT_ID,
@@ -1279,7 +1682,7 @@ def _build_record(email, tier, status_text, auth_help, limits, local_stats):
         "hasLocalStats": True,
         "tierLabel": " · ".join(part for part in (tier, email) if part),
         "usageStatusText": status_text,
-        "authHelpText": auth_help,
+        "authHelpText": clean_text(auth_help or "", MAX_MESSAGE_CHARS),
         # Only an auth problem gets the panel's Sign In button; signing in
         # again cannot fix an outage or a changed usage format.
         "authRequired": status_text == "Waiting for auth",
@@ -1292,8 +1695,8 @@ def _build_record(email, tier, status_text, auth_help, limits, local_stats):
     return record
 
 
-def _error_record(error):
-    """Last-resort record so a crash shows up in the panel.
+def _fallback_record(status_text, detail):
+    """Last-resort record so a crash or a stuck run shows up in the panel.
 
     Without it the updater keeps the previous record and the panel silently
     freezes on stale numbers. The last limits are kept for context.
@@ -1301,14 +1704,15 @@ def _error_record(error):
     limits = []
     try:
         cached, _ = read_private_json(CACHE_FILE)
-        if isinstance(cached, dict) and isinstance(cached.get("limits"), list):
-            limits = cached["limits"]
+        if isinstance(cached, dict):
+            limits = _valid_limits(cached.get("limits")) or []
     except Exception:
         pass
-    return _build_record(
-        "", "", "Collector error",
-        f"The Antigravity usage collector failed: {error}", limits, {},
-    )
+    return _build_record("", "", status_text, detail, limits, {})
+
+
+def _error_record(error):
+    return _fallback_record("Collector error", f"The Antigravity usage collector failed: {error}")
 
 
 def _run(args):
@@ -1342,8 +1746,8 @@ def _run(args):
     if not args.force:
         ttl = CACHE_TTL_SECONDS * 2 if args.limits_only else CACHE_TTL_SECONDS
         cached = get_cached_limits(ttl)
-        if cached and isinstance(cached.get("limits"), list):
-            limits = cached["limits"]
+        limits = _valid_limits(cached.get("limits")) if cached else None
+        if limits is not None:
             log_debug("limits cache hit")
 
     if limits is None:
@@ -1355,10 +1759,11 @@ def _run(args):
     email, tier = resolve_account(account, lambda: get_token()[0])
 
     record = _build_record(email, tier, status_text, auth_help, limits, collect_local_stats())
-    print(json.dumps(record, separators=(",", ":")))
+    emit_record(record)
 
 
 def main(argv=None):
+    global _record_emitted
     parser = argparse.ArgumentParser(description="Collect Antigravity usage record")
     parser.add_argument("--force", action="store_true", help="Bypass probe cache and active session check")
     parser.add_argument("--limits-only", action="store_true", help="Prioritize speed/cache")
@@ -1369,8 +1774,17 @@ def main(argv=None):
         os.environ["OMARCHY_ANTIGRAVITY_DEBUG"] = "1"
     log_debug(f"start force={args.force} limits_only={args.limits_only}")
     start_run_budget()
+    _record_emitted = False
+    watchdog = start_watchdog(RUN_BUDGET_SECONDS + WATCHDOG_GRACE_SECONDS)
 
+    lock_fd = None
     try:
+        lock_fd = acquire_run_lock()
+        if lock_fd is None:
+            # Exit 0 with no output: the updater keeps the record the other
+            # run is about to write.
+            log_warn("another collector run is still in progress; skipping")
+            return 0
         _run(args)
     except Exception as e:
         log_warn(f"collector error: {e!r}")
@@ -1378,10 +1792,41 @@ def main(argv=None):
             notify_status_change("Collector error", str(e))
         except Exception:
             pass
-        print(json.dumps(_error_record(e), separators=(",", ":")))
+        emit_record(_error_record(e))
+    finally:
+        watchdog.set()
+        if lock_fd is not None:
+            os.close(lock_fd)
     return 0
 
 
+RUN_LOCK_WAIT_SECONDS = 15
+
+
+def acquire_run_lock():
+    """Take the collector's run lock; ``None`` when another run keeps it.
+
+    Waits a little (another run usually finishes within seconds) but never so
+    long that this run could not finish inside the updater's timeout. The lock
+    file is opened like every other private file: no symlinks, owner only.
+    A cache directory that cannot be made private raises, so the run reports
+    it as a collector error rather than as another run in progress.
+    """
+    ensure_dir(CACHE_DIR)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(RUN_LOCK_FILE, flags, 0o600)
+    deadline = time.monotonic() + RUN_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.1)
+
+
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _terminate_children)
+    install_signal_handlers()
     sys.exit(main())

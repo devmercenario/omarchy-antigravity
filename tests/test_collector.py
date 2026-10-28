@@ -4,18 +4,25 @@ Unit and Integration Tests for Antigravity Usage Collector
 Part of omarchy-antigravity
 """
 
+import grp
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
 import os
+import pwd
+import re
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -61,6 +68,67 @@ class FakeHTTPResponse:
 
     def __exit__(self, *exc):
         return False
+
+
+# Loads the collector in a child interpreter. The caller gives it a sandbox
+# HOME and XDG_STATE_HOME, so its default paths never reach the real
+# ~/.cache, ~/.gemini or ~/.local; argv[2] is the code to run.
+DRIVER = r'''
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("collector", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+collector = importlib.util.module_from_spec(spec)
+sys.modules["collector"] = collector
+loader.exec_module(collector)
+exec(sys.argv[2])
+'''
+
+
+def _helper_script(pidfile):
+    """A helper that records its own pid and a grandchild's, then waits."""
+    return [
+        "/bin/sh", "-c",
+        f"sleep 60 & echo $$ $! > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; wait",
+    ]
+
+
+def _alive(pid):
+    """True while ``pid`` runs; a zombie waiting to be reaped counts as gone."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _wait_gone(pids, seconds=3):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and any(_alive(p) for p in pids):
+        time.sleep(0.05)
+    return [p for p in pids if _alive(p)]
+
+
+def _wait_for_file(path, seconds=5):
+    deadline = time.monotonic() + seconds
+    while not os.path.exists(path):
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{path} never appeared")
+        time.sleep(0.02)
+
+
+def _kill_leftovers(pids):
+    """Cleanup for a failed test: never leave a helper's sleep behind.
+
+    Only processes still alive in the helper's own group are hit, so a
+    recycled pid can never take an unrelated process down.
+    """
+    for pid in pids:
+        try:
+            if _alive(pid) and os.getpgid(pid) == pids[0]:
+                os.killpg(pids[0], signal.SIGKILL)
+        except OSError:
+            pass
 
 
 class TestQuotaParsing(unittest.TestCase):
@@ -728,6 +796,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
         "ACCOUNT_CACHE_FILE": "account.json",
         "ALERT_STATE_FILE": "alert.json",
         "GROUPS_STATE_FILE": "groups.json",
+        "RUN_LOCK_FILE": "run.lock",
         # Keep history/brain inside the sandbox so tests never read or write
         # the developer/CI machine's real data.
         "HISTORY_FILE": "history.jsonl",
@@ -761,6 +830,8 @@ class TestMainExecutionScenarios(unittest.TestCase):
     def tearDown(self):
         for name, value in self.orig_paths.items():
             setattr(collector, name, value)
+        # main() starts a run budget; later tests must not inherit it.
+        collector._deadline = None
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def seen_groups(self, *groups):
@@ -958,6 +1029,22 @@ class TestMainExecutionScenarios(unittest.TestCase):
         self.assertEqual(record["usageStatusText"], "")
         self.assertEqual(record["limits"], self.COMPLETE_LIMITS)
 
+    @patch("collector.RUN_LOCK_WAIT_SECONDS", 0.2)
+    def test_a_concurrent_run_is_skipped_without_output(self):
+        import fcntl
+        fd = os.open(collector.RUN_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with patch("builtins.print") as mock_print, patch("sys.stderr.write") as mock_err, \
+                    patch("collector._run") as mock_run:
+                self.assertEqual(collector.main(argv=["--force"]), 0)
+            mock_run.assert_not_called()
+            mock_print.assert_not_called()
+            self.assertIn("still in progress", "".join(str(c) for c in mock_err.call_args_list))
+        finally:
+            os.close(fd)
+        self.assertEqual(stat.S_IMODE(os.stat(collector.RUN_LOCK_FILE).st_mode), 0o600)
+
     @patch("collector.resolve_tool", return_value="/usr/bin/agy")
     @patch("collector.collect_local_stats", side_effect=RuntimeError("history exploded"))
     @patch("collector.fetch_authoritative_limits")
@@ -973,6 +1060,150 @@ class TestMainExecutionScenarios(unittest.TestCase):
         self.assertFalse(record["authRequired"])
         # The last limits stay on screen for context.
         self.assertEqual(len(record["limits"]), 2)
+
+    def expire(self):
+        """Run the watchdog's expiry with os._exit stubbed out."""
+        class Exited(BaseException):
+            pass
+
+        # The expiry keeps the spawn lock through the exit it never reaches here.
+        self.addCleanup(lambda: collector._procs_lock.locked() and collector._procs_lock.release())
+        with patch("os._exit", side_effect=Exited) as mock_exit, patch("sys.stderr.write"):
+            with self.assertRaises(Exited):
+                collector._expire_run()
+        mock_exit.assert_called_once_with(0)
+
+    def test_the_watchdog_kills_helpers_and_reports_the_timeout(self):
+        collector.save_private_json(collector.CACHE_FILE, {"limits": self.COMPLETE_LIMITS})
+        collector._record_emitted = False
+        proc = collector._spawn_tracked(["/bin/sh", "-c", "sleep 30"])
+        try:
+            with patch("builtins.print") as mock_print:
+                self.expire()
+            self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
+        finally:
+            proc.stdout.close()
+            collector._active_procs.discard(proc)
+        mock_print.assert_called_once()
+        record = json.loads(mock_print.call_args[0][0])
+        self.assertEqual(record["usageStatusText"], "Quota unavailable")
+        self.assertIn("ran out of time", record["authHelpText"])
+        self.assertEqual(record["limits"], self.COMPLETE_LIMITS)
+
+    def test_the_watchdog_never_prints_a_second_record(self):
+        collector._record_emitted = False
+        with patch("builtins.print") as mock_print:
+            self.assertTrue(collector.emit_record({"id": "antigravity"}))
+            self.expire()
+        mock_print.assert_called_once()
+
+    def test_the_watchdog_fires_unless_disarmed(self):
+        fired = threading.Event()
+        with patch("collector._expire_run", side_effect=fired.set):
+            collector.start_watchdog(0.1)
+            self.assertTrue(fired.wait(5))
+            fired.clear()
+            collector.start_watchdog(0.2).set()
+            self.assertFalse(fired.wait(0.5))
+
+    @patch("collector._run")
+    def test_main_arms_the_watchdog_inside_the_updater_timeout_and_disarms_it(self, _run):
+        disarm = threading.Event()
+        with patch("collector.start_watchdog", return_value=disarm) as mock_watchdog:
+            self.assertEqual(collector.main(argv=["--force"]), 0)
+        delay = mock_watchdog.call_args[0][0]
+        self.assertEqual(delay, collector.RUN_BUDGET_SECONDS + collector.WATCHDOG_GRACE_SECONDS)
+        # The updater runs collectors under `timeout --kill-after=5 60`.
+        self.assertLessEqual(delay, 50)
+        self.assertTrue(disarm.is_set())
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy")
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_an_agy_timeout_is_not_cached(self, _auth, mock_limits, mock_agy, _which):
+        self.seen_groups("Gemini", "Claude/GPT")
+        mock_limits.return_value = [
+            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.1, "resetsAt": ""},
+        ]
+        mock_agy.side_effect = [
+            collector.HelperTimeout("agy -p /usage did not answer"),
+            [{"title": "Gemini (5h)", "label": "Session", "percent": 0.4, "resetsAt": ""}],
+        ]
+
+        with patch("sys.stderr.write"):
+            self.run_main()
+        # Neither agy's answer nor the merge missing its pools was cached...
+        self.assertFalse(os.path.exists(collector.AGY_CACHE_FILE))
+        self.assertFalse(os.path.exists(collector.CACHE_FILE))
+
+        # ...so the next run asks agy again and the Gemini pool is back.
+        record = self.run_main()
+        self.assertEqual(mock_agy.call_count, 2)
+        self.assertEqual(record["usageStatusText"], "")
+        self.assertIn("Gemini (5h)", [item["title"] for item in record["limits"]])
+        self.assertTrue(os.path.exists(collector.AGY_CACHE_FILE))
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy")
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_merged_limits_are_capped(self, _auth, mock_limits, mock_agy, _which):
+        mock_limits.return_value = [
+            {"title": f"Claude/GPT (B{i})", "label": f"B{i}", "percent": 0.1, "resetsAt": ""}
+            for i in range(collector.MAX_LIMIT_ENTRIES)
+        ]
+        mock_agy.return_value = [
+            {"title": f"Gemini (B{i})", "label": f"B{i}", "percent": 0.2, "resetsAt": ""}
+            for i in range(collector.MAX_LIMIT_ENTRIES)
+        ]
+
+        record = self.run_main(["--force"])
+
+        self.assertEqual(len(record["limits"]), collector.MAX_LIMIT_ENTRIES)
+        # What was cached reads back as a hit.
+        self.assertEqual(
+            collector._valid_limits(collector.get_cached_limits()["limits"]), record["limits"]
+        )
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
+    @patch("collector.get_valid_access_token", return_value=("ya29.SECRET\nX-Injected: 1", ""))
+    def test_a_token_that_cannot_be_sent_never_reaches_a_message(self, _auth, _agy, _which):
+        with patch("http.client.HTTPConnection.connect", side_effect=AssertionError("network")), \
+                patch("urllib.request.urlopen", wraps=urllib.request.urlopen) as spy, \
+                patch("sys.stderr.write") as mock_err:
+            record = self.run_main(["--force"])
+
+        # Deterministic, so not retried; and the header error quoting the
+        # token is replaced before it reaches the panel or the log.
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(record["usageStatusText"], "Quota unavailable")
+        self.assertIn("could not be built", record["authHelpText"])
+        self.assertNotIn("SECRET", record["authHelpText"])
+        self.assertNotIn("SECRET", "".join(str(c) for c in mock_err.call_args_list))
+
+    def test_an_untrusted_cache_directory_is_a_collector_error(self):
+        os.chmod(self.temp_dir, 0o755)
+        with patch("os.chmod", side_effect=PermissionError("read-only")), \
+                patch("sys.stderr.write"), patch("collector._run") as mock_run:
+            record = self.run_main(["--force"])
+        mock_run.assert_not_called()
+        # Reported as what it is, not as another run holding the lock.
+        self.assertEqual(record["usageStatusText"], "Collector error")
+        self.assertIn("group/world accessible", record["authHelpText"])
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/pgrep")
+    @patch("subprocess.run")
+    def test_pgrep_is_cut_to_the_run_budget(self, mock_run, _tool):
+        mock_run.return_value = MagicMock(returncode=1)
+        collector.start_run_budget(1)
+        self.assertFalse(collector.is_agy_running())
+        self.assertLessEqual(mock_run.call_args.kwargs["timeout"], 1)
+        # Without time left it fails open, as on any pgrep failure.
+        collector.start_run_budget(0)
+        self.assertTrue(collector.is_agy_running())
+        self.assertEqual(mock_run.call_count, 1)
 
     @patch("collector.resolve_tool", return_value="/usr/bin/pgrep")
     @patch("subprocess.run")
@@ -1182,6 +1413,19 @@ class TestBoundedNetworkReads(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 403)
         self.assertEqual(mock_urlopen.call_count, 1)
 
+    def test_a_trickling_response_stops_at_the_run_deadline(self):
+        class Trickle(FakeHTTPResponse):
+            def read(self, amt=None):
+                time.sleep(0.05)
+                return super().read(1)
+
+        collector.start_run_budget(0.3)
+        try:
+            with self.assertRaises(collector.HttpFetchError):
+                collector.read_bounded(Trickle(b"x" * 1000), 4096)
+        finally:
+            collector._deadline = None
+
     @patch("urllib.request.urlopen")
     def test_requests_stop_when_the_run_budget_is_spent(self, mock_urlopen):
         collector.start_run_budget(0)
@@ -1358,6 +1602,34 @@ class TestStatusNotification(unittest.TestCase):
         status, detail = collector._check_limits_complete([], "Waiting for auth", "sign in")
         self.assertEqual((status, detail), ("Waiting for auth", "sign in"))
 
+    @patch("collector.resolve_tool", return_value="/usr/bin/notify-send")
+    @patch("subprocess.run")
+    def test_notification_is_cut_to_the_run_budget(self, mock_run, _tool):
+        collector.notify_status_change("Quota unavailable", "down")
+        collector.start_run_budget(0)
+        try:
+            with patch("sys.stderr.write"):
+                collector.notify_status_change("Quota unavailable", "down")
+            mock_run.assert_not_called()
+            # Still armed: the next run with time left sends it.
+            collector.start_run_budget(3)
+            collector.notify_status_change("Quota unavailable", "down")
+        finally:
+            collector._deadline = None
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertLessEqual(mock_run.call_args.kwargs["timeout"], 3)
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/notify-send")
+    @patch("subprocess.run")
+    def test_notification_text_is_one_clean_capped_line(self, mock_run, _tool):
+        detail = "line one\nline two\x1b[31m‮" + "x" * 5000
+        collector.notify_status_change("Quota\nunavailable", detail)
+        collector.notify_status_change("Quota\nunavailable", detail)
+        title, body = mock_run.call_args[0][0][-2:]
+        for text in (title, body):
+            self.assertIsNone(collector._CONTROL_CHARS.search(text), repr(text[:40]))
+        self.assertLessEqual(len(body), collector.MAX_MESSAGE_CHARS)
+
 
 class TestGroupTracking(unittest.TestCase):
     """Missing pools are judged against what this account reported recently."""
@@ -1440,14 +1712,210 @@ class TestAccountResolution(unittest.TestCase):
 class TestChildProcesses(unittest.TestCase):
     """A helper killed on timeout takes its own children with it."""
 
+    def test_a_descendant_holding_stdout_cannot_stall_or_outlive_the_run(self):
+        # The helper exits at once; its background child keeps the pipe open.
+        start = time.monotonic()
+        code, out, _truncated = collector.run_bounded_stdout(
+            ["/bin/sh", "-c", "sleep 30 & echo $!"], timeout=10
+        )
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(code, 0)
+        child = int(out.decode().strip())
+        time.sleep(0.2)
+        self.assertFalse(os.path.exists(f"/proc/{child}"), "the descendant outlived the helper")
+        self.assertEqual(collector._active_procs, set())
+
     def test_timeout_kills_the_whole_process_group(self):
         marker = tempfile.mktemp()
         # The grandchild would create the marker after the parent is killed.
         script = f"(sleep 1.5; touch {marker}) & sleep 30"
         code, _out, truncated = collector.run_bounded_stdout(["/bin/sh", "-c", script], timeout=0.5)
-        self.assertTrue(truncated)
+        self.assertEqual(truncated, "time")
         time.sleep(2)
         self.assertFalse(os.path.exists(marker))
+
+    def test_truncation_says_why(self):
+        _code, _out, truncated = collector.run_bounded_stdout(
+            ["/bin/sh", "-c", "head -c 4096 /dev/zero"], timeout=10, max_bytes=100
+        )
+        self.assertEqual(truncated, "size")
+        collector.start_run_budget(0)
+        try:
+            self.assertEqual(
+                collector.run_bounded_stdout(["/bin/true"], timeout=10), (None, b"", "time")
+            )
+        finally:
+            collector._deadline = None
+
+    def test_an_interrupt_while_waiting_kills_the_helper_group(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        pidfile = os.path.join(tmp, "pids")
+        spawned = []
+        real_spawn = collector._spawn_tracked
+
+        def spawn(args):
+            spawned.append(real_spawn(args))
+            return spawned[-1]
+
+        def interrupted(_proc, _timeout):
+            _wait_for_file(pidfile)
+            raise KeyboardInterrupt
+
+        with patch("collector._spawn_tracked", side_effect=spawn), \
+                patch("collector._wait_exited", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                collector.run_bounded_stdout(_helper_script(pidfile), timeout=30)
+        proc = spawned[0]
+        with open(pidfile, encoding="utf-8") as f:
+            pids = [int(p) for p in f.read().split()]
+        try:
+            self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
+            self.assertEqual(_wait_gone(pids), [], "a helper outlived the interrupted run")
+            self.assertNotIn(proc, collector._active_procs)
+        finally:
+            _kill_leftovers(pids)
+            time.sleep(0.1)  # let the reader see EOF before the pipe closes
+            proc.stdout.close()
+
+
+class TestSignalCleanup(unittest.TestCase):
+    """A signal to the collector takes the helpers' own sessions with it."""
+
+    def tearDown(self):
+        collector._deferred_signals.clear()
+
+    def test_handlers_cover_every_signal_that_ends_a_terminal_run(self):
+        self.assertEqual(
+            set(collector.CLEANUP_SIGNALS),
+            {signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT},
+        )
+        saved = {signum: signal.getsignal(signum) for signum in collector.CLEANUP_SIGNALS}
+        try:
+            collector.install_signal_handlers()
+            for signum in collector.CLEANUP_SIGNALS:
+                self.assertIs(signal.getsignal(signum), collector._terminate_children)
+        finally:
+            for signum, handler in saved.items():
+                signal.signal(signum, handler)
+
+    def test_a_signal_during_spawn_waits_for_the_registration(self):
+        real_popen = subprocess.Popen
+        started, deferred = [], []
+
+        def popen_then_signal(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            # Handled here, before the helper is tracked, the signal must not
+            # exit yet: the new session would be left running.
+            collector._terminate_children(signal.SIGINT, None)
+            deferred.extend(collector._deferred_signals)
+            return started[-1]
+
+        with patch("subprocess.Popen", side_effect=popen_then_signal):
+            with self.assertRaises(SystemExit) as ctx:
+                collector._spawn_tracked(["/bin/sh", "-c", "sleep 30"])
+        proc = started[0]
+        try:
+            self.assertEqual(deferred, [signal.SIGINT])
+            self.assertEqual(ctx.exception.code, 128 + signal.SIGINT)
+            # Acted on once tracked: the helper went down with the run.
+            self.assertEqual(proc.wait(timeout=5), -signal.SIGKILL)
+        finally:
+            proc.stdout.close()
+            collector._active_procs.discard(proc)
+
+    def test_the_spawned_helper_keeps_a_normal_signal_mask(self):
+        # agy must still answer SIGTERM/SIGINT from its own MCP servers' view.
+        code, out, _truncated = collector.run_bounded_stdout(
+            ["/bin/grep", "SigBlk", "/proc/self/status"], timeout=10
+        )
+        self.assertEqual(code, 0)
+        blocked = int(out.split()[1], 16)
+        for signum in collector.CLEANUP_SIGNALS:
+            self.assertFalse(blocked & (1 << (signum - 1)), signal.Signals(signum).name)
+
+
+class TestRunTermination(unittest.TestCase):
+    """End to end in a child interpreter whose HOME is a sandbox."""
+
+    def setUp(self):
+        self.sandbox = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.sandbox, ignore_errors=True)
+        self.pidfile = os.path.join(self.sandbox, "helper.pids")
+
+    def start_driver(self, code):
+        env = {
+            "HOME": self.sandbox,
+            "XDG_STATE_HOME": os.path.join(self.sandbox, "state"),
+            "PATH": "/usr/bin:/bin",
+        }
+        return subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", DRIVER, COLLECTOR_PATH, code,
+             json.dumps(_helper_script(self.pidfile))],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        )
+
+    def finish(self, driver, timeout):
+        try:
+            return driver.communicate(timeout=timeout)
+        finally:
+            if driver.poll() is None:
+                driver.kill()
+                driver.communicate()
+
+    def helper_pids(self):
+        with open(self.pidfile, encoding="utf-8") as f:
+            pids = [int(p) for p in f.read().split()]
+        self.addCleanup(_kill_leftovers, pids)
+        return pids
+
+    def test_a_terminal_signal_kills_the_running_helper_group(self):
+        code = (
+            "import json\n"
+            "collector.install_signal_handlers()\n"
+            "collector.start_run_budget()\n"
+            "collector.run_bounded_stdout(json.loads(sys.argv[3]), timeout=30)\n"
+            "print('returned')\n"
+        )
+        for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGTERM):
+            with self.subTest(signal=signum.name):
+                if os.path.exists(self.pidfile):
+                    os.unlink(self.pidfile)
+                driver = self.start_driver(code)
+                try:
+                    _wait_for_file(self.pidfile)
+                    pids = self.helper_pids()
+                    driver.send_signal(signum)
+                finally:
+                    out, _err = self.finish(driver, 10)
+                self.assertEqual(driver.returncode, 128 + signum)
+                self.assertNotIn(b"returned", out)
+                self.assertEqual(_wait_gone(pids), [], "a helper outlived the collector")
+
+    def test_the_watchdog_ends_a_run_blocked_in_c(self):
+        code = (
+            "import json, socket\n"
+            "collector.RUN_BUDGET_SECONDS = 1\n"
+            "collector.WATCHDOG_GRACE_SECONDS = 0.5\n"
+            "def stuck(args):\n"
+            "    collector._spawn_tracked(json.loads(sys.argv[3]))\n"
+            "    a, b = socket.socketpair()\n"
+            "    a.recv(1)  # blocked in C, like getaddrinfo or a TLS handshake\n"
+            "collector._run = stuck\n"
+            "sys.exit(collector.main(['--force']))\n"
+        )
+        start = time.monotonic()
+        driver = self.start_driver(code)
+        out, err = self.finish(driver, 15)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(driver.returncode, 0)
+        lines = out.decode().splitlines()
+        self.assertEqual(len(lines), 1, out)
+        record = json.loads(lines[0])
+        self.assertEqual(record["usageStatusText"], "Quota unavailable")
+        self.assertIn("ran out of time", record["authHelpText"])
+        self.assertIn(b"run time budget exhausted", err)
+        self.assertEqual(_wait_gone(self.helper_pids()), [], "a helper outlived the watchdog")
 
 
 class TestObservability(unittest.TestCase):
@@ -1524,6 +1992,436 @@ class TestTrustedToolResolution(unittest.TestCase):
         os.chmod(tool, 0o755)
         with patch("shutil.which", return_value=tool):
             self.assertIsNone(collector.resolve_tool("tool"))
+
+    # Ownership and modes nobody can create in a test are faked at os.stat.
+    @staticmethod
+    def fake_stat(mode, uid, gid=0):
+        return os.stat_result((mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+
+    def resolve_binary(self, st, private_group=True):
+        with patch("shutil.which", return_value="/opt/tools/helper"), \
+                patch("os.path.realpath", side_effect=lambda p: p), \
+                patch("os.stat", return_value=st), patch("os.access", return_value=True), \
+                patch("collector._trusted_parent_chain", return_value=True), \
+                patch("collector._user_private_group", return_value=private_group):
+            return collector.resolve_tool("helper")
+
+    def test_resolve_tool_checks_the_binary_itself(self):
+        me, other = os.getuid(), os.getuid() + 4242
+        reg = stat.S_IFREG
+        cases = [
+            (self.fake_stat(reg | 0o755, 0), True, True),
+            (self.fake_stat(reg | 0o755, me), True, True),
+            (self.fake_stat(reg | 0o755, other), True, False),
+            (self.fake_stat(reg | 0o757, me), True, False),
+            (self.fake_stat(reg | 0o775, me), True, True),   # umask 002, private group
+            (self.fake_stat(reg | 0o775, me), False, False),  # shared group
+            (self.fake_stat(reg | 0o775, 0), True, False),   # root's, group-writable
+        ]
+        for st, private_group, trusted in cases:
+            with self.subTest(mode=oct(st.st_mode), uid=st.st_uid, private_group=private_group):
+                result = self.resolve_binary(st, private_group)
+                self.assertEqual(result, "/opt/tools/helper" if trusted else None)
+
+    def test_group_writable_directories_need_the_users_private_group(self):
+        me, gid = os.getuid(), os.getgid()
+        tool = "/home/u/.local/bin/agy"
+        root_dir = self.fake_stat(stat.S_IFDIR | 0o755, 0)
+
+        def chain(bin_dir):
+            stats = {"/home/u/.local/bin": bin_dir}
+            with patch("os.stat", side_effect=lambda p: stats.get(p, root_dir)), \
+                    patch("collector._user_private_group", side_effect=lambda g: g == gid):
+                return collector._trusted_parent_chain(tool)
+
+        self.assertTrue(chain(self.fake_stat(stat.S_IFDIR | 0o775, me, gid)))
+        self.assertFalse(chain(self.fake_stat(stat.S_IFDIR | 0o775, me, gid + 1)))
+        self.assertFalse(chain(self.fake_stat(stat.S_IFDIR | 0o775, 0, 0)))
+        self.assertFalse(chain(self.fake_stat(stat.S_IFDIR | 0o755, os.getuid() + 4242)))
+
+    def test_private_group_is_the_users_own_and_nobody_elses(self):
+        uid, gid = os.getuid(), os.getgid()
+        me = pwd.struct_passwd(("me", "x", uid, gid, "", "/home/me", "/bin/sh"))
+        own = grp.struct_group(("me", "x", gid, []))
+        shared = grp.struct_group(("users", "x", gid, ["me", "someone"]))
+        with patch("pwd.getpwuid", return_value=me):
+            with patch("grp.getgrgid", return_value=own):
+                self.assertTrue(collector._user_private_group(gid))
+                self.assertFalse(collector._user_private_group(gid + 1))
+            with patch("grp.getgrgid", return_value=shared):
+                self.assertFalse(collector._user_private_group(gid))
+            with patch("grp.getgrgid", side_effect=KeyError(gid)):
+                self.assertFalse(collector._user_private_group(gid))
+
+
+class TestTokenHygiene(unittest.TestCase):
+    """A corrupt token is treated as missing and never quoted in a message."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_access_cache = collector.ACCESS_TOKEN_CACHE_FILE
+        collector.ACCESS_TOKEN_CACHE_FILE = os.path.join(self.temp_dir, "access-token.json")
+
+    def tearDown(self):
+        collector.ACCESS_TOKEN_CACHE_FILE = self.orig_access_cache
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def expiry(hours):
+        return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+    def test_token_shape(self):
+        self.assertTrue(collector.valid_token("ya29.a0AfB_byC-" + "x" * 200))
+        for bad in ("", "ya29.abc\n", "ya29.\rabc", "has space", "tab\there", "ünicode",
+                    "x" * (collector.MAX_TOKEN_CHARS + 1), None, 123, b"bytes"):
+            self.assertFalse(collector.valid_token(bad), repr(bad)[:40])
+
+    @patch("urllib.request.urlopen")
+    def test_a_corrupt_stored_token_is_treated_as_missing(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse(
+            json.dumps({"access_token": "minted", "expires_in": 3600})
+        )
+        token = {"access_token": "ya29.SECRET\n", "refresh_token": "refresh-a", "expiry": self.expiry(1)}
+        self.assertEqual(collector.get_valid_access_token(token), ("minted", ""))
+
+        # Without a usable refresh token either, there is nothing to send.
+        token = {"access_token": "ya29.SECRET\n", "refresh_token": "refresh\n"}
+        self.assertIsNone(collector.get_valid_access_token(token)[0])
+        self.assertEqual(collector.account_id(token), "")
+
+    @patch("urllib.request.urlopen")
+    def test_a_corrupt_cached_or_minted_token_is_never_used(self, mock_urlopen):
+        token = {"access_token": "stored", "refresh_token": "refresh-a", "expiry": self.expiry(-1)}
+        collector.save_private_json(collector.ACCESS_TOKEN_CACHE_FILE, {
+            "account": collector.account_id(token),
+            "access_token": "cached\r\nX",
+            "expiry": self.expiry(1),
+        })
+        mock_urlopen.return_value = FakeHTTPResponse(
+            json.dumps({"access_token": "minted\nSECRET", "expires_in": 3600})
+        )
+        with patch("sys.stderr.write") as mock_err:
+            access_token, _ = collector.get_valid_access_token(token)
+
+        # Best effort with the stored one, which is at least well-formed.
+        self.assertEqual(access_token, "stored")
+        mock_urlopen.assert_called_once()
+        self.assertNotIn("SECRET", "".join(str(c) for c in mock_err.call_args_list))
+        with open(collector.ACCESS_TOKEN_CACHE_FILE, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["access_token"], "cached\r\nX")
+
+    def test_a_header_error_never_carries_the_token(self):
+        req = urllib.request.Request(
+            "https://example.invalid/q", headers={"Authorization": "Bearer ya29.SECRET\nX"}
+        )
+        with patch("http.client.HTTPConnection.connect", side_effect=AssertionError("network")):
+            with self.assertRaises(collector.HttpFetchError) as ctx:
+                collector.fetch_json(req, 5, 1024, "quota request failed")
+        self.assertNotIn("SECRET", str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertFalse(collector._retryable(ctx.exception))
+
+    def test_server_text_is_cleaned_before_it_reaches_a_message(self):
+        handler = collector._NoRedirectHandler()
+        req = urllib.request.Request("https://oauth2.googleapis.com/token")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            handler.redirect_request(
+                req, None, 302, "Found", {}, "https://evil.invalid/\r\nX-Injected: 1" + "a" * 5000
+            )
+        self.addCleanup(ctx.exception.close)
+        self.assertIsNone(collector._CONTROL_CHARS.search(ctx.exception.reason))
+        self.assertLessEqual(len(ctx.exception.reason), 250)
+
+        err = urllib.error.HTTPError(
+            "https://example.invalid/quota", 500, "Bad\r\nreason" + "r" * 5000, {},
+            io.BytesIO(b"body\x1b[31m\nmore" + b"b" * 3000),
+        )
+        self.addCleanup(err.close)
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(collector.HttpFetchError) as ctx:
+                collector.fetch_json(
+                    urllib.request.Request("https://example.invalid/quota"), 5, 4096, "quota"
+                )
+        message = str(ctx.exception)
+        self.assertIsNone(collector._CONTROL_CHARS.search(message))
+        self.assertLessEqual(len(message), 800)
+
+    def test_record_and_log_text_is_one_clean_capped_line(self):
+        record = collector._build_record(
+            "a@example.com\n", "Pro\x1b[2J", "Quota unavailable\r\n",
+            "bad\r\nthing\x00" + "y" * 5000, [], {},
+        )
+        for field in ("tierLabel", "usageStatusText", "authHelpText"):
+            self.assertIsNone(collector._CONTROL_CHARS.search(record[field]), field)
+        self.assertEqual(record["usageStatusText"], "Quota unavailable")
+        self.assertLessEqual(len(record["authHelpText"]), collector.MAX_MESSAGE_CHARS)
+
+        with patch("sys.stderr.write") as mock_err:
+            collector.log_warn("a\nb\x1b[2J" + "c" * 5000)
+        line = mock_err.call_args[0][0]
+        self.assertEqual(line.count("\n"), 1)
+        self.assertTrue(line.endswith("\n"))
+        self.assertNotIn("\x1b", line)
+        self.assertLess(len(line), collector.MAX_LOG_CHARS + 64)
+
+
+class TestOutputCaps(unittest.TestCase):
+    """A response within its byte ceiling still yields a bounded record."""
+
+    @patch("urllib.request.urlopen")
+    def test_a_flood_of_tiny_buckets_is_cut_to_the_first_entries(self, mock_urlopen):
+        count = (collector.QUOTA_RESPONSE_MAX_BYTES - 200) // 3
+        body = (
+            '{"groups":[{"displayName":"Other","buckets":[' + ",".join(["{}"] * count) + ']},'
+            '{"displayName":"GEMINI MODELS","buckets":[{"window":"5h","remainingFraction":0.5}]}]}'
+        )
+        self.assertLessEqual(len(body), collector.QUOTA_RESPONSE_MAX_BYTES)
+        mock_urlopen.return_value = FakeHTTPResponse(body)
+
+        limits = collector.fetch_authoritative_limits("token")
+
+        self.assertEqual(len(limits), collector.MAX_LIMIT_ENTRIES)
+        # Display order decides what is kept: the Gemini pool listed last leads.
+        self.assertEqual(limits[0]["title"], "Gemini (5h)")
+        self.assertLess(len(json.dumps({"limits": limits}, indent=2)), 16 * 1024)
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout")
+    def test_agy_names_are_cleaned_and_capped(self, mock_bounded, _tool):
+        long_name = "Gemini 4 \x1b[31mArgon\n" + "z" * 5000
+        bucket = {"name": long_name, "window": "monthly", "remaining_fraction": 0.5,
+                  "reset_time": "\r\n" + "9" * 5000}
+        stdout = json.dumps({"command": {"data": {"groups": [
+            {"name": long_name, "buckets": [bucket] * 100},
+            {"name": "Odd", "buckets": [{"name": "Huge", "remaining_fraction": 10 ** 400},
+                                        {"name": "NaN", "remaining_fraction": float("nan")}]},
+        ]}}})
+        mock_bounded.return_value = (0, stdout.encode("utf-8"), False)
+
+        limits = collector.fetch_limits_via_agy()
+
+        self.assertEqual(len(limits), collector.MAX_LIMIT_ENTRIES)
+        self.assertIsNotNone(collector._valid_limits(limits))
+        self.assertEqual(
+            collector.limit_group(limits[0]), collector.clean_text(long_name, collector.MAX_LIMIT_NAME_CHARS)
+        )
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout")
+    def test_agy_table_with_absurd_numbers_is_skipped(self, mock_bounded, _tool):
+        stdout = (
+            "Gemini Models\tFive Hour Limit Remaining\t" + "9" * 400 + "%\t2026-09-08T22:56:17Z\n"
+            "Gemini Models\tWeekly Limit Remaining\t40%\t2026-09-10T18:37:23Z\n"
+        )
+        mock_bounded.return_value = (0, stdout.encode("utf-8"), False)
+        self.assertEqual([i["title"] for i in collector.fetch_limits_via_agy()], ["Gemini (Weekly)"])
+
+    def test_every_cache_save_is_capped_at_what_can_be_read_back(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        target = os.path.join(tmp, "cache.json")
+        with patch("sys.stderr.write"):
+            self.assertFalse(
+                collector.save_private_json(target, {"k": "x" * collector.MAX_CACHE_FILE_SIZE})
+            )
+        self.assertFalse(os.path.exists(target))
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.run_bounded_stdout", return_value=(None, b"", "time"))
+    def test_an_agy_that_ran_out_of_time_raises_instead_of_answering(self, _bounded, _tool):
+        with self.assertRaises(collector.HelperTimeout):
+            collector.fetch_limits_via_agy()
+
+
+class TestCacheIntegrity(unittest.TestCase):
+    """Caches are trusted for their mode, owner and shape, or treated as a miss."""
+
+    SANDBOXED = {
+        "CACHE_DIR": "", "AGY_CACHE_FILE": "agy.json", "ACCESS_TOKEN_CACHE_FILE": "token.json",
+        "ACCOUNT_CACHE_FILE": "account.json", "GROUPS_STATE_FILE": "groups.json",
+        "HISTORY_FILE": "history.jsonl", "HISTORY_CACHE_FILE": "history-cache.json",
+        "BRAIN_DIR": "brain",
+    }
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig = {name: getattr(collector, name) for name in self.SANDBOXED}
+        for name, filename in self.SANDBOXED.items():
+            setattr(collector, name, os.path.join(self.temp_dir, filename))
+
+    def tearDown(self):
+        for name, value in self.orig.items():
+            setattr(collector, name, value)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def write(self, path, text, mode=0o600):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(path, mode)
+
+    def test_a_private_file_can_be_required(self):
+        path = os.path.join(self.temp_dir, "x.json")
+        self.write(path, '{"a": 1}', 0o640)
+        self.assertEqual(collector.read_private_json(path)[0], {"a": 1})
+        self.assertEqual(collector.read_private_json(path, require_private=True), (None, None))
+        os.chmod(path, 0o600)
+        self.assertEqual(collector.read_private_json(path, require_private=True)[0], {"a": 1})
+
+    @patch("urllib.request.urlopen")
+    def test_a_token_cache_others_can_read_is_not_used(self, mock_urlopen):
+        token = {"refresh_token": "refresh-a"}
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        self.write(collector.ACCESS_TOKEN_CACHE_FILE, json.dumps({
+            "account": collector.account_id(token), "access_token": "leaked", "expiry": future,
+        }), 0o644)
+        mock_urlopen.return_value = FakeHTTPResponse(
+            json.dumps({"access_token": "fresh", "expires_in": 3600})
+        )
+        self.assertEqual(collector.get_valid_access_token(token), ("fresh", ""))
+        self.assertEqual(stat.S_IMODE(os.stat(collector.ACCESS_TOKEN_CACHE_FILE).st_mode), 0o600)
+
+    def test_ensure_dir_narrows_an_open_directory(self):
+        path = os.path.join(self.temp_dir, "open")
+        os.mkdir(path, 0o755)
+        os.chmod(path, 0o755)
+        collector.ensure_dir(path)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700)
+
+    def test_ensure_dir_refuses_what_it_cannot_make_private(self):
+        path = os.path.join(self.temp_dir, "stuck")
+        os.mkdir(path, 0o755)
+        os.chmod(path, 0o755)
+        with patch("os.chmod", side_effect=PermissionError("read-only")):
+            with self.assertRaisesRegex(OSError, "group/world accessible"):
+                collector.ensure_dir(path)
+        with patch("os.getuid", return_value=os.getuid() + 4242):
+            with self.assertRaisesRegex(OSError, "owned by uid"):
+                collector.ensure_dir(path)
+
+    def test_a_groups_file_with_absurd_numbers_is_read_safely(self):
+        now = float(int(time.time()))
+        self.write(collector.GROUPS_STATE_FILE, (
+            '{"Huge": 1' + "0" * 400 + ', "Inf": 1e400, "NaN": NaN, "Flag": true, '
+            '"Text": "x", "Line\\nBreak": %f, "Gemini": %f}' % (now, now)
+        ))
+        self.assertEqual(collector._read_seen_groups(), {"Gemini": now})
+        self.assertEqual(collector.known_limit_groups(), {"Gemini"})
+
+        self.write(collector.GROUPS_STATE_FILE, json.dumps(
+            {f"G{i}": now for i in range(collector.MAX_TRACKED_GROUPS + 1)}
+        ))
+        self.assertEqual(collector._read_seen_groups(), {})
+
+    def test_cached_limits_of_the_wrong_shape_are_a_miss(self):
+        good = [{"title": "Gemini (5h)", "label": "Session", "percent": 0.5, "resetsAt": ""}]
+        self.assertEqual(collector._valid_limits(good), good)
+        for bad in (
+            None, "limits", {"title": "x"}, [1, 2], [{"title": "x"}],
+            [{"title": "x", "percent": "50%"}], [{"title": "x", "percent": True}],
+            [{"title": "x", "percent": float("nan")}], [{"title": "x", "percent": 2}],
+            [{"title": "A\nB", "percent": 0.1}], [{"title": "x" * 500, "percent": 0.1}],
+            good * (collector.MAX_LIMIT_ENTRIES + 1),
+        ):
+            self.assertIsNone(collector._valid_limits(bad), repr(bad)[:60])
+
+    @patch("collector.fetch_limits_via_agy")
+    def test_a_wrong_shaped_agy_cache_is_refetched(self, mock_agy):
+        fetched = [{"title": "Gemini (5h)", "label": "Session", "percent": 0.5, "resetsAt": ""}]
+        mock_agy.return_value = fetched
+        for bad in ([1, 2], {"title": "x"}, "string", [{"title": "x", "percent": None}]):
+            with self.subTest(limits=bad):
+                self.write(collector.AGY_CACHE_FILE, json.dumps({"limits": bad}))
+                self.assertEqual(collector.get_agy_limits(), (fetched, False))
+        # A well-formed entry (a failure marker included) is a hit.
+        mock_agy.reset_mock()
+        self.write(collector.AGY_CACHE_FILE, json.dumps({"limits": None}))
+        self.assertEqual(collector.get_agy_limits(), (None, False))
+        mock_agy.assert_not_called()
+
+    def test_a_wrong_shaped_history_cache_is_rescanned(self):
+        with open(collector.HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": time.time() * 1000}) + "\n")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        key = collector._history_cache_key(collector.HISTORY_FILE) + [today]
+        good = {"historyKey": key, "totalPrompts": 9, "todayPrompts": 9, "todaySessions": 1,
+                "recentDays": [{"date": today, "messageCount": 9}]}
+        for change in (
+            {"totalPrompts": "abc"}, {"todayPrompts": 1e400}, {"todaySessions": None},
+            {"recentDays": 5}, {"recentDays": [1]}, {"recentDays": [{"date": today}]},
+            {"recentDays": [{"date": today, "messageCount": 10 ** 400}]},
+        ):
+            with self.subTest(change=change):
+                self.write(collector.HISTORY_CACHE_FILE, json.dumps({**good, **change}))
+                self.assertEqual(collector.collect_local_stats()["totalPrompts"], 1)
+        # The well-formed one is still served from the cache.
+        self.write(collector.HISTORY_CACHE_FILE, json.dumps(good))
+        self.assertEqual(collector.collect_local_stats()["totalPrompts"], 9)
+
+    def test_a_cached_expiry_of_the_wrong_shape_is_stale_not_a_crash(self):
+        for expiry in ({"at": 1}, ["2026"], 12345, "x" * 100000, "2026-13-45T99:00:00"):
+            self.assertFalse(collector._token_fresh(expiry), repr(expiry)[:40])
+        self.assertFalse(collector._token_fresh("0001-01-01T00:00:00+14:00"))
+        self.assertTrue(collector._token_fresh("9999-12-31T23:59:59-14:00"))
+
+    @patch("collector._fetch_tier", return_value="Google AI Pro")
+    @patch("collector._fetch_email", return_value="a@example.com")
+    def test_a_wrong_shaped_account_cache_is_refetched(self, mock_email, _tier):
+        self.write(collector.ACCOUNT_CACHE_FILE, json.dumps(
+            {"account": "acct", "email": {"nested": True}, "tier": 5}
+        ))
+        self.assertEqual(
+            collector.resolve_account("acct", lambda: "token"), ("a@example.com", "Google AI Pro")
+        )
+        mock_email.assert_called_once()
+
+
+class TestShellIdChecks(unittest.TestCase):
+    """Agent ids from records and synced snapshots are checked before argv or a path.
+
+    The panel cannot run outside Quickshell, so these pin the checks in the
+    QML sources and exercise the pattern they use.
+    """
+
+    SAFE_ID = "^[a-z0-9][a-z0-9-]{0,63}$"
+
+    @staticmethod
+    def read_ui(name):
+        with open(os.path.join(PROJECT_ROOT, "ui", name), encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def function_body(source, name):
+        start = source.index(f"function {name}(")
+        return source[start:source.index("\n  }\n", start)]
+
+    def test_the_pattern_rejects_ids_that_could_escape(self):
+        # fullmatch reads "$" the way JavaScript does: no trailing newline.
+        pattern = re.compile(self.SAFE_ID)
+        for ok in ("antigravity", "claude", "open-code", "a" * 64):
+            self.assertIsNotNone(pattern.fullmatch(ok), ok)
+        for bad in ("--force", "-x", "../../../../Sync/x", "a/b", "a?b", "a#b", "Agy",
+                    "", "a" * 65, "a b", "a\n", "a.svg", "__proto__"):
+            self.assertIsNone(pattern.fullmatch(bad), repr(bad))
+
+    def test_main_checks_ids_before_the_updater_argv_and_the_merge(self):
+        source = self.read_ui("Main.qml")
+        self.assertIn(f"/{self.SAFE_ID}/.test(id)", self.function_body(source, "isSafeAgentId"))
+        retry = self.function_body(source, "scheduleLimitsRetry")
+        self.assertIn("agent.agentId", retry)
+        self.assertNotIn("record.id", retry)
+        self.assertIn("isSafeAgentId(id) && providerEnabled(id)", retry)
+        command = self.function_body(source, "updateCommand")
+        self.assertIn("if (isSafeAgentId(agentIds[i])) command.push(agentIds[i])", command)
+        self.assertIn("isSafeAgentId(id) && providers[id]", command)
+        self.assertIn("if (!isSafeAgentId(providerId)) continue",
+                      self.function_body(source, "aggregateSnapshots"))
+
+    def test_panel_checks_the_id_before_building_an_asset_url(self):
+        source = self.read_ui("Panel.qml")
+        icons = self.function_body(source, "iconCandidatesForProvider")
+        self.assertLess(icons.index(f"/{self.SAFE_ID}/.test(id)"), icons.index("Qt.resolvedUrl"))
+        self.assertNotIn("p.providerId +", icons)
+        self.assertIn("i < root.maxLimitRows", self.function_body(source, "limitWindows"))
 
 
 if __name__ == "__main__":
