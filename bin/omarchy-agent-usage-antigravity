@@ -1315,7 +1315,9 @@ def _run(args):
     # When not forced and an existing state file already exists, only query remote servers
     # if there is at least one active 'agy' session running on the machine.
     if not args.force and os.path.exists(STATE_FILE) and not is_agy_running():
-        log_warn("no active agy session running; skipping update")
+        # The normal idle path, hit on every bar tick: the updater forwards
+        # stderr to the shell log, so this stays a debug line.
+        log_debug("no active agy session running; skipping update")
         return
 
     limits = None

@@ -999,7 +999,12 @@ class TestMainExecutionScenarios(unittest.TestCase):
             result = collector.main(argv=[])
             self.assertEqual(result, 0)
             mock_print.assert_not_called()
-            mock_stderr.assert_called()
+            # The idle skip is routine; it must not land in the shell log as a warning.
+            mock_stderr.assert_not_called()
+
+        with patch.dict(os.environ, {"OMARCHY_ANTIGRAVITY_DEBUG": "1"}), \
+                patch("builtins.print"), patch("sys.stderr.write") as mock_stderr:
+            collector.main(argv=[])
             self.assertIn("no active agy session running", mock_stderr.call_args[0][0])
 
     @patch("collector.is_agy_running")
