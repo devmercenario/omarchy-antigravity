@@ -191,4 +191,22 @@ fi
 no_temp_files
 echo "  ✅ Test Case 5 passed!"
 
+# Test Case 6 (#1): the "gemini" default earlier releases set opened the
+# deprecated Gemini CLI once its agy shim was removed. The plugin's own choice
+# (opt-in marker present) moves to antigravity; a user's Gemini pick stays.
+echo "  ▶ Test Case 6: Legacy plugin-set 'gemini' default moves to antigravity..."
+AGENT_FILE="$TEST_HOME/.config/omarchy/defaults/agent"
+touch "$TEST_HOME/.config/omarchy/antigravity.default"
+echo "gemini" > "$AGENT_FILE"
+bash "$HOOK_SRC"
+[[ "$(cat "$AGENT_FILE")" == "antigravity" ]] \
+  || { echo "❌ Assertion failed: hook kept the legacy plugin 'gemini' default." >&2; exit 1; }
+
+rm -f "$TEST_HOME/.config/omarchy/antigravity.default"
+echo "gemini" > "$AGENT_FILE"
+bash "$HOOK_SRC"
+[[ "$(cat "$AGENT_FILE")" == "gemini" ]] \
+  || { echo "❌ Assertion failed: hook overrode a user's own Gemini default." >&2; exit 1; }
+echo "  ✅ Test Case 6 passed!"
+
 echo "🎉 All hook tests passed successfully!"

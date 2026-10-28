@@ -16,6 +16,7 @@ SHELL_CONFIG="$CONFIG_DIR/shell.json"
 # over (the current marker, or the header every earlier release carried).
 STATUSLINE_MARKER_RE='^# (omarchy-antigravity: statusline|Omarchy Antigravity CLI Statusline)$'
 UPDATER_MARKER_RE='^# (omarchy-antigravity: agent-usage-update|omarchy:summary=Update local usage records for all configured coding agents)$'
+AGENT_LAUNCHER_MARKER_RE='^# omarchy-antigravity: agent-launcher$'
 # Dropped into the agents plugin folder when this installer created it.
 CLONE_MARKER=".omarchy-antigravity-cloned"
 
@@ -172,6 +173,7 @@ if has_marker "$UPDATER_BAK" "$UPDATER_MARKER_RE"; then
 fi
 for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
                "$SCRIPT_DIR/bin/omarchy-agent-usage-update" \
+               "$SCRIPT_DIR/bin/omarchy-agent" \
                "$SCRIPT_DIR/bin/omarchy-antigravity" \
                "$SCRIPT_DIR/bin/omarchy-antigravity-statusline"; do
   bin_name=$(basename "$bin_src")
@@ -183,6 +185,13 @@ for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
   fi
   if [[ -e "$target" && ! -f "$target" ]]; then
     echo "⚠️  Skipping $target: non-regular file exists at destination." >&2
+    continue
+  fi
+  # omarchy-agent shadows Omarchy's launcher so Antigravity can be the default
+  # agent; a launcher of the user's own there is theirs and is left alone.
+  if [[ "$bin_name" == "omarchy-agent" && -f "$target" ]] &&
+     ! cmp -s "$bin_src" "$target" && ! has_marker "$target" "$AGENT_LAUNCHER_MARKER_RE"; then
+    echo "⚠️  Skipping $target: a different omarchy-agent already exists there; Antigravity will not open as the default agent." >&2
     continue
   fi
   # omarchy-agent-usage-update shadows the stock Omarchy helper of the same
@@ -212,7 +221,18 @@ export PATH="$BIN_DIR:$PATH"
 mkdir -p "$CONFIG_DIR/defaults"
 AGENT_FILE="$CONFIG_DIR/defaults/agent"
 CURRENT_AGENT=""
-[[ -f "$AGENT_FILE" ]] && CURRENT_AGENT=$(cat "$AGENT_FILE")
+[[ -f "$AGENT_FILE" ]] && CURRENT_AGENT=$(tr -d '[:space:]' < "$AGENT_FILE")
+
+# Releases before the Antigravity CLI set "gemini", served by a
+# ~/.local/bin/gemini shim to agy that has since been removed; Omarchy now
+# opens the deprecated Gemini CLI for it. Move a default this plugin set (its
+# opt-in marker is there) to "antigravity"; a user's own Gemini pick has no
+# marker and stays.
+if [[ "$CURRENT_AGENT" == "gemini" && -f "$CONFIG_DIR/antigravity.default" ]]; then
+  echo "⚙️  Moving the legacy 'gemini' default agent to 'antigravity'..."
+  echo "antigravity" > "$AGENT_FILE"
+  CURRENT_AGENT="antigravity"
+fi
 
 should_set_default=false
 if [[ "$SET_DEFAULT" == "yes" ]]; then

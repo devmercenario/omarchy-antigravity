@@ -11,7 +11,12 @@ AGENT_FILE="$CONFIG_DIR/defaults/agent"
 # If the user has explicitly selected another agent, respect their choice.
 if [[ -f "$AGENT_FILE" ]]; then
   current_agent=$(tr -d '[:space:]' < "$AGENT_FILE")
-  if [[ "$current_agent" != "gemini" && "$current_agent" != "antigravity" ]]; then
+  if [[ "$current_agent" == "gemini" && -f "$CONFIG_DIR/antigravity.default" ]]; then
+    # Releases before the Antigravity CLI set "gemini", served by a
+    # ~/.local/bin/gemini shim to agy that has since been removed; Omarchy now
+    # opens the deprecated Gemini CLI for it. The plugin's own choice moves on.
+    echo "antigravity" > "$AGENT_FILE"
+  elif [[ "$current_agent" != "gemini" && "$current_agent" != "antigravity" ]]; then
     rm -f "$CONFIG_DIR/antigravity.default"
   fi
 elif [[ -f "$CONFIG_DIR/antigravity.default" ]]; then

@@ -273,5 +273,37 @@ run_uninstall
 [[ -e "$TEST_HOME/.cache/omarchy/agent-usage/claude-usage.json" ]] || fail "uninstall removed another agent's cache."
 [[ "$(cat "$TEST_HOME/.config/omarchy/defaults/agent")" == "claude" ]] || fail "previous default agent was not restored."
 
+echo "  ▶ The agent launcher is installed, never clobbers the user's, and leaves on uninstall..."
+fresh_home launcher
+run_install --no-default --no-statusline
+grep -qx '# omarchy-antigravity: agent-launcher' "$TEST_HOME/.local/bin/omarchy-agent" \
+  || fail "install did not put the plugin's omarchy-agent launcher in ~/.local/bin."
+run_uninstall
+[[ ! -e "$TEST_HOME/.local/bin/omarchy-agent" ]] || fail "uninstall left the plugin's omarchy-agent launcher behind."
+
+fresh_home launcher-user
+printf '#!/bin/bash\necho mine\n' > "$TEST_HOME/.local/bin/omarchy-agent"
+chmod +x "$TEST_HOME/.local/bin/omarchy-agent"
+run_install --no-default --no-statusline
+[[ "$("$TEST_HOME/.local/bin/omarchy-agent")" == "mine" ]] || fail "install replaced the user's own omarchy-agent."
+run_uninstall
+[[ "$("$TEST_HOME/.local/bin/omarchy-agent")" == "mine" ]] || fail "uninstall removed the user's own omarchy-agent."
+
+echo "  ▶ Install moves the legacy plugin-set 'gemini' default to antigravity (#1)..."
+fresh_home legacy-gemini
+mkdir -p "$TEST_HOME/.config/omarchy/defaults"
+echo "gemini" > "$TEST_HOME/.config/omarchy/defaults/agent"
+touch "$TEST_HOME/.config/omarchy/antigravity.default"
+run_install --no-default --no-statusline
+[[ "$(cat "$TEST_HOME/.config/omarchy/defaults/agent")" == "antigravity" ]] \
+  || fail "install kept the legacy plugin 'gemini' default."
+
+fresh_home user-gemini
+mkdir -p "$TEST_HOME/.config/omarchy/defaults"
+echo "gemini" > "$TEST_HOME/.config/omarchy/defaults/agent"
+run_install --no-default --no-statusline
+[[ "$(cat "$TEST_HOME/.config/omarchy/defaults/agent")" == "gemini" ]] \
+  || fail "install overrode a user's own Gemini default."
+
 echo "  ✅ Reinstall & uninstall safety checks passed!"
 echo "🎉 Reinstall & uninstall safety tests passed successfully!"

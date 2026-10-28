@@ -1,0 +1,70 @@
+#!/bin/bash
+# omarchy:summary=Launch the default coding agent in a terminal
+# omarchy:args=[--inline] [--pick]
+# omarchy:examples=omarchy agent | omarchy agent --inline
+# omarchy-antigravity: agent-launcher
+#
+# Omarchy's launcher has no entry for Antigravity, so with `antigravity` as
+# the default agent the keybinding, the menu and the bar's agent button fail
+# with "Unsupported default agent". This copy shadows it on PATH (~/.local/bin
+# comes first), opens agy for that one agent, and hands every other agent to
+# the stock launcher untouched. Keep the marker line above verbatim: install
+# and uninstall use it to tell this copy apart from a user's own.
+
+set -euo pipefail
+
+stock="${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent"
+
+if [[ $(omarchy-default-agent 2>/dev/null || true) != "antigravity" ]]; then
+  # Never exec ourselves: an OMARCHY_PATH pointing back here would loop.
+  if [[ ! -x $stock || $(realpath -- "$stock") == $(realpath -- "${BASH_SOURCE[0]}") ]]; then
+    echo "Omarchy's omarchy-agent was not found at $stock" >&2
+    exit 1
+  fi
+  exec "$stock" "$@"
+fi
+
+inline=false
+prompt=""
+
+# The stock launcher's flags, so the keybinding, menu and prompt helpers keep
+# working unchanged.
+while (($#)); do
+  case "$1" in
+    --inline)
+      inline=true
+      shift
+      ;;
+    --pick)
+      # A default is set, so there is nothing to pick.
+      shift
+      ;;
+    --prompt)
+      prompt=${2:?--prompt needs a value}
+      shift 2
+      ;;
+    *)
+      echo "Unexpected argument: $1" >&2
+      echo "To pass a prompt: omarchy agent prompt \"$*\"" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# As in the stock launcher: agents re-ask for trust in $HOME on every session.
+[[ $PWD == "$HOME" && -d $HOME/Work ]] && cd "$HOME/Work"
+
+if ! command -v agy >/dev/null 2>&1; then
+  echo "Antigravity CLI (agy) is not installed. Install it or choose another agent with: omarchy default agent <name>" >&2
+  exit 1
+fi
+
+# Unlike the stock entries, no approval bypass is passed: agy keeps its
+# standard permission prompts (see SECURITY.md).
+command=(agy)
+[[ -n $prompt ]] && command+=(-i "$prompt")
+
+if [[ $inline == "true" ]]; then
+  exec "${command[@]}"
+fi
+exec omarchy-launch-tui --app-id=org.omarchy.agent "${command[@]}"

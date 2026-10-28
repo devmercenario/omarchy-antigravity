@@ -36,6 +36,7 @@ omarchy-antigravity/
 ├── bin/
 │   ├── omarchy-agent-usage-antigravity # Python collector for Google Cloud Code / Antigravity quota
 │   ├── omarchy-agent-usage-update      # Multi-provider runner (unifies /usr/share and ~/.local/bin)
+│   ├── omarchy-agent                   # Launcher: opens agy for the antigravity default, else Omarchy's own
 │   ├── omarchy-antigravity             # User CLI helper (run | auth | status | refresh | statusline | help)
 │   └── omarchy-antigravity-statusline  # Dynamic theme-aware status bar for Antigravity CLI (agy)
 ├── hooks/
@@ -249,7 +250,8 @@ Antigravity is designed as a first-class, **optional** agent that coexists with 
 - When `defaults/agent` changes:
   - If set to `claude`: `Panel.qml` switches its active provider to Claude, displaying Claude's rate limits and tokens.
   - If set to `gemini` or `antigravity`: `Panel.qml` switches to Antigravity, displaying Gemini/Claude quota windows and prompt metrics.
-  - Right-clicking the bar button executes `omarchy-agent --pick`, which always invokes the user's current default agent.
+  - Right-clicking the bar button executes `omarchy-agent --pick`, which always invokes the user's current default agent. Omarchy's stock launcher has no Antigravity entry, so the plugin installs `~/.local/bin/omarchy-agent` (ahead of `/usr/bin` on `PATH`): for the `antigravity` default it runs `omarchy-launch-tui --app-id=org.omarchy.agent agy` (or `agy` with `--inline`, `agy -i <prompt>` with `--prompt`), with no permission bypass; for any other default it `exec`s `${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-agent` with the arguments untouched.
+  - `omarchy default agent` only accepts Omarchy's built-in agents; `omarchy-antigravity default` sets `antigravity` (with a backup and the `antigravity.default` opt-in marker). `gemini` means Omarchy's Gemini CLI: a `gemini` default with the opt-in marker is a leftover from releases that shipped a `gemini` shim to agy, and install and the post-update hook move it to `antigravity`.
   - In the panel tab strip, users can still click or middle-click to browse any other enabled provider tabs.
 
 ### 5.4. Multi-Provider Runner & Refresh Cadence
@@ -260,7 +262,7 @@ Antigravity is designed as a first-class, **optional** agent that coexists with 
   - Runs collectors in parallel from `${OMARCHY_PATH:-/usr/share/omarchy}/bin` and `~/.local/bin` (local wins), each under `timeout 60` and a non-blocking per-collector `flock` (`.<id>.lock`), so overlapping refreshes skip a collector that is still running.
   - Only plain lowercase ids (`^[a-z0-9][a-z0-9-]*$`) not starting with `update` are run, and an `OMARCHY_AGENT_USAGE_UPDATE_ACTIVE` guard turns nested invocations into no-ops: a stray copy of the updater can never recurse.
   - Forwards each collector's stderr as `<id>: ...` (control characters stripped, 50 lines max) and exits non-zero when a collector fails, times out, or prints invalid JSON.
-  - Keep the `# omarchy-antigravity: agent-usage-update` marker line (and the status line's `# omarchy-antigravity: statusline`) verbatim: install and uninstall use it to tell the plugin's copy from the user's.
+  - Keep the `# omarchy-antigravity: agent-usage-update` marker line (and the status line's `# omarchy-antigravity: statusline`, and the launcher's `# omarchy-antigravity: agent-launcher`) verbatim: install and uninstall use it to tell the plugin's copy from the user's.
 - **Refresh Intervals**:
   - `ui/Main.qml` runs the full refresh of every collector every `refreshIntervalSec` (default 900, matching stock Omarchy) and a limits-only refresh of Antigravity every `limitsRefreshIntervalSec` (default 120, minimum 60); both are set in `shell.json`. Opening the panel also refreshes limits.
   - An optional systemd user timer (`omarchy-agent-usage.timer`, not installed by `install.sh`) may also run `omarchy-agent-usage-update --limits-only`; the updater's per-collector locks keep overlapping runs from colliding.

@@ -19,6 +19,7 @@ USER_PLUGIN_DIR="$CONFIG_DIR/plugins/$USER_PLUGIN_ID"
 # files carrying them are removed or replaced here.
 STATUSLINE_MARKER_RE='^# (omarchy-antigravity: statusline|Omarchy Antigravity CLI Statusline)$'
 UPDATER_MARKER_RE='^# (omarchy-antigravity: agent-usage-update|omarchy:summary=Update local usage records for all configured coding agents)$'
+AGENT_LAUNCHER_MARKER_RE='^# omarchy-antigravity: agent-launcher$'
 CLONE_MARKER=".omarchy-antigravity-cloned"
 
 # True when $1 is a regular file (not a symlink) carrying marker regex $2.
@@ -74,6 +75,11 @@ echo "🗑️  Uninstalling Antigravity Integration for Omarchy..."
 rm -f "$BIN_DIR/omarchy-agent-usage-antigravity" \
       "$BIN_DIR/omarchy-antigravity" \
       "$BIN_DIR/omarchy-antigravity-statusline"
+# The agent launcher shadows Omarchy's own; only the plugin's copy goes, so the
+# stock launcher takes over again.
+if has_marker "$BIN_DIR/omarchy-agent" "$AGENT_LAUNCHER_MARKER_RE"; then
+  rm -f "$BIN_DIR/omarchy-agent"
+fi
 
 # Undo the Antigravity CLI status line only where it is still this plugin's:
 # a statusline.sh without the marker, and any statusLine entry not pointing

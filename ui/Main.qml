@@ -31,9 +31,10 @@ Item {
     onLoadFailed: root.defaultAgentId = ""
   }
 
+  // "gemini" is Omarchy's Gemini CLI, not Antigravity: the plugin's legacy
+  // "gemini" default is migrated to "antigravity" by install and the hook.
   function normalizeAgentId(content) {
     var raw = String(content || "").trim().toLowerCase()
-    if (raw === "gemini") return "antigravity"
     if (raw === "claude-code") return "claude"
     return raw
   }

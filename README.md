@@ -8,7 +8,7 @@
 Complete integration of Google Antigravity CLI (`agy`) for [Omarchy](https://omarchy.org/) Linux:
 - 📊 **Real-time Quota Meters**: 5-hour session and weekly limits for the Gemini and Claude/GPT model groups, plus any per-model pool Antigravity reports (such as Gemini 4 Argon), directly in the Omarchy bar panel.
 - 🚨 **Broken-Usage Alerts**: If Antigravity stops reporting a quota pool it reported during the last week (for example after an upstream format change), the bar lights up, the panel says `Usage incomplete`, and you get a single desktop notification. The bar alarm covers every agent in the panel, not only the one on screen.
-- ⚡ **Agent Integration**: Dedicated CLI helper `omarchy-antigravity` and dashboard support for default agent routing.
+- ⚡ **Agent Integration**: Antigravity can be Omarchy's default agent: the keybinding, the Omarchy menu, and the bar's agent button open `agy` (with its normal permission prompts), through a small `omarchy-agent` launcher that hands every other agent to Omarchy's own. Plus the `omarchy-antigravity` CLI helper.
 - 🔔 **Status Bar Warnings**: The bar icon lights up in warning color with a tooltip when authentication is required or expired.
 - 🔑 **1-Click Authentication**: Interactive **"Sign In"** button in the dashboard opens a floating terminal to log in to Google immediately.
 - 🎨 **Antigravity CLI Status Bar**: Dynamic Omarchy theme-aware bottom status bar for `agy` displaying active Git branch/diff, RTK token killer status (`⚡ RTK`), Shunt-Local status (`󰘚 SL`), and balanced clock.
@@ -106,10 +106,10 @@ omarchy-antigravity statusline disable
 Antigravity is completely optional and non-intrusive:
 - **Switch anytime**: You can change your default agent whenever you like:
   ```bash
-  omarchy default agent claude
-  # or
-  omarchy default agent antigravity
+  omarchy default agent claude   # any of Omarchy's own agents
+  omarchy-antigravity default    # back to Antigravity
   ```
+  Omarchy's `omarchy default agent` only accepts its built-in agents, so Antigravity is set with `omarchy-antigravity default` (or `./install.sh --set-default`). Note that `gemini` is Omarchy's Gemini CLI, not Antigravity: a `gemini` default left by older releases of this plugin is moved to `antigravity` on install and on `omarchy update`.
 - **Real-Time Bar Sync**: The status bar panel automatically watches `~/.config/omarchy/defaults/agent`. When you switch default agents, the bar icon and panel immediately switch their active target to reflect your chosen agent without restarting the shell.
 - **Update Safety**: System updates via `omarchy update` will **never** overwrite your chosen default agent back to Antigravity if you have switched to another provider.
 
@@ -122,7 +122,7 @@ Antigravity is completely optional and non-intrusive:
 2. **Session-Aware Refresh & Low-Latency Cache**:
    To eliminate unnecessary network requests and idle disk writes, the collector inspects the OS process table (`pgrep -x agy`) and only queries remote servers when at least one active Antigravity session is running (or when `--force` is requested via manual refresh). While active, the bar refreshes Antigravity's limits every 2 minutes (`limitsRefreshIntervalSec`, default 120) and runs the full scan of every agent every 15 minutes (`refreshIntervalSec`, default 900), both configurable in `shell.json`; opening the panel also refreshes limits. The collector caches limits for 60 seconds and agy's `/usage` answer for 10 minutes, and every run finishes within a 50-second budget.
 3. **Dedicated CLI & Standard Permission Model**:
-   Ships a plugin-specific `omarchy-antigravity` executable in `~/.local/bin/` providing `run`, `auth`, `status`, and `refresh` subcommands. Executes `agy` using its standard permission model without bypassing permission prompts.
+   Ships a plugin-specific `omarchy-antigravity` executable in `~/.local/bin/` providing `run`, `auth`, `status`, `refresh`, `default`, and `statusline` subcommands. Executes `agy` using its standard permission model without bypassing permission prompts.
 4. **Bar Widget & Status Alerts**:
    Integrates into the Quickshell bar. When quota is low, authentication is missing, or usage could not be read completely, the bar button triggers an urgent visual alert for any agent in the panel, and a new problem also raises one desktop notification via `notify-send`. A spent window clears at its reset time, even while the panel is closed.
 5. **Update Hook**:

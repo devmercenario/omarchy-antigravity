@@ -88,6 +88,28 @@ if ! jq -e '.statusLine.enabled == false' "$agy_dir/settings.json" >/dev/null; t
   exit 1
 fi
 
+# `omarchy default agent antigravity` is rejected by Omarchy, so the helper
+# is how Antigravity becomes the default agent.
+echo "  ▶ Testing the default subcommand..."
+AGENT_FILE="$TEST_HOME/.config/omarchy/defaults/agent"
+mkdir -p "$(dirname "$AGENT_FILE")"
+echo "claude" > "$AGENT_FILE"
+default_out=$("$CLI" default)
+if [[ "$(cat "$AGENT_FILE")" != "antigravity" || ! -f "$TEST_HOME/.config/omarchy/antigravity.default" ]]; then
+  echo "❌ Assertion failed: default did not set antigravity and its opt-in marker." >&2
+  exit 1
+fi
+if ! echo "$default_out" | grep -q "was: claude" || ! ls "$AGENT_FILE".bak.* >/dev/null 2>&1; then
+  echo "❌ Assertion failed: default did not keep a backup of the previous agent." >&2
+  exit 1
+fi
+baks_before=$(ls "$AGENT_FILE".bak.* | wc -l)
+"$CLI" default >/dev/null
+if [[ "$(ls "$AGENT_FILE".bak.* | wc -l)" != "$baks_before" ]]; then
+  echo "❌ Assertion failed: re-running default backed up antigravity again." >&2
+  exit 1
+fi
+
 # 6. Test syntax of all shell scripts in bin/
 echo "  ▶ Testing bash syntax for bin scripts..."
 for script in "$PROJECT_ROOT"/bin/*; do

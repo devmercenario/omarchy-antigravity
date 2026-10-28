@@ -1,6 +1,6 @@
 #!/bin/bash
 # omarchy:summary=Antigravity integration helper for Omarchy
-# omarchy:args=[auth|status|refresh|statusline|help]
+# omarchy:args=[auth|status|refresh|default|statusline|help]
 # omarchy:group=agent
 
 set -euo pipefail
@@ -51,6 +51,7 @@ Commands:
   run [args...]   Execute Antigravity CLI (agy) using normal permission model
   status          Show current token, authentication state, and quotas
   refresh, update Force refresh quotas and update Omarchy bar widget
+  default         Make Antigravity Omarchy's default agent
   statusline      Manage Antigravity CLI status bar [status|enable|disable]
   help            Show this help message
 
@@ -63,6 +64,22 @@ case "$cmd" in
   run)
     shift
     exec agy "$@"
+    ;;
+  default)
+    # `omarchy default agent` only accepts Omarchy's own agents, so this is
+    # the way to pick Antigravity; the plugin's omarchy-agent launcher then
+    # opens agy from the keybinding, the menu and the bar.
+    config_dir="$HOME/.config/omarchy"
+    agent_file="$config_dir/defaults/agent"
+    mkdir -p "$config_dir/defaults"
+    current=""
+    [[ -f "$agent_file" ]] && current=$(tr -d '[:space:]' < "$agent_file")
+    if [[ "$current" != "antigravity" ]]; then
+      [[ -f "$agent_file" ]] && cp "$agent_file" "$agent_file.bak.$(date +%s)"
+      echo "antigravity" > "$agent_file"
+    fi
+    touch "$config_dir/antigravity.default"
+    echo "Antigravity is now the default agent${current:+ (was: $current)}."
     ;;
   auth|login)
     echo "Launching Antigravity authentication..."
