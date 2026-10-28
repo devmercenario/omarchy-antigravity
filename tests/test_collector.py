@@ -144,8 +144,8 @@ class TestQuotaParsing(unittest.TestCase):
         self.assertEqual(limits[3]["label"], "Weekly")
         self.assertAlmostEqual(limits[3]["percent"], 0.30, places=4)
 
-        # Verify disk cache written
-        self.assertTrue(os.path.exists(collector.CACHE_FILE))
+        # Caching is the caller's job, so a fallback call can't clobber the merged result.
+        self.assertFalse(os.path.exists(collector.CACHE_FILE))
 
     @patch("urllib.request.urlopen")
     def test_fetch_authoritative_limits_retry_success(self, mock_urlopen):
@@ -247,7 +247,6 @@ class TestQuotaParsing(unittest.TestCase):
             ],
         )
         self.assertEqual(limits[4]["resetsAt"], "2026-11-04T14:02:51Z")
-        self.assertTrue(os.path.exists(collector.CACHE_FILE))
 
     @patch("collector.resolve_tool", return_value="/usr/bin/agy")
     @patch("collector.run_bounded_stdout")
@@ -299,11 +298,14 @@ class TestKeyringAndAuthentication(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.orig_token_file = collector.TOKEN_FILE
+        self.orig_access_cache = collector.ACCESS_TOKEN_CACHE_FILE
         self.test_token_file = os.path.join(self.temp_dir, "test-oauth-token")
         collector.TOKEN_FILE = self.test_token_file
+        collector.ACCESS_TOKEN_CACHE_FILE = os.path.join(self.temp_dir, "access-token.json")
 
     def tearDown(self):
         collector.TOKEN_FILE = self.orig_token_file
+        collector.ACCESS_TOKEN_CACHE_FILE = self.orig_access_cache
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_get_token_from_file_found(self):
@@ -403,43 +405,72 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         self.assertEqual(data["token"]["access_token"], "keyring-tok")
         self.assertEqual(err, "")
 
-    def test_save_token_to_file(self):
-        sample_data = {"token": {"access_token": "new-token"}}
-        collector.save_token_to_file(sample_data)
-        self.assertTrue(os.path.exists(self.test_token_file))
-        st = os.stat(self.test_token_file)
-        self.assertEqual(st.st_mode & 0o777, 0o600)
-        self.assertEqual(st.st_uid, os.getuid())
-        with open(self.test_token_file, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        self.assertEqual(saved["token"]["access_token"], "new-token")
+    @patch("urllib.request.urlopen")
+    def test_refresh_never_writes_agy_credentials(self, mock_urlopen):
+        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        with open(self.test_token_file, "w", encoding="utf-8") as f:
+            json.dump({"token": {
+                "access_token": "expired", "refresh_token": "refresh-a", "expiry": past_exp,
+            }}, f)
+        os.chmod(self.test_token_file, 0o600)
+        with open(self.test_token_file, "rb") as f:
+            before = f.read()
+        mock_urlopen.return_value = FakeHTTPResponse(
+            json.dumps({"access_token": "minted", "expires_in": 3600})
+        )
 
-    def test_save_token_to_file_rejects_oversized_payload(self):
-        oversized = {"token": {"access_token": "x" * (collector.MAX_TOKEN_FILE_SIZE + 10)}}
+        token, err = collector.read_token()
+        access_token, err = collector.get_valid_access_token(token, err)
+
+        self.assertEqual(access_token, "minted")
+        with open(self.test_token_file, "rb") as f:
+            self.assertEqual(f.read(), before)
+        st = os.stat(collector.ACCESS_TOKEN_CACHE_FILE)
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+        with open(collector.ACCESS_TOKEN_CACHE_FILE, encoding="utf-8") as f:
+            cached = json.load(f)
+        self.assertEqual(cached["account"], collector.account_id(token))
+        self.assertNotIn("refresh-a", json.dumps(cached))
+
+    @patch("urllib.request.urlopen")
+    def test_refreshed_token_is_reused_for_the_same_account_only(self, mock_urlopen):
+        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        account_a = {"access_token": "old", "refresh_token": "refresh-a", "expiry": past_exp}
+        account_b = {"access_token": "old", "refresh_token": "refresh-b", "expiry": past_exp}
+        mock_urlopen.side_effect = [
+            FakeHTTPResponse(json.dumps({"access_token": "token-a", "expires_in": 3600})),
+            FakeHTTPResponse(json.dumps({"access_token": "token-b", "expires_in": 3600})),
+        ]
+
+        self.assertEqual(collector.get_valid_access_token(account_a)[0], "token-a")
+        self.assertEqual(collector.get_valid_access_token(account_a)[0], "token-a")
+        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(collector.get_valid_access_token(account_b)[0], "token-b")
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("urllib.request.urlopen", side_effect=urllib.error.URLError("offline"))
+    def test_refresh_failure_falls_back_to_stored_token(self, _mock_urlopen):
+        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        token = {"access_token": "stored", "refresh_token": "r", "expiry": past_exp}
         with patch("sys.stderr.write"):
-            collector.save_token_to_file(oversized)
-        self.assertFalse(os.path.exists(self.test_token_file))
+            self.assertEqual(collector.get_valid_access_token(token), ("stored", ""))
 
-    def test_save_token_to_file_replaces_symlink_safely(self):
-        victim_file = os.path.join(self.temp_dir, "victim-secret")
-        with open(victim_file, "w", encoding="utf-8") as f:
-            f.write("victim-secret-content")
-        os.symlink(victim_file, self.test_token_file)
+    @patch("collector.get_credentials")
+    def test_read_token_rejects_non_object_credentials(self, mock_cred):
+        # A keyring entry holding valid JSON of the wrong shape used to crash main().
+        mock_cred.return_value = (["not", "an", "object"], "keyring", "")
+        token, err = collector.read_token()
+        self.assertIsNone(token)
+        self.assertIn("Invalid token structure", err)
 
-        sample_data = {"token": {"access_token": "refreshed-safe-token"}}
-        collector.save_token_to_file(sample_data)
+        mock_cred.return_value = ({"token": "string"}, "keyring", "")
+        self.assertIsNone(collector.read_token()[0])
 
-        # Ensure symlink was replaced, not followed
-        self.assertFalse(os.path.islink(self.test_token_file))
-        # Ensure victim content was preserved
-        with open(victim_file, "r", encoding="utf-8") as f:
-            self.assertEqual(f.read(), "victim-secret-content")
-        # Ensure token file has new token and 0600 mode
-        st = os.stat(self.test_token_file)
-        self.assertEqual(st.st_mode & 0o777, 0o600)
-        data, err = collector.get_token_from_file()
-        self.assertIsNotNone(data)
-        self.assertEqual(data["token"]["access_token"], "refreshed-safe-token")
+    def test_token_freshness_handles_naive_and_garbage_expiry(self):
+        soon = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
+        self.assertTrue(collector._token_fresh(soon.isoformat()))
+        self.assertFalse(collector._token_fresh("not a date"))
+        self.assertTrue(collector._token_fresh(None))
 
     @patch("collector.resolve_tool", return_value="/usr/bin/secret-tool")
     @patch("collector.run_bounded_stdout")
@@ -494,69 +525,55 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         mock_bounded.return_value = (0, b"", True)
         self.assertIsNone(collector.fetch_limits_via_agy())
 
-    @patch("collector.get_credentials")
-    def test_get_valid_access_token_valid(self, mock_cred):
+    def test_get_valid_access_token_valid(self):
         future_exp = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-        mock_cred.return_value = ({
-            "token": {
-                "access_token": "valid-token",
-                "refresh_token": "refresh-token",
-                "expiry": future_exp
-            }
-        }, "file", "")
-
-        token, err = collector.get_valid_access_token()
+        token, err = collector.get_valid_access_token({
+            "access_token": "valid-token",
+            "refresh_token": "refresh-token",
+            "expiry": future_exp
+        })
         self.assertEqual(token, "valid-token")
         self.assertEqual(err, "")
 
-    @patch("collector.save_token_to_file")
-    @patch("urllib.request.urlopen")
-    @patch("collector.get_credentials")
-    def test_get_valid_access_token_refreshes_expired(self, mock_cred, mock_urlopen, mock_save):
-        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        mock_cred.return_value = ({
-            "token": {
-                "access_token": "expired-token",
-                "refresh_token": "valid-refresh-token",
-                "expiry": past_exp
-            }
-        }, "file", "")
+    def test_get_valid_access_token_without_credentials(self):
+        token, err = collector.get_valid_access_token(None, "No credentials here")
+        self.assertIsNone(token)
+        self.assertEqual(err, "No credentials here")
 
-        payload = json.dumps({
+    @patch("urllib.request.urlopen")
+    def test_get_valid_access_token_refreshes_expired(self, mock_urlopen):
+        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        mock_urlopen.return_value = FakeHTTPResponse(json.dumps({
             "access_token": "new-refreshed-token",
             "expires_in": 3600
-        }).encode("utf-8")
-        mock_urlopen.return_value = FakeHTTPResponse(payload)
+        }))
 
-        token, err = collector.get_valid_access_token()
+        token, err = collector.get_valid_access_token({
+            "access_token": "expired-token",
+            "refresh_token": "valid-refresh-token",
+            "expiry": past_exp
+        })
         self.assertEqual(token, "new-refreshed-token")
         self.assertEqual(err, "")
-        mock_save.assert_called_once()
 
-    @patch("collector.save_token_to_file")
     @patch("urllib.request.urlopen")
-    @patch("collector.get_credentials")
-    def test_strict_client_refuses_refresh_without_env(self, mock_cred, mock_urlopen, mock_save):
-        mock_cred.return_value = ({"token": {"refresh_token": "refresh"}}, "file", "")
+    def test_strict_client_refuses_refresh_without_env(self, mock_urlopen):
         orig = collector.STRICT_CLIENT
         collector.STRICT_CLIENT = True
         try:
             with patch.dict(os.environ, {}, clear=True), patch("sys.stderr.write") as mock_err:
-                token, err = collector.get_valid_access_token()
+                token, err = collector.get_valid_access_token({"refresh_token": "refresh"})
             self.assertIsNone(token)
             mock_urlopen.assert_not_called()
-            mock_save.assert_not_called()
+            self.assertFalse(os.path.exists(collector.ACCESS_TOKEN_CACHE_FILE))
             self.assertTrue(
                 any("strict client mode" in str(call) for call in mock_err.call_args_list)
             )
         finally:
             collector.STRICT_CLIENT = orig
 
-    @patch("collector.save_token_to_file")
     @patch("urllib.request.urlopen")
-    @patch("collector.get_credentials")
-    def test_strict_client_allows_refresh_with_env(self, mock_cred, mock_urlopen, mock_save):
-        mock_cred.return_value = ({"token": {"refresh_token": "refresh"}}, "file", "")
+    def test_strict_client_allows_refresh_with_env(self, mock_urlopen):
         mock_urlopen.return_value = FakeHTTPResponse(
             json.dumps({"access_token": "strict-token", "expires_in": 3600}).encode("utf-8")
         )
@@ -567,17 +584,14 @@ class TestKeyringAndAuthentication(unittest.TestCase):
                 "ANTIGRAVITY_CLIENT_ID": "client-id",
                 "ANTIGRAVITY_CLIENT_SECRET": "client-secret",
             }):
-                token, err = collector.get_valid_access_token()
+                token, err = collector.get_valid_access_token({"refresh_token": "refresh"})
             self.assertEqual(token, "strict-token")
             mock_urlopen.assert_called_once()
         finally:
             collector.STRICT_CLIENT = orig
 
-    @patch("collector.save_token_to_file")
     @patch("urllib.request.urlopen")
-    @patch("collector.get_credentials")
-    def test_non_strict_uses_builtin_client(self, mock_cred, mock_urlopen, mock_save):
-        mock_cred.return_value = ({"token": {"refresh_token": "refresh"}}, "file", "")
+    def test_non_strict_uses_builtin_client(self, mock_urlopen):
         mock_urlopen.return_value = FakeHTTPResponse(
             json.dumps({"access_token": "default-token", "expires_in": 3600}).encode("utf-8")
         )
@@ -585,7 +599,7 @@ class TestKeyringAndAuthentication(unittest.TestCase):
         collector.STRICT_CLIENT = False
         try:
             with patch.dict(os.environ, {}, clear=True):
-                token, err = collector.get_valid_access_token()
+                token, err = collector.get_valid_access_token({"refresh_token": "refresh"})
             self.assertEqual(token, "default-token")
             mock_urlopen.assert_called_once()
         finally:
@@ -633,9 +647,30 @@ class TestLocalStats(unittest.TestCase):
 
         self.assertEqual(stats["todayPrompts"], 2)
         self.assertEqual(stats["totalPrompts"], 2)
+        # Prompts without a conversation id count together as one session.
         self.assertEqual(stats["todaySessions"], 1)
         self.assertEqual(stats["totalSessions"], 2)
         self.assertEqual(len(stats["recentDays"]), 7)
+
+    def test_today_sessions_counts_distinct_conversations(self):
+        now_ms = time.time() * 1000
+        yesterday_ms = now_ms - 2 * 86400 * 1000
+        lines = [
+            json.dumps({"timestamp": now_ms, "conversationId": "a"}),
+            json.dumps({"timestamp": now_ms, "conversationId": "a"}),
+            json.dumps({"timestamp": now_ms, "conversationId": "b"}),
+            json.dumps({"timestamp": now_ms}),
+            json.dumps({"timestamp": yesterday_ms, "conversationId": "c"}),
+        ]
+        with open(self.history_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        stats = collector.collect_local_stats()
+        self.assertEqual(stats["todayPrompts"], 4)
+        self.assertEqual(stats["todaySessions"], 3)
+        # The cached aggregation carries the session count too.
+        with patch("collector._scan_history", side_effect=AssertionError("unexpected rescan")):
+            self.assertEqual(collector.collect_local_stats()["todaySessions"], 3)
 
     def test_collect_local_stats_ignores_symlinked_history(self):
         real = os.path.join(self.temp_dir, "real-history.jsonl")
@@ -686,44 +721,53 @@ class TestLocalStats(unittest.TestCase):
 class TestMainExecutionScenarios(unittest.TestCase):
     """Test overall collector behavior under various system conditions."""
 
+    SANDBOXED_PATHS = {
+        "CACHE_FILE": "limits.json",
+        "AGY_CACHE_FILE": "agy-usage.json",
+        "ACCESS_TOKEN_CACHE_FILE": "access-token.json",
+        "ACCOUNT_CACHE_FILE": "account.json",
+        "ALERT_STATE_FILE": "alert.json",
+        "GROUPS_STATE_FILE": "groups.json",
+        # Keep history/brain inside the sandbox so tests never read or write
+        # the developer/CI machine's real data.
+        "HISTORY_FILE": "history.jsonl",
+        "BRAIN_DIR": "brain",
+        "HISTORY_CACHE_FILE": "history-cache.json",
+        # A state file that does not exist yet, so the session-suspension early
+        # return is never triggered by one on the developer/CI machine.
+        "STATE_FILE": "state.json",
+    }
+
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.orig_cache_dir = collector.CACHE_DIR
-        self.orig_cache_file = collector.CACHE_FILE
-        self.orig_user_cache = collector.USER_CACHE_FILE
-        self.orig_state_dir = collector.STATE_DIR
-        self.orig_state_file = collector.STATE_FILE
-        self.orig_history_file = collector.HISTORY_FILE
-        self.orig_brain_dir = collector.BRAIN_DIR
-        self.orig_history_cache = collector.HISTORY_CACHE_FILE
+        self.orig_paths = {name: getattr(collector, name) for name in self.SANDBOXED_PATHS}
+        self.orig_paths["CACHE_DIR"] = collector.CACHE_DIR
+        self.orig_paths["STATE_DIR"] = collector.STATE_DIR
         collector.CACHE_DIR = self.temp_dir
-        collector.CACHE_FILE = os.path.join(self.temp_dir, "limits.json")
-        collector.USER_CACHE_FILE = os.path.join(self.temp_dir, "user.json")
-        # Keep history/brain inside the sandbox so tests never read or write the
-        # developer/CI machine's real data.
-        collector.HISTORY_FILE = os.path.join(self.temp_dir, "history.jsonl")
-        collector.BRAIN_DIR = os.path.join(self.temp_dir, "brain")
-        collector.HISTORY_CACHE_FILE = os.path.join(self.temp_dir, "history-cache.json")
-        # Point the state file at a path that does not exist yet, so the
-        # session-suspension early return is never triggered by a pre-existing
-        # state file on the developer/CI machine.
         collector.STATE_DIR = self.temp_dir
-        collector.STATE_FILE = os.path.join(self.temp_dir, "state.json")
-        # Never pop real desktop notifications from the test suite.
-        notify_patcher = patch("collector.notify_status_change")
-        self.mock_notify = notify_patcher.start()
-        self.addCleanup(notify_patcher.stop)
+        for name, filename in self.SANDBOXED_PATHS.items():
+            setattr(collector, name, os.path.join(self.temp_dir, filename))
+        # Never pop real desktop notifications, read the developer's real
+        # credentials, or look the account up over the network.
+        for target, attr, value in (
+            ("collector.notify_status_change", "mock_notify", None),
+            ("collector.read_token", "mock_read_token", ({"refresh_token": "r"}, "")),
+            ("collector.resolve_account", "mock_account", ("", "")),
+        ):
+            patcher = patch(target, return_value=value)
+            setattr(self, attr, patcher.start())
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
-        collector.CACHE_DIR = self.orig_cache_dir
-        collector.CACHE_FILE = self.orig_cache_file
-        collector.USER_CACHE_FILE = self.orig_user_cache
-        collector.STATE_DIR = self.orig_state_dir
-        collector.STATE_FILE = self.orig_state_file
-        collector.HISTORY_FILE = self.orig_history_file
-        collector.BRAIN_DIR = self.orig_brain_dir
-        collector.HISTORY_CACHE_FILE = self.orig_history_cache
+        for name, value in self.orig_paths.items():
+            setattr(collector, name, value)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def seen_groups(self, *groups):
+        """Record ``groups`` as reported a minute ago."""
+        with open(collector.GROUPS_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({g: time.time() - 60 for g in groups}, f)
+        os.chmod(collector.GROUPS_STATE_FILE, 0o600)
 
     @patch("collector.is_agy_running", return_value=True)
     @patch("collector.resolve_tool", return_value=None)
@@ -770,7 +814,7 @@ class TestMainExecutionScenarios(unittest.TestCase):
             self.assertIn("No Antigravity credentials", record["authHelpText"])
             self.assertTrue(record["authRequired"])
             self.assertEqual(record["limits"], [])
-            self.assertEqual(record["tierLabel"], "Pro")
+            self.assertEqual(record["tierLabel"], "")
             self.mock_notify.assert_called_once_with("Waiting for auth", record["authHelpText"])
 
     COMPLETE_LIMITS = [
@@ -778,46 +822,82 @@ class TestMainExecutionScenarios(unittest.TestCase):
         {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
     ]
 
-    @patch("collector.resolve_tool")
-    @patch("collector.fetch_limits_via_agy", return_value=None)
+    def run_main(self, argv=None):
+        with patch("builtins.print") as mock_print:
+            self.assertEqual(collector.main(argv=argv or []), 0)
+        mock_print.assert_called_once()
+        return json.loads(mock_print.call_args[0][0])
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy")
     @patch("collector.fetch_authoritative_limits")
-    @patch("collector.get_cached_user_email")
-    @patch("collector.get_valid_access_token")
-    def test_main_authenticated_healthy(self, mock_auth, mock_email, mock_limits, _mock_agy, mock_which):
-        mock_which.return_value = "/usr/bin/agy"
-        mock_auth.return_value = ("valid-token", "")
-        mock_email.return_value = "developer@example.com"
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_authenticated_healthy(self, _auth, mock_limits, mock_agy, _which):
+        self.mock_account.return_value = ("developer@example.com", "Google AI Pro")
         mock_limits.return_value = self.COMPLETE_LIMITS
 
-        with patch("builtins.print") as mock_print:
-            collector.main(argv=[])
-            mock_print.assert_called_once()
-            output_str = mock_print.call_args[0][0]
-            record = json.loads(output_str)
+        record = self.run_main()
 
-            self.assertEqual(record["schemaVersion"], 1)
-            self.assertEqual(record["id"], "antigravity")
-            self.assertEqual(record["usageStatusText"], "")
-            self.assertFalse(record["authRequired"])
-            self.assertEqual(record["tierLabel"], "Pro · developer@example.com")
-            self.assertEqual(len(record["limits"]), 2)
-            self.mock_notify.assert_called_once_with("", "")
+        # The API covered both shared pools, so agy (and its MCP servers) stayed idle.
+        mock_agy.assert_not_called()
+        self.assertEqual(record["usageStatusText"], "")
+        self.assertFalse(record["authRequired"])
+        self.assertEqual(record["tierLabel"], "Google AI Pro · developer@example.com")
+        self.assertEqual(record["recentDaysUnit"], "prompts")
+        self.assertEqual(len(record["limits"]), 2)
+        self.mock_notify.assert_called_once_with("", "")
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy")
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_fills_pools_the_api_dropped_from_agy(self, _auth, mock_limits, mock_agy, _which):
+        # The quota API's current shape: only the Claude/GPT pool comes back.
+        mock_limits.return_value = [
+            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.1, "resetsAt": ""},
+        ]
+        mock_agy.return_value = [
+            {"title": "Gemini (5h)", "label": "Session", "percent": 0.42, "resetsAt": ""},
+            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.9, "resetsAt": ""},
+            {"title": "Gemini 4 Argon (Weekly)", "label": "Weekly", "percent": 0.12, "resetsAt": ""},
+        ]
+
+        record = self.run_main(["--force"])
+
+        self.assertEqual(record["usageStatusText"], "")
+        self.assertEqual(
+            [(item["title"], item["percent"]) for item in record["limits"]],
+            [("Gemini (5h)", 0.42), ("Claude/GPT (5h)", 0.1), ("Gemini 4 Argon (Weekly)", 0.12)],
+        )
 
     @patch("collector.resolve_tool", return_value="/usr/bin/agy")
     @patch("collector.fetch_limits_via_agy", return_value=None)
     @patch("collector.fetch_authoritative_limits")
-    @patch("collector.get_cached_user_email", return_value="")
     @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
-    def test_main_flags_missing_quota_group(self, _auth, _email, mock_limits, _agy, _which):
-        # The quota API's current shape: only the Claude/GPT pool comes back.
+    def test_agy_answer_is_cached_even_when_it_fails(self, _auth, mock_limits, mock_agy, _which):
+        mock_limits.return_value = [
+            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
+        ]
+        self.run_main()
+        # Drop the combined cache so the second run goes back to the sources.
+        os.unlink(collector.CACHE_FILE)
+        self.run_main()
+
+        self.assertEqual(mock_limits.call_count, 2)
+        mock_agy.assert_called_once()
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_flags_missing_quota_group(self, _auth, mock_limits, _agy, _which):
+        self.seen_groups("Gemini", "Claude/GPT")
         mock_limits.return_value = [
             {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
             {"title": "Claude/GPT (Weekly)", "label": "Weekly", "percent": 0.0, "resetsAt": ""},
         ]
 
-        with patch("builtins.print") as mock_print:
-            collector.main(argv=["--force"])
-            record = json.loads(mock_print.call_args[0][0])
+        record = self.run_main(["--force"])
 
         self.assertEqual(record["usageStatusText"], "Usage incomplete")
         self.assertIn("Gemini", record["authHelpText"])
@@ -828,73 +908,71 @@ class TestMainExecutionScenarios(unittest.TestCase):
         self.mock_notify.assert_called_once_with("Usage incomplete", record["authHelpText"])
 
     @patch("collector.resolve_tool", return_value="/usr/bin/agy")
-    @patch("collector.fetch_limits_via_agy", return_value=[])
+    @patch("collector.fetch_limits_via_agy", return_value=None)
     @patch("collector.fetch_authoritative_limits")
-    @patch("collector.get_cached_user_email", return_value="")
     @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
-    def test_main_flags_empty_quota_response(self, _auth, _email, mock_limits, _agy, _which):
-        with patch("builtins.print") as mock_print:
-            collector.main(argv=["--force"])
-            record = json.loads(mock_print.call_args[0][0])
+    def test_main_does_not_flag_a_pool_the_account_never_had(self, _auth, mock_limits, _agy, _which):
+        mock_limits.return_value = [
+            {"title": "Gemini (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
+        ]
+        self.assertEqual(self.run_main(["--force"])["usageStatusText"], "")
 
-        mock_limits.assert_not_called()
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
+    @patch("collector.fetch_authoritative_limits", return_value=[])
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_flags_empty_quota_response(self, _auth, _limits, _agy, _which):
+        record = self.run_main(["--force"])
         self.assertEqual(record["usageStatusText"], "Usage incomplete")
-        self.assertIn("Gemini and Claude/GPT", record["authHelpText"])
+        self.assertIn("any quota", record["authHelpText"])
 
-    @patch("collector.resolve_tool")
-    @patch("collector.fetch_limits_via_agy")
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.fetch_limits_via_agy", return_value=None)
     @patch("collector.fetch_authoritative_limits")
-    @patch("collector.get_cached_user_email")
-    @patch("collector.get_valid_access_token")
-    def test_main_quota_failure_sets_error_and_empty_limits(self, mock_auth, mock_email, mock_limits, mock_agy, mock_which):
-        mock_which.return_value = "/usr/bin/agy"
-        mock_auth.return_value = ("valid-token", "")
-        mock_email.return_value = "developer@example.com"
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_quota_failure_sets_error_and_empty_limits(self, _auth, mock_limits, _agy, _which):
         mock_limits.side_effect = urllib.error.URLError("Quota endpoint down")
-        mock_agy.return_value = None
 
         # Put a stale cache file in place to ensure it is NOT used when quota fails
         with open(collector.CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump({"limits": [{"title": "Stale Gemini", "percent": 0.5}], "fetchedAt": 1000}, f)
 
-        with patch("builtins.print") as mock_print:
-            collector.main(argv=["--force"])
-            mock_print.assert_called_once()
-            output_str = mock_print.call_args[0][0]
-            record = json.loads(output_str)
+        with patch("sys.stderr.write"):
+            record = self.run_main(["--force"])
 
-            self.assertEqual(record["schemaVersion"], 1)
-            self.assertEqual(record["id"], "antigravity")
-            self.assertEqual(record["usageStatusText"], "Quota unavailable")
-            self.assertIn("Failed to retrieve quota", record["authHelpText"])
-            self.assertEqual(record["limits"], [])
+        self.assertEqual(record["usageStatusText"], "Quota unavailable")
+        self.assertIn("Failed to retrieve quota", record["authHelpText"])
+        self.assertEqual(record["limits"], [])
 
-    @patch("collector.resolve_tool")
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
     @patch("collector.fetch_limits_via_agy")
     @patch("collector.fetch_authoritative_limits")
-    @patch("collector.get_cached_user_email")
-    @patch("collector.get_valid_access_token")
-    def test_main_prefers_agy_usage_over_api(self, mock_auth, mock_email, mock_limits, mock_agy, mock_which):
-        mock_which.return_value = "/usr/bin/agy"
-        mock_auth.return_value = ("valid-token", "")
-        mock_email.return_value = "developer@example.com"
-        mock_agy.return_value = [
-            {"title": "Gemini (5h)", "label": "Session", "percent": 0.42, "resetsAt": "2026-09-08T22:56:17Z"},
-            {"title": "Claude/GPT (5h)", "label": "Session", "percent": 0.0, "resetsAt": ""},
-        ]
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_uses_agy_when_the_api_fails(self, _auth, mock_limits, mock_agy, _which):
+        mock_limits.side_effect = urllib.error.URLError("Quota endpoint down")
+        mock_agy.return_value = self.COMPLETE_LIMITS
 
-        with patch("builtins.print") as mock_print:
-            collector.main(argv=["--force"])
-            mock_print.assert_called_once()
-            output_str = mock_print.call_args[0][0]
-            record = json.loads(output_str)
+        with patch("sys.stderr.write"):
+            record = self.run_main(["--force"])
 
-            mock_limits.assert_not_called()
-            self.assertEqual(record["schemaVersion"], 1)
-            self.assertEqual(record["id"], "antigravity")
-            self.assertEqual(record["usageStatusText"], "")
-            self.assertEqual(len(record["limits"]), 2)
-            self.assertEqual(record["limits"][0]["percent"], 0.42)
+        self.assertEqual(record["usageStatusText"], "")
+        self.assertEqual(record["limits"], self.COMPLETE_LIMITS)
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/agy")
+    @patch("collector.collect_local_stats", side_effect=RuntimeError("history exploded"))
+    @patch("collector.fetch_authoritative_limits")
+    @patch("collector.get_valid_access_token", return_value=("valid-token", ""))
+    def test_main_turns_a_crash_into_an_error_record(self, _auth, mock_limits, _stats, _which):
+        mock_limits.return_value = self.COMPLETE_LIMITS
+
+        with patch("sys.stderr.write"):
+            record = self.run_main(["--force"])
+
+        self.assertEqual(record["usageStatusText"], "Collector error")
+        self.assertIn("history exploded", record["authHelpText"])
+        self.assertFalse(record["authRequired"])
+        # The last limits stay on screen for context.
+        self.assertEqual(len(record["limits"]), 2)
 
     @patch("collector.resolve_tool", return_value="/usr/bin/pgrep")
     @patch("subprocess.run")
@@ -930,13 +1008,11 @@ class TestMainExecutionScenarios(unittest.TestCase):
     @patch("collector.get_valid_access_token")
     @patch("collector.fetch_limits_via_agy", return_value=None)
     @patch("collector.fetch_authoritative_limits")
-    @patch("collector.get_cached_user_email")
-    def test_main_forced_bypasses_session_check(self, mock_email, mock_limits, _mock_agy, mock_auth, mock_which, mock_exists, mock_running):
+    def test_main_forced_bypasses_session_check(self, mock_limits, _mock_agy, mock_auth, mock_which, mock_exists, mock_running):
         mock_exists.side_effect = lambda path: True if path == collector.STATE_FILE else False
         mock_running.return_value = False
         mock_which.return_value = "/usr/bin/agy"
         mock_auth.return_value = ("token", "")
-        mock_email.return_value = "user@example.com"
         mock_limits.return_value = []
 
         with patch("builtins.print") as mock_print:
@@ -1051,39 +1127,25 @@ class TestBoundedNetworkReads(unittest.TestCase):
             collector.fetch_authoritative_limits("fake-token")
         self.assertEqual(mock_urlopen.call_count, 1)
 
-    @patch("collector.save_token_to_file")
+    @patch("collector.save_private_json")
     @patch("urllib.request.urlopen")
-    @patch("collector.get_credentials")
-    def test_oauth_refresh_oversized_response_is_discarded(self, mock_cred, mock_urlopen, mock_save):
-        past_exp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        mock_cred.return_value = ({
-            "token": {
-                "refresh_token": "valid-refresh-token",
-            }
-        }, "file", "")
+    def test_oauth_refresh_oversized_response_is_discarded(self, mock_urlopen, mock_save):
         mock_urlopen.return_value = FakeHTTPResponse(
             b"{" + b"a" * (collector.OAUTH_TOKEN_RESPONSE_MAX_BYTES + 1)
         )
 
-        token, err = collector.get_valid_access_token()
+        with patch("sys.stderr.write"):
+            token, err = collector.get_valid_access_token({"refresh_token": "valid-refresh-token"})
         self.assertIsNone(token)
         self.assertIn("Unable to obtain valid access token", err)
         mock_save.assert_not_called()
 
-    @patch("os.path.expanduser")
     @patch("urllib.request.urlopen")
-    def test_userinfo_oversized_response_returns_empty(self, mock_urlopen, mock_expand):
-        missing_accounts = "/nonexistent/antigravity-google_accounts.json"
-        mock_expand.side_effect = lambda p: missing_accounts if p.endswith("google_accounts.json") else p
-        orig_user_cache = collector.USER_CACHE_FILE
-        collector.USER_CACHE_FILE = "/nonexistent/antigravity-user-cache.json"
-        try:
-            mock_urlopen.return_value = FakeHTTPResponse(
-                b"{" + b"a" * (collector.USERINFO_RESPONSE_MAX_BYTES + 1)
-            )
-            self.assertEqual(collector.get_cached_user_email("fake-token"), "")
-        finally:
-            collector.USER_CACHE_FILE = orig_user_cache
+    def test_userinfo_oversized_response_returns_empty(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse(
+            b"{" + b"a" * (collector.USERINFO_RESPONSE_MAX_BYTES + 1)
+        )
+        self.assertEqual(collector._fetch_email("fake-token"), "")
 
     def test_read_private_json_rejects_oversized_file(self):
         path = os.path.join(tempfile.mkdtemp(), "big.json")
@@ -1105,19 +1167,27 @@ class TestBoundedNetworkReads(unittest.TestCase):
         data, _ = collector.read_private_json(link)
         self.assertIsNone(data)
 
-    def test_get_cached_user_email_reads_google_accounts_descriptor(self):
-        tmp = tempfile.mkdtemp()
-        acc = os.path.join(tmp, "google_accounts.json")
-        with open(acc, "w", encoding="utf-8") as f:
-            json.dump({"active": "user@example.com"}, f)
-        os.chmod(acc, 0o600)
-        orig_user_cache = collector.USER_CACHE_FILE
-        collector.USER_CACHE_FILE = os.path.join(tmp, "missing-user.json")
+    @patch("urllib.request.urlopen")
+    def test_quota_auth_errors_are_not_retried(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://example.invalid/quota", 403, "Forbidden", {}, io.BytesIO(b"denied")
+        )
+        with self.assertRaises(collector.HttpFetchError) as ctx:
+            collector.fetch_authoritative_limits("fake-token")
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    @patch("urllib.request.urlopen")
+    def test_requests_stop_when_the_run_budget_is_spent(self, mock_urlopen):
+        collector.start_run_budget(0)
         try:
-            with patch("os.path.expanduser", side_effect=lambda p: acc if p.endswith("google_accounts.json") else p):
-                self.assertEqual(collector.get_cached_user_email("fake-token"), "user@example.com")
+            with self.assertRaises(collector.HttpFetchError):
+                collector.fetch_json(
+                    urllib.request.Request("https://example.invalid"), 10, 1024, "probe"
+                )
         finally:
-            collector.USER_CACHE_FILE = orig_user_cache
+            collector._deadline = None
+        mock_urlopen.assert_not_called()
 
     @patch("urllib.request.urlopen")
     def test_http_error_body_is_bounded_and_reported(self, mock_urlopen):
@@ -1246,27 +1316,133 @@ class TestStatusNotification(unittest.TestCase):
         collector.notify_status_change("", "")
         mock_run.assert_not_called()
 
-        collector.notify_status_change("Usage incomplete", "Gemini missing")
-        collector.notify_status_change("Usage incomplete", "Gemini missing")
+        # The first sighting may be a blip; the second one notifies, once.
+        collector.notify_status_change("Usage incomplete", "Gemini <missing> & co")
+        mock_run.assert_not_called()
+        collector.notify_status_change("Usage incomplete", "Gemini <missing> & co")
+        collector.notify_status_change("Usage incomplete", "Gemini <missing> & co")
         self.assertEqual(mock_run.call_count, 1)
         args = mock_run.call_args[0][0]
         self.assertEqual(args[0], "/usr/bin/notify-send")
         self.assertIn("Antigravity: Usage incomplete", args)
-        self.assertIn("Gemini missing", args)
+        # The body is escaped for daemons that render Pango markup.
+        self.assertIn("Gemini &lt;missing&gt; &amp; co", args)
 
         collector.notify_status_change("", "")
         collector.notify_status_change("Usage incomplete", "Gemini missing")
+        collector.notify_status_change("Usage incomplete", "Gemini missing")
         self.assertEqual(mock_run.call_count, 2)
+
+    @patch("collector.resolve_tool", return_value="/usr/bin/notify-send")
+    @patch("subprocess.run")
+    def test_a_single_blip_never_notifies(self, mock_run, _tool):
+        collector.notify_status_change("Quota unavailable", "down")
+        collector.notify_status_change("", "")
+        collector.notify_status_change("Quota unavailable", "down")
+        collector.notify_status_change("", "")
+        mock_run.assert_not_called()
 
     @patch("collector.resolve_tool", return_value=None)
     @patch("subprocess.run")
     def test_missing_notify_send_is_silent(self, mock_run, _tool):
+        collector.notify_status_change("Quota unavailable", "down")
         collector.notify_status_change("Quota unavailable", "down")
         mock_run.assert_not_called()
 
     def test_check_limits_complete_leaves_existing_status(self):
         status, detail = collector._check_limits_complete([], "Waiting for auth", "sign in")
         self.assertEqual((status, detail), ("Waiting for auth", "sign in"))
+
+
+class TestGroupTracking(unittest.TestCase):
+    """Missing pools are judged against what this account reported recently."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_groups_file = collector.GROUPS_STATE_FILE
+        collector.GROUPS_STATE_FILE = os.path.join(self.temp_dir, "groups.json")
+
+    def tearDown(self):
+        collector.GROUPS_STATE_FILE = self.orig_groups_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def limits(*titles):
+        return [{"title": t, "label": "Session"} for t in titles]
+
+    def test_missing_pool_is_reported_until_it_is_forgotten(self):
+        now = 1_000_000.0
+        collector.track_limit_groups(self.limits("Gemini (5h)", "Claude/GPT (5h)"), now)
+
+        self.assertEqual(collector.track_limit_groups(self.limits("Claude/GPT (5h)"), now + 60), ["Gemini"])
+        later = now + collector.GROUP_MEMORY_SECONDS + 1
+        self.assertEqual(collector.track_limit_groups(self.limits("Claude/GPT (5h)"), later), [])
+        self.assertEqual(collector.known_limit_groups(later), {"Claude/GPT"})
+
+    def test_steady_state_does_not_rewrite_the_file(self):
+        now = 1_000_000.0
+        collector.track_limit_groups(self.limits("Gemini (5h)"), now)
+        mtime = os.stat(collector.GROUPS_STATE_FILE).st_mtime_ns
+        with patch("collector.save_private_json") as mock_save:
+            collector.track_limit_groups(self.limits("Gemini (5h)"), now + 60)
+        mock_save.assert_not_called()
+        self.assertEqual(os.stat(collector.GROUPS_STATE_FILE).st_mtime_ns, mtime)
+
+
+class TestAccountResolution(unittest.TestCase):
+    """The email/plan label follows the signed-in account."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_account_file = collector.ACCOUNT_CACHE_FILE
+        collector.ACCOUNT_CACHE_FILE = os.path.join(self.temp_dir, "account.json")
+
+    def tearDown(self):
+        collector.ACCOUNT_CACHE_FILE = self.orig_account_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @patch("collector._fetch_tier", side_effect=["Google AI Pro", "Google AI Ultra"])
+    @patch("collector._fetch_email", side_effect=["a@example.com", "b@example.com"])
+    def test_switching_accounts_refreshes_email_and_plan(self, mock_email, _tier):
+        get_token = MagicMock(return_value="token")
+        self.assertEqual(collector.resolve_account("acct-a", get_token), ("a@example.com", "Google AI Pro"))
+        self.assertEqual(collector.resolve_account("acct-a", get_token), ("a@example.com", "Google AI Pro"))
+        self.assertEqual(mock_email.call_count, 1)
+        self.assertEqual(collector.resolve_account("acct-b", get_token), ("b@example.com", "Google AI Ultra"))
+
+    @patch("collector._fetch_tier", return_value="")
+    @patch("collector._fetch_email", return_value="")
+    def test_failed_lookup_is_not_cached(self, mock_email, _tier):
+        get_token = MagicMock(return_value="token")
+        collector.resolve_account("acct-a", get_token)
+        collector.resolve_account("acct-a", get_token)
+        self.assertEqual(mock_email.call_count, 2)
+
+    def test_no_account_needs_no_token(self):
+        get_token = MagicMock()
+        self.assertEqual(collector.resolve_account("", get_token), ("", ""))
+        get_token.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_tier_prefers_the_paid_plan(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse(json.dumps({
+            "currentTier": {"id": "free-tier", "name": "Antigravity"},
+            "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"},
+        }))
+        self.assertEqual(collector._fetch_tier("token"), "Google AI Pro")
+
+
+class TestChildProcesses(unittest.TestCase):
+    """A helper killed on timeout takes its own children with it."""
+
+    def test_timeout_kills_the_whole_process_group(self):
+        marker = tempfile.mktemp()
+        # The grandchild would create the marker after the parent is killed.
+        script = f"(sleep 1.5; touch {marker}) & sleep 30"
+        code, _out, truncated = collector.run_bounded_stdout(["/bin/sh", "-c", script], timeout=0.5)
+        self.assertTrue(truncated)
+        time.sleep(2)
+        self.assertFalse(os.path.exists(marker))
 
 
 class TestObservability(unittest.TestCase):

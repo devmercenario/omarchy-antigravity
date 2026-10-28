@@ -4,10 +4,13 @@
 # omarchy:hidden=true
 
 import argparse
+import hashlib
+import html
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -35,23 +38,36 @@ OAUTH_CLIENT_SECRET = os.getenv("ANTIGRAVITY_CLIENT_SECRET") or _DEFAULT_OAUTH_C
 STRICT_CLIENT = os.getenv("ANTIGRAVITY_STRICT_CLIENT", "").strip().lower() in (
     "1", "true", "yes", "on"
 )
-QUOTA_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+CODE_ASSIST_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com/v1internal"
+QUOTA_ENDPOINT = f"{CODE_ASSIST_ENDPOINT}:retrieveUserQuotaSummary"
 CACHE_DIR = os.path.expanduser("~/.cache/omarchy/agent-usage")
 CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-limits.json")
-USER_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-user.json")
+AGY_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-agy-usage.json")
+ACCESS_TOKEN_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-access-token.json")
+ACCOUNT_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-account.json")
 HISTORY_CACHE_FILE = os.path.join(CACHE_DIR, "antigravity-history.json")
 ALERT_STATE_FILE = os.path.join(CACHE_DIR, "antigravity-alert.json")
-STATE_DIR = os.path.expanduser("~/.local/state/omarchy/agents/usage")
+GROUPS_STATE_FILE = os.path.join(CACHE_DIR, "antigravity-groups.json")
+STATE_DIR = os.path.join(
+    os.getenv("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "omarchy", "agents", "usage",
+)
 STATE_FILE = os.path.join(STATE_DIR, "antigravity.json")
-# Quota now comes from spawning `agy -p /usage` (several seconds and ~1.5 s of
-# CPU), so the cache rides out the panel's 60-second polling instead of
-# relaunching the CLI on every tick.
-CACHE_TTL_SECONDS = 120
+CACHE_TTL_SECONDS = 60
+# The quota API is cheap but stopped reporting the Gemini pools. `agy -p
+# /usage` still reports them, yet every call starts all of the user's MCP
+# servers, so its answer is reused for much longer than the API's.
+AGY_USAGE_TTL_SECONDS = 600
 AGY_USAGE_TIMEOUT_SECONDS = 20
-# The two shared pools every Antigravity account reports. A response missing
-# either one means the upstream format changed under us, which must be
-# surfaced instead of silently dropping a meter from the panel.
-EXPECTED_LIMIT_GROUPS = ("Gemini", "Claude/GPT")
+# Whole-run wall-clock budget, kept under the updater's `timeout 60` so a slow
+# network ends in a record that says so instead of a killed collector.
+RUN_BUDGET_SECONDS = 50
+# The shared pools agy is consulted for whenever the API leaves one out.
+SHARED_LIMIT_GROUPS = ("Gemini", "Claude/GPT")
+# A pool that stops being reported is flagged for this long after it was last
+# seen; after that it is treated as retired upstream and forgotten.
+GROUP_MEMORY_SECONDS = 7 * 24 * 3600
+GROUP_SEEN_REFRESH_SECONDS = 3600
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 HISTORY_FILE = os.path.expanduser("~/.gemini/antigravity-cli/history.jsonl")
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity-cli/brain")
@@ -67,8 +83,11 @@ RETRY_DELAY_SECONDS = 2
 # allocate before the body is rejected.
 OAUTH_TOKEN_RESPONSE_MAX_BYTES = 16 * 1024
 USERINFO_RESPONSE_MAX_BYTES = 16 * 1024
+CODE_ASSIST_RESPONSE_MAX_BYTES = 64 * 1024
 QUOTA_RESPONSE_MAX_BYTES = 256 * 1024
 HTTP_ERROR_BODY_MAX_BYTES = 4 * 1024
+# Client errors that a retry can actually fix.
+RETRYABLE_CLIENT_STATUSES = (408, 429)
 
 
 class BoundedReadError(Exception):
@@ -77,6 +96,25 @@ class BoundedReadError(Exception):
 
 class HttpFetchError(Exception):
     """Raised when a remote HTTP request fails or returns an invalid body."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+_deadline = None
+
+
+def start_run_budget(seconds=RUN_BUDGET_SECONDS):
+    global _deadline
+    _deadline = time.monotonic() + seconds
+
+
+def remaining_budget(cap):
+    """Seconds one step may take: ``cap``, bounded by what is left of the run."""
+    if _deadline is None:
+        return cap
+    return max(0.0, min(cap, _deadline - time.monotonic()))
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -155,8 +193,12 @@ def fetch_json(req, timeout, max_bytes, error_label):
     """Perform an HTTP request and parse a bounded JSON response.
 
     Both success bodies and HTTPError bodies are read through
-    :func:`read_bounded` so every response and error path is size-limited.
+    :func:`read_bounded` so every response and error path is size-limited, and
+    ``timeout`` is cut to what is left of the run budget.
     """
+    timeout = remaining_budget(timeout)
+    if timeout <= 0:
+        raise HttpFetchError(f"{error_label}: run time budget exhausted")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = read_bounded(resp, max_bytes)
@@ -176,7 +218,7 @@ def fetch_json(req, timeout, max_bytes, error_label):
                 pass
         if snippet:
             detail = f"{detail}: {snippet[:512]}"
-        raise HttpFetchError(detail) from e
+        raise HttpFetchError(detail, status=e.code) from e
 
     try:
         return json.loads(body.decode("utf-8"))
@@ -359,7 +401,7 @@ def atomic_write_private(file_path, data, max_bytes=None, error_label="private f
     The temporary file is created with ``mkstemp`` (mode 0600, ``O_EXCL``) in the
     target directory, validated on its descriptor, written, fsynced, and
     published with ``os.replace`` so an existing symlink is replaced rather than
-    followed. Shared by cache and token persistence.
+    followed. Shared by every cache the collector persists.
     """
     fd = None
     tmp_path = None
@@ -406,89 +448,115 @@ def save_private_json(file_path, data):
     return atomic_write_private(file_path, data)
 
 
-def save_token_to_file(data):
-    return atomic_write_private(
-        TOKEN_FILE, data, max_bytes=MAX_TOKEN_FILE_SIZE, error_label="token file"
-    )
+def read_token():
+    """Return ``(token, error)`` from agy's stored credentials, read-only."""
+    data, _source, err = get_credentials()
+    token = data.get("token") if isinstance(data, dict) else None
+    if not isinstance(token, dict):
+        return None, err or "Invalid token structure in Antigravity credentials"
+    return token, ""
 
 
-def save_token_to_keyring(data):
-    secret_tool = resolve_tool("secret-tool")
-    if secret_tool is None:
-        log_warn("secret-tool is not available in a trusted PATH")
-        return
+def account_id(token):
+    """Short, non-secret fingerprint of the signed-in account's credentials."""
+    refresh_token = token.get("refresh_token") if isinstance(token, dict) else None
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return ""
+    return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()[:16]
+
+
+def _token_fresh(expiry):
+    """True while an access token has more than two minutes left.
+
+    A token without an expiry is trusted as before; one whose expiry cannot be
+    parsed is treated as stale so it gets replaced.
+    """
+    if not expiry:
+        return True
     try:
-        p = subprocess.Popen(
-            [secret_tool, "store", "--label=Password for 'antigravity' on 'gemini'", "service", "gemini", "username", "antigravity"],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        exp_dt = datetime.fromisoformat(str(expiry))
+    except ValueError:
+        return False
+    if exp_dt.tzinfo is None:
+        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+    return (exp_dt - datetime.now(timezone.utc)).total_seconds() >= 120
+
+
+def _refresh_access_token(refresh_token):
+    """Mint a new access token; returns ``(access_token, expiry_iso)``."""
+    if STRICT_CLIENT and not (
+        os.getenv("ANTIGRAVITY_CLIENT_ID") and os.getenv("ANTIGRAVITY_CLIENT_SECRET")
+    ):
+        raise RuntimeError(
+            "strict client mode requires ANTIGRAVITY_CLIENT_ID and "
+            "ANTIGRAVITY_CLIENT_SECRET; refusing to use the built-in default"
         )
-        p.communicate(input=json.dumps(data).encode("utf-8"), timeout=5)
-    except Exception as e:
-        log_warn(f"failed to save keyring: {e}")
+    params = urllib.parse.urlencode({
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token"
+    }).encode("utf-8")
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=params, method="POST")
+    res = fetch_json(
+        req,
+        timeout=10,
+        max_bytes=OAUTH_TOKEN_RESPONSE_MAX_BYTES,
+        error_label="OAuth token refresh failed",
+    )
+    new_token = res.get("access_token")
+    if not new_token:
+        raise HttpFetchError("OAuth token refresh failed: no access_token in response")
+    expires_in = res.get("expires_in", 3600)
+    if not isinstance(expires_in, (int, float)):
+        expires_in = 3600
+    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    return new_token, expiry.isoformat()
 
 
-def get_valid_access_token():
-    data, source, err = get_credentials()
-    if not data:
-        return None, err
+def get_valid_access_token(token, token_err=""):
+    """Return ``(access_token, error)`` for agy's credentials.
 
-    tok = data.get("token", {})
-    access_token = tok.get("access_token")
-    refresh_token = tok.get("refresh_token")
-    expiry_str = tok.get("expiry")
+    agy's own access token is used while it is fresh. Otherwise the collector
+    refreshes one for itself and keeps it in its own private cache, keyed by
+    account, so agy's token file and keyring entry are only ever read and the
+    collector never races the CLI's own token refresh.
+    """
+    if not isinstance(token, dict):
+        return None, token_err or "No Antigravity credentials found"
 
-    is_expired = False
-    if expiry_str:
+    access_token = token.get("access_token")
+    if access_token and _token_fresh(token.get("expiry")):
+        return access_token, ""
+
+    account = account_id(token)
+    cached, _ = read_private_json(ACCESS_TOKEN_CACHE_FILE)
+    if (
+        account
+        and isinstance(cached, dict)
+        and cached.get("account") == account
+        and cached.get("access_token")
+        and _token_fresh(cached.get("expiry"))
+    ):
+        return cached["access_token"], ""
+
+    refresh_token = token.get("refresh_token")
+    if refresh_token:
         try:
-            exp_dt = datetime.fromisoformat(expiry_str)
-            now_utc = datetime.now(timezone.utc)
-            if (exp_dt - now_utc).total_seconds() < 120:
-                is_expired = True
-        except Exception:
-            pass
-
-    if (not access_token or is_expired) and refresh_token:
-        try:
-            if STRICT_CLIENT and not (
-                os.getenv("ANTIGRAVITY_CLIENT_ID") and os.getenv("ANTIGRAVITY_CLIENT_SECRET")
-            ):
-                raise RuntimeError(
-                    "strict client mode requires ANTIGRAVITY_CLIENT_ID and "
-                    "ANTIGRAVITY_CLIENT_SECRET; refusing to use the built-in default"
-                )
-            params = urllib.parse.urlencode({
-                "client_id": OAUTH_CLIENT_ID,
-                "client_secret": OAUTH_CLIENT_SECRET,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token"
-            }).encode("utf-8")
-            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=params, method="POST")
-            res = fetch_json(
-                req,
-                timeout=10,
-                max_bytes=OAUTH_TOKEN_RESPONSE_MAX_BYTES,
-                error_label="OAuth token refresh failed",
-            )
-            new_token = res.get("access_token")
-            expires_in = res.get("expires_in", 3600)
-            if new_token:
-                access_token = new_token
-                tok["access_token"] = new_token
-                new_exp = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                tok["expiry"] = new_exp.isoformat()
-                data["token"] = tok
-
-                if source == "file":
-                    save_token_to_file(data)
-                elif source == "keyring":
-                    save_token_to_keyring(data)
+            new_token, expiry = _refresh_access_token(refresh_token)
+            save_private_json(ACCESS_TOKEN_CACHE_FILE, {
+                "account": account,
+                "access_token": new_token,
+                "expiry": expiry,
+            })
+            return new_token, ""
         except Exception as e:
             log_warn(f"token refresh error: {e}")
 
-    if not access_token:
-        return None, "Unable to obtain valid access token"
-
-    return access_token, ""
+    if access_token:
+        # Best effort: the server is the judge of a token we could not renew.
+        return access_token, ""
+    return None, "Unable to obtain valid access token"
 
 
 def read_private_json(file_path, max_bytes=MAX_CACHE_FILE_SIZE):
@@ -526,13 +594,21 @@ def run_bounded_stdout(args, timeout, max_bytes=MAX_SUBPROCESS_OUTPUT_BYTES):
     """Run a command and capture a bounded amount of stdout.
 
     Returns ``(returncode, stdout_bytes, truncated)``. The child is killed when
-    it produces more than ``max_bytes`` or exceeds ``timeout`` seconds so a
-    misbehaving helper cannot force unbounded allocation.
+    it produces more than ``max_bytes`` or exceeds ``timeout`` seconds (cut to
+    the run budget) so a misbehaving helper cannot force unbounded allocation.
+    The child gets its own process group and the whole group is killed, so
+    helpers it started (agy's MCP servers) are not left orphaned.
     """
+    timeout = remaining_budget(timeout)
+    if timeout <= 0:
+        return None, b"", True
     try:
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
+        )
     except OSError:
         return None, b"", False
+    _active_procs.add(proc)
 
     state = {"data": bytearray(), "truncated": False}
 
@@ -544,7 +620,7 @@ def run_bounded_stdout(args, timeout, max_bytes=MAX_SUBPROCESS_OUTPUT_BYTES):
                     break
                 if len(state["data"]) + len(chunk) > max_bytes:
                     state["truncated"] = True
-                    proc.kill()
+                    kill_process_tree(proc)
                     break
                 state["data"].extend(chunk)
         except Exception:
@@ -556,8 +632,10 @@ def run_bounded_stdout(args, timeout, max_bytes=MAX_SUBPROCESS_OUTPUT_BYTES):
         returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         state["truncated"] = True
-        proc.kill()
+        kill_process_tree(proc)
         returncode = proc.wait()
+    finally:
+        _active_procs.discard(proc)
     reader.join(timeout=2)
     if proc.stdout is not None:
         try:
@@ -567,46 +645,109 @@ def run_bounded_stdout(args, timeout, max_bytes=MAX_SUBPROCESS_OUTPUT_BYTES):
     return returncode, bytes(state["data"]), state["truncated"]
 
 
-def get_cached_limits(max_age_seconds=CACHE_TTL_SECONDS):
-    data, st = read_private_json(CACHE_FILE)
-    if data is None:
+_active_procs = set()
+
+
+def kill_process_tree(proc):
+    """SIGKILL a child started by :func:`run_bounded_stdout` and its group."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except OSError:
+        proc.kill()
+
+
+def _terminate_children(signum, _frame):
+    # `timeout` in the updater signals only our own process group; the
+    # helpers live in their own groups and would outlive us otherwise.
+    for proc in list(_active_procs):
+        kill_process_tree(proc)
+    sys.exit(128 + signum)
+
+
+def get_cached_limits(max_age_seconds=CACHE_TTL_SECONDS, path=None):
+    data, st = read_private_json(path or CACHE_FILE)
+    if not isinstance(data, dict):
         return None
     if time.time() - st.st_mtime > max_age_seconds:
         return None
     return data
 
 
-def get_cached_user_email(access_token):
-    data, _ = read_private_json(USER_CACHE_FILE)
-    if data and data.get("email"):
-        return data["email"]
-
-    acc_data, _ = read_private_json(os.path.expanduser("~/.gemini/google_accounts.json"))
-    if acc_data:
-        active = acc_data.get("active")
-        if active and isinstance(active, str):
-            return active
-        old = acc_data.get("old", [])
-        if old and isinstance(old, list) and len(old) > 0:
-            return old[0]
-
+def _fetch_email(access_token):
     try:
-        headers = {"Authorization": f"Bearer {access_token}"}
-        req = urllib.request.Request("https://www.googleapis.com/oauth2/v2/userinfo", headers=headers)
+        req = urllib.request.Request(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
         info = fetch_json(
             req,
             timeout=5,
             max_bytes=USERINFO_RESPONSE_MAX_BYTES,
             error_label="Google userinfo request failed",
         )
-        email = info.get("email")
-        if email:
-            save_private_json(USER_CACHE_FILE, {"email": email})
-            return email
-    except Exception:
-        pass
+        email = info.get("email") if isinstance(info, dict) else None
+        return email if isinstance(email, str) else ""
+    except Exception as e:
+        log_debug(f"userinfo lookup failed: {e}")
+        return ""
 
+
+def _fetch_tier(access_token):
+    """The account's plan name, e.g. "Google AI Pro", as agy's backend reports it."""
+    try:
+        req = urllib.request.Request(
+            f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist",
+            data=json.dumps({"metadata": {"ideType": "ANTIGRAVITY"}}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "antigravity",
+            },
+            method="POST",
+        )
+        info = fetch_json(
+            req,
+            timeout=5,
+            max_bytes=CODE_ASSIST_RESPONSE_MAX_BYTES,
+            error_label="loadCodeAssist request failed",
+        )
+    except Exception as e:
+        log_debug(f"tier lookup failed: {e}")
+        return ""
+    if not isinstance(info, dict):
+        return ""
+    for key in ("paidTier", "currentTier"):
+        tier = info.get(key)
+        name = tier.get("name") if isinstance(tier, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
     return ""
+
+
+def resolve_account(account, get_access_token):
+    """Return ``(email, tier)`` for the signed-in account.
+
+    Cached per account fingerprint, so switching accounts in agy is picked up
+    instead of showing the previous account forever. The network is only hit
+    on a cache miss, and only then is an access token minted.
+    """
+    if not account:
+        return "", ""
+    cached, _ = read_private_json(ACCOUNT_CACHE_FILE)
+    if isinstance(cached, dict) and cached.get("account") == account:
+        return str(cached.get("email") or ""), str(cached.get("tier") or "")
+    access_token = get_access_token()
+    if not access_token:
+        return "", ""
+    email = _fetch_email(access_token)
+    tier = _fetch_tier(access_token)
+    # An empty answer is a failed lookup, not an account without an email;
+    # caching it would hide the email until the next account switch.
+    if email:
+        save_private_json(ACCOUNT_CACHE_FILE, {"account": account, "email": email, "tier": tier})
+    return email, tier
 
 
 def _used_fraction(remaining):
@@ -659,6 +800,28 @@ def _finalize_limits(parsed_items):
     return [item[2] for item in parsed_items]
 
 
+def limit_group(limit):
+    """Display group of a limit record, read back from its title ("Gemini (5h)")."""
+    title = str(limit.get("title", "")) if isinstance(limit, dict) else ""
+    return title.rsplit(" (", 1)[0] if " (" in title else title
+
+
+def _limit_sort_key(limit):
+    """Same order as :func:`_finalize_limits`, for records already titled."""
+    group = limit_group(limit)
+    group_priority = SHARED_LIMIT_GROUPS.index(group) if group in SHARED_LIMIT_GROUPS else 2
+    window_priority = {"Session": 0, "Weekly": 1}.get(limit.get("label"), 2)
+    return group_priority, window_priority
+
+
+def _retryable(error):
+    if isinstance(error, BoundedReadError):
+        # An oversized response is deterministic: retrying cannot help.
+        return False
+    status = getattr(error, "status", None)
+    return not (status and 400 <= status < 500 and status not in RETRYABLE_CLIENT_STATUSES)
+
+
 def fetch_authoritative_limits(access_token):
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -679,22 +842,25 @@ def fetch_authoritative_limits(access_token):
                 error_label="quota request failed",
             )
             break
-        except BoundedReadError:
-            # An oversized response is deterministic: retrying cannot help.
-            raise
         except Exception as e:
+            # A 401/403 or an oversized body will not change on a second try.
+            if not _retryable(e):
+                raise
             last_err = e
-            if attempt < MAX_RETRIES:
+            if attempt < MAX_RETRIES and remaining_budget(RETRY_DELAY_SECONDS + 1) > RETRY_DELAY_SECONDS:
                 time.sleep(RETRY_DELAY_SECONDS)
 
-    if data is None:
-        raise last_err or RuntimeError("Failed to fetch quota from endpoint")
+    if not isinstance(data, dict):
+        raise last_err or HttpFetchError("quota request failed: unexpected response shape")
 
-    groups = data.get("groups", [])
     parsed_items = []
-    for group in groups:
+    for group in data.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
         gname = group.get("displayName", "")
-        for b in group.get("buckets", []):
+        for b in group.get("buckets") or []:
+            if not isinstance(b, dict):
+                continue
             parsed_items.append(_limit_entry(
                 gname,
                 b.get("window", ""),
@@ -703,10 +869,7 @@ def fetch_authoritative_limits(access_token):
                 b.get("resetTime", ""),
             ))
 
-    limits = _finalize_limits(parsed_items)
-
-    save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
-    return limits
+    return _finalize_limits(parsed_items)
 
 
 def _parse_agy_usage_text(text):
@@ -773,7 +936,8 @@ def fetch_limits_via_agy():
     """Read quota through the official CLI's ``/usage`` command.
 
     Its structured output carries every pool the CLI shows, including the
-    Gemini ones the quota API stopped returning.
+    Gemini ones the quota API stopped returning. Each call starts the user's
+    MCP servers, so callers go through :func:`get_agy_limits` and its cache.
     """
     agy = resolve_tool("agy")
     if agy is None:
@@ -796,12 +960,27 @@ def fetch_limits_via_agy():
         if parsed_items is None:
             parsed_items = _parse_agy_usage_text(raw)
         if parsed_items:
-            limits = _finalize_limits(parsed_items)
-            save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
-            return limits
+            return _finalize_limits(parsed_items)
     except Exception as e:
         log_warn(f"agy -p /usage error: {e}")
     return None
+
+
+def get_agy_limits(force=False):
+    """agy's /usage answer, reused for AGY_USAGE_TTL_SECONDS unless forced.
+
+    A failed call is cached too: an agy that cannot answer would otherwise be
+    relaunched, MCP servers and all, on every refresh.
+    """
+    if not force:
+        cached = get_cached_limits(AGY_USAGE_TTL_SECONDS, AGY_CACHE_FILE)
+        if cached is not None and "limits" in cached:
+            log_debug("agy usage cache hit")
+            limits = cached["limits"]
+            return limits if isinstance(limits, list) else None
+    limits = fetch_limits_via_agy()
+    save_private_json(AGY_CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
+    return limits
 
 
 def count_dir_entries(directory, limit=10000):
@@ -832,9 +1011,16 @@ def _history_cache_key(history_file):
 
 
 def _scan_history(history_file, today_str, recent_days_map):
-    """Stream history.jsonl and count prompts; returns (total, today)."""
+    """Stream history.jsonl; returns (total prompts, today's prompts, today's sessions).
+
+    Sessions are today's distinct conversation ids. Prompts logged without one
+    (agy writes a few) count together as a single extra session, so the number
+    never exceeds the prompts behind it.
+    """
     total_prompts = 0
     today_prompts = 0
+    today_conversations = set()
+    today_without_id = False
     fd = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -861,6 +1047,11 @@ def _scan_history(history_file, today_str, recent_days_map):
                         total_prompts += 1
                         if d_str == today_str:
                             today_prompts += 1
+                            conversation = data.get("conversationId")
+                            if isinstance(conversation, str) and conversation:
+                                today_conversations.add(conversation)
+                            else:
+                                today_without_id = True
                         if d_str in recent_days_map:
                             recent_days_map[d_str] += 1
                     except Exception:
@@ -873,7 +1064,7 @@ def _scan_history(history_file, today_str, recent_days_map):
                 os.close(fd)
             except OSError:
                 pass
-    return total_prompts, today_prompts
+    return total_prompts, today_prompts, len(today_conversations) + int(today_without_id)
 
 
 def collect_local_stats():
@@ -890,15 +1081,22 @@ def collect_local_stats():
 
     total_prompts = 0
     today_prompts = 0
+    today_sessions = 0
 
     # Cache the history scan when the file is unchanged and the local day has
     # not rolled over; the cache key is validated through the private reader.
     history_key = _history_cache_key(history_file)
     cached, _ = read_private_json(HISTORY_CACHE_FILE)
     cache_hit = False
-    if history_key is not None and cached and cached.get("historyKey") == history_key + [today_str]:
+    if (
+        history_key is not None
+        and isinstance(cached, dict)
+        and cached.get("historyKey") == history_key + [today_str]
+        and "todaySessions" in cached
+    ):
         total_prompts = int(cached.get("totalPrompts", 0))
         today_prompts = int(cached.get("todayPrompts", 0))
+        today_sessions = int(cached.get("todaySessions", 0))
         for day in cached.get("recentDays", []):
             date = day.get("date")
             if date in recent_days_map:
@@ -907,12 +1105,15 @@ def collect_local_stats():
         log_debug(f"history cache hit ({history_key[1]} bytes)")
 
     if not cache_hit:
-        total_prompts, today_prompts = _scan_history(history_file, today_str, recent_days_map)
+        total_prompts, today_prompts, today_sessions = _scan_history(
+            history_file, today_str, recent_days_map
+        )
         if history_key is not None:
             save_private_json(HISTORY_CACHE_FILE, {
                 "historyKey": history_key + [today_str],
                 "totalPrompts": total_prompts,
                 "todayPrompts": today_prompts,
+                "todaySessions": today_sessions,
                 "recentDays": [
                     {"date": k, "messageCount": v} for k, v in recent_days_map.items()
                 ],
@@ -925,7 +1126,7 @@ def collect_local_stats():
 
     return {
         "todayPrompts": today_prompts,
-        "todaySessions": 1 if today_prompts > 0 else 0,
+        "todaySessions": today_sessions,
         "todayTotalTokens": 0,
         "todayTokensByModel": {},
         "recentDays": recent_days,
@@ -937,68 +1138,128 @@ def collect_local_stats():
     }
 
 
-def _resolve_limits(access_token, token_err, limits, status_text, auth_help):
-    """Resolve quota limits, preferring agy's /usage and falling back to the API.
+def _resolve_limits(get_token, force, status_text, auth_help):
+    """Combine the quota API with agy's /usage into one list of limits.
 
-    The quota API stopped returning the Gemini pools while the CLI still shows
-    them, so the CLI is the primary source and the API the fallback.
+    The API is cheap and stays the source for every pool it reports. agy is
+    consulted, through its long-lived cache, only when the API leaves out a
+    shared pool or one seen recently, e.g. the Gemini pools it stopped
+    returning and per-model pools such as "Gemini 4 Argon".
     """
-    if limits is None:
-        limits = fetch_limits_via_agy()
-    if limits is None and access_token:
+    access_token, token_err = get_token()
+    api_limits, api_error = None, None
+    if access_token:
         try:
-            limits = fetch_authoritative_limits(access_token)
-            log_debug("limits from quota API (agy /usage unavailable)")
+            api_limits = fetch_authoritative_limits(access_token)
         except Exception as e:
+            api_error = e
             log_warn(f"failed to fetch quota after retries: {e}")
+
+    have = {limit_group(item) for item in api_limits or []}
+    wanted = set(SHARED_LIMIT_GROUPS) | known_limit_groups()
+    agy_limits = None
+    if api_limits is None or not wanted <= have:
+        agy_limits = get_agy_limits(force)
+
+    if api_limits is None and agy_limits is None:
+        if not status_text and access_token:
             status_text = "Quota unavailable"
-            auth_help = f"Failed to retrieve quota: {e}"
-    if not limits and not access_token and not status_text:
-        status_text = "Waiting for auth"
-        auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+            auth_help = f"Failed to retrieve quota: {api_error}"
+        elif not status_text:
+            status_text = "Waiting for auth"
+            auth_help = token_err or "Run `agy` to authenticate with Antigravity."
+        return None, status_text, auth_help
+
+    merged = list(api_limits or [])
+    merged += [item for item in agy_limits or [] if limit_group(item) not in have]
+    limits = sorted(merged, key=_limit_sort_key)
+    save_private_json(CACHE_FILE, {"limits": limits, "fetchedAt": time.time()})
     return limits, status_text, auth_help
 
 
+def _read_seen_groups():
+    seen, _ = read_private_json(GROUPS_STATE_FILE)
+    if not isinstance(seen, dict):
+        return {}
+    return {
+        str(group): float(ts) for group, ts in seen.items()
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool)
+    }
+
+
+def known_limit_groups(now=None):
+    """Pools reported within GROUP_MEMORY_SECONDS."""
+    now = time.time() if now is None else now
+    return {g for g, ts in _read_seen_groups().items() if now - ts <= GROUP_MEMORY_SECONDS}
+
+
+def track_limit_groups(limits, now=None):
+    """Remember the pools in ``limits``; return recently seen ones now missing.
+
+    Timestamps are only rewritten when they are an hour old, so a steady state
+    does not cost a disk write per refresh.
+    """
+    now = time.time() if now is None else now
+    seen = _read_seen_groups()
+    current = {limit_group(item) for item in limits or []} - {""}
+    missing = sorted(
+        g for g, ts in seen.items() if g not in current and now - ts <= GROUP_MEMORY_SECONDS
+    )
+    updated = {g: ts for g, ts in seen.items() if now - ts <= GROUP_MEMORY_SECONDS}
+    for group in current:
+        if now - updated.get(group, 0) > GROUP_SEEN_REFRESH_SECONDS:
+            updated[group] = now
+    if updated != seen:
+        save_private_json(GROUPS_STATE_FILE, updated)
+    return missing
+
+
 def _check_limits_complete(limits, status_text, auth_help):
-    """Flag a quota response that dropped one of the shared pools.
+    """Flag a quota response that dropped a pool it reported recently.
 
     Without this an upstream format change only shows up as a meter quietly
-    vanishing from the panel.
+    vanishing from the panel. Pools are compared against what this account
+    reported over the last week rather than a fixed list, so a plan without
+    one of the shared pools is not flagged forever.
     """
     if status_text:
         return status_text, auth_help
-    titles = [str(item.get("title", "")) for item in limits or [] if isinstance(item, dict)]
-    missing = [
-        group for group in EXPECTED_LIMIT_GROUPS
-        if not any(title.startswith(group + " (") for title in titles)
-    ]
-    if not missing:
+    missing = track_limit_groups(limits)
+    if limits and not missing:
         return status_text, auth_help
-    log_warn(f"quota response is missing: {', '.join(missing)}")
+    what = f"the {' and '.join(missing)} quota" if missing else "any quota"
+    log_warn(f"quota response is missing {what}")
     return "Usage incomplete", (
-        f"Antigravity stopped reporting the {' and '.join(missing)} quota, so its "
-        "usage format may have changed. Compare with /usage in agy."
+        f"Antigravity stopped reporting {what}, so its usage format may have "
+        "changed. Compare with /usage in agy."
     )
 
 
 def notify_status_change(status_text, detail):
     """Raise one desktop notification when the usage status turns into a problem.
 
-    The last notified status is remembered, so a problem that persists across
-    refreshes notifies once and recovering re-arms the alert.
+    A problem notifies on its second consecutive sighting, so one network blip
+    stays quiet; it then stays quiet until the status changes, and recovering
+    re-arms the alert.
     """
-    previous, _ = read_private_json(ALERT_STATE_FILE)
-    if isinstance(previous, dict) and previous.get("status", "") == status_text:
+    state, _ = read_private_json(ALERT_STATE_FILE)
+    state = state if isinstance(state, dict) else {}
+    if state.get("status", "") != status_text:
+        save_private_json(ALERT_STATE_FILE, {"status": status_text, "notified": False})
         return
-    save_private_json(ALERT_STATE_FILE, {"status": status_text})
-    if not status_text:
+    if not status_text or state.get("notified"):
         return
+    save_private_json(ALERT_STATE_FILE, {"status": status_text, "notified": True})
     notify_send = resolve_tool("notify-send")
     if notify_send is None:
         return
     try:
+        # Notification daemons such as mako render the body as Pango markup.
         subprocess.run(
-            [notify_send, "--app-name=Antigravity", f"Antigravity: {status_text}", detail or ""],
+            [
+                notify_send, "--app-name=Antigravity",
+                f"Antigravity: {status_text}", html.escape(detail or "", quote=False),
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -1007,17 +1268,7 @@ def notify_status_change(status_text, detail):
         log_warn(f"failed to send desktop notification: {e}")
 
 
-def _resolve_email(access_token, limits):
-    """Resolve the account email from cache/accounts file, then userinfo."""
-    email = ""
-    if access_token:
-        email = get_cached_user_email(access_token)
-    if not email and (access_token or limits):
-        email = get_cached_user_email(None)
-    return email
-
-
-def _build_record(email, status_text, auth_help, limits, local_stats):
+def _build_record(email, tier, status_text, auth_help, limits, local_stats):
     """Assemble the display-ready usage record emitted on stdout."""
     record = {
         "schemaVersion": 1,
@@ -1026,16 +1277,83 @@ def _build_record(email, status_text, auth_help, limits, local_stats):
         "updatedAt": datetime.now(timezone.utc).isoformat(),
         "ready": True,
         "hasLocalStats": True,
-        "tierLabel": f"Pro · {email}" if email else "Pro",
+        "tierLabel": " · ".join(part for part in (tier, email) if part),
         "usageStatusText": status_text,
         "authHelpText": auth_help,
         # Only an auth problem gets the panel's Sign In button; signing in
         # again cannot fix an outage or a changed usage format.
         "authRequired": status_text == "Waiting for auth",
-        "limits": limits or []
+        "limits": limits or [],
+        # history.jsonl counts prompts, while other agents' recentDays count
+        # tokens; the panel labels the chart from this.
+        "recentDaysUnit": "prompts",
     }
     record.update(local_stats)
     return record
+
+
+def _error_record(error):
+    """Last-resort record so a crash shows up in the panel.
+
+    Without it the updater keeps the previous record and the panel silently
+    freezes on stale numbers. The last limits are kept for context.
+    """
+    limits = []
+    try:
+        cached, _ = read_private_json(CACHE_FILE)
+        if isinstance(cached, dict) and isinstance(cached.get("limits"), list):
+            limits = cached["limits"]
+    except Exception:
+        pass
+    return _build_record(
+        "", "", "Collector error",
+        f"The Antigravity usage collector failed: {error}", limits, {},
+    )
+
+
+def _run(args):
+    # When not forced and an existing state file already exists, only query remote servers
+    # if there is at least one active 'agy' session running on the machine.
+    if not args.force and os.path.exists(STATE_FILE) and not is_agy_running():
+        log_warn("no active agy session running; skipping update")
+        return
+
+    limits = None
+    status_text = ""
+    auth_help = ""
+
+    if resolve_tool("agy") is None:
+        status_text = "Not installed"
+        auth_help = "Antigravity CLI ('agy') is not found in PATH."
+
+    token, cred_err = read_token()
+    account = account_id(token)
+    token_state = {}
+
+    def get_token():
+        # Most runs are served from caches; mint a token only when one is used.
+        if "result" not in token_state:
+            token_state["result"] = get_valid_access_token(token, cred_err)
+            log_debug(f"access token resolved: {'yes' if token_state['result'][0] else 'no'}")
+        return token_state["result"]
+
+    if not args.force:
+        ttl = CACHE_TTL_SECONDS * 2 if args.limits_only else CACHE_TTL_SECONDS
+        cached = get_cached_limits(ttl)
+        if cached and isinstance(cached.get("limits"), list):
+            limits = cached["limits"]
+            log_debug("limits cache hit")
+
+    if limits is None:
+        limits, status_text, auth_help = _resolve_limits(
+            get_token, args.force, status_text, auth_help
+        )
+    status_text, auth_help = _check_limits_complete(limits, status_text, auth_help)
+    notify_status_change(status_text, auth_help)
+    email, tier = resolve_account(account, lambda: get_token()[0])
+
+    record = _build_record(email, tier, status_text, auth_help, limits, collect_local_stats())
+    print(json.dumps(record, separators=(",", ":")))
 
 
 def main(argv=None):
@@ -1048,41 +1366,20 @@ def main(argv=None):
     if args.debug:
         os.environ["OMARCHY_ANTIGRAVITY_DEBUG"] = "1"
     log_debug(f"start force={args.force} limits_only={args.limits_only}")
+    start_run_budget()
 
-    # When not forced and an existing state file already exists, only query remote servers
-    # if there is at least one active 'agy' session running on the machine.
-    if not args.force and os.path.exists(STATE_FILE) and not is_agy_running():
-        log_warn("no active agy session running; skipping update")
-        return 0
-
-    limits = None
-    status_text = ""
-    auth_help = ""
-
-    if resolve_tool("agy") is None:
-        status_text = "Not installed"
-        auth_help = "Antigravity CLI ('agy') is not found in PATH."
-
-    if not args.force:
-        ttl = CACHE_TTL_SECONDS * 2 if args.limits_only else CACHE_TTL_SECONDS
-        cached = get_cached_limits(ttl)
-        if cached and "limits" in cached:
-            limits = cached["limits"]
-            log_debug("limits cache hit")
-
-    access_token, token_err = get_valid_access_token()
-    log_debug(f"credentials resolved: access_token={'yes' if access_token else 'no'}")
-
-    limits, status_text, auth_help = _resolve_limits(
-        access_token, token_err, limits, status_text, auth_help
-    )
-    status_text, auth_help = _check_limits_complete(limits, status_text, auth_help)
-    notify_status_change(status_text, auth_help)
-    email = _resolve_email(access_token, limits)
-
-    record = _build_record(email, status_text, auth_help, limits, collect_local_stats())
-    print(json.dumps(record, separators=(",", ":")))
+    try:
+        _run(args)
+    except Exception as e:
+        log_warn(f"collector error: {e!r}")
+        try:
+            notify_status_change("Collector error", str(e))
+        except Exception:
+            pass
+        print(json.dumps(_error_record(e), separators=(",", ":")))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGTERM, _terminate_children)
+    sys.exit(main())
