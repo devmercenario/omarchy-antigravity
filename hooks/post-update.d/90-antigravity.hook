@@ -10,7 +10,7 @@ AGENT_FILE="$CONFIG_DIR/defaults/agent"
 # 1. Restore defaults only if user previously selected Antigravity as default.
 # If the user has explicitly selected another agent, respect their choice.
 if [[ -f "$AGENT_FILE" ]]; then
-  current_agent=$(cat "$AGENT_FILE" | tr -d '[:space:]')
+  current_agent=$(tr -d '[:space:]' < "$AGENT_FILE")
   if [[ "$current_agent" != "gemini" && "$current_agent" != "antigravity" ]]; then
     rm -f "$CONFIG_DIR/antigravity.default"
   fi
@@ -24,25 +24,30 @@ if [[ -f "$HOME/.local/bin/gemini" ]] && grep -q -- '--dangerously-skip-permissi
   rm -f "$HOME/.local/bin/gemini"
 fi
 
-# 2. Ensure shell.json has antigravity enabled
+# 2. Ensure shell.json has antigravity enabled. This runs on every
+# `omarchy update` and the bar watches shell.json, so the file is replaced
+# only when the filter actually changes it, via a temp file in the same
+# directory (atomic rename, original mode kept).
 SHELL_CONFIG="$CONFIG_DIR/shell.json"
 if [[ -f "$SHELL_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT INT TERM
-  jq '
-    .bar.layout.right |= map(
-      if .id == "omarchy.agents" or (.id | endswith(".agents")) then
-        # Only fill in a missing preference; never override an explicit false.
-        if (.providers.antigravity.enabled? == null) then
-          .providers.antigravity.enabled = true
-        else
-          .
-        end
-      else
-        .
-      end
-    )
-  ' "$SHELL_CONFIG" > "$tmp" && mv -f "$tmp" "$SHELL_CONFIG"
+  tmp=$(mktemp "$SHELL_CONFIG.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Every agents widget in any bar section; missing sections and entries
+  # without a string id are skipped. Only a missing preference is filled
+  # in; an explicit false is never overridden. No output means no change.
+  if jq '
+    ((.bar.layout[]?[]?
+      | select(type == "object" and ((.id? // "") | tostring | endswith(".agents")))
+      | select((.providers?.antigravity?.enabled?) == null))
+      |= (.providers.antigravity.enabled = true)) as $new
+    | if $new == . then empty else $new end
+  ' "$SHELL_CONFIG" > "$tmp" && [[ -s "$tmp" ]]; then
+    chmod --reference="$SHELL_CONFIG" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$SHELL_CONFIG"
+  fi
+  rm -f "$tmp"
   trap - EXIT INT TERM
 fi
 

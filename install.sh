@@ -12,6 +12,75 @@ CONFIG_DIR="$HOME/.config/omarchy"
 HOOKS_DIR="$CONFIG_DIR/hooks/post-update.d"
 SHELL_CONFIG="$CONFIG_DIR/shell.json"
 
+# Marker lines that identify this plugin's own copy of a file it installs
+# over (the current marker, or the header every earlier release carried).
+STATUSLINE_MARKER_RE='^# (omarchy-antigravity: statusline|Omarchy Antigravity CLI Statusline)$'
+UPDATER_MARKER_RE='^# (omarchy-antigravity: agent-usage-update|omarchy:summary=Update local usage records for all configured coding agents)$'
+# Dropped into the agents plugin folder when this installer created it.
+CLONE_MARKER=".omarchy-antigravity-cloned"
+
+# True when $1 is a regular file (not a symlink) carrying marker regex $2.
+has_marker() {
+  [[ -f "$1" && ! -L "$1" ]] && grep -qE -- "$2" "$1" 2>/dev/null
+}
+
+# Temp files are removed on any exit. INT/TERM must exit explicitly: a trap
+# that only cleans up would let the install carry on after Ctrl-C.
+TMP_FILES=()
+cleanup_tmp() {
+  (( ${#TMP_FILES[@]} == 0 )) || rm -f -- "${TMP_FILES[@]}"
+}
+trap cleanup_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Keep only the three most recent <file>.bak.<epoch> backups of $1.
+prune_backups() {
+  local f
+  local -a baks=()
+  for f in "$1".bak.*; do
+    if [[ -f "$f" && ! -L "$f" && "$f" =~ \.bak\.[0-9]+$ ]]; then
+      baks+=("$f")
+    fi
+  done
+  (( ${#baks[@]} > 3 )) || return 0
+  mapfile -t baks < <(printf '%s\n' "${baks[@]}" | sort -V)
+  rm -f -- "${baks[@]:0:${#baks[@]}-3}"
+}
+
+# update_json [--backup] FILE FILTER [jq args...]
+# Rewrite FILE through the jq FILTER, but only when the result differs (as
+# JSON) from what is there: an unchanged file keeps its bytes, inode and
+# mtime. The temp file is created next to FILE so the final mv is an atomic
+# same-filesystem rename (the bar watches shell.json), and it takes FILE's
+# mode. --backup keeps the previous version as FILE.bak.<epoch>; callers
+# prune those with prune_backups.
+update_json() {
+  local backup=0 file filter tmp
+  if [[ "$1" == "--backup" ]]; then
+    backup=1
+    shift
+  fi
+  file="$1"
+  filter="$2"
+  shift 2
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  TMP_FILES+=("$tmp")
+  if ! jq "$@" "($filter) as \$new | if \$new == . then empty else \$new end" "$file" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod --reference="$file" "$tmp" 2>/dev/null || true
+  if (( backup )); then
+    cp -p "$file" "$file.bak.$(date +%s)" || return 1
+  fi
+  mv -f "$tmp" "$file"
+}
+
 ASSUME_YES=0
 SET_DEFAULT=""
 INSTALL_STATUSLINE=""
@@ -84,6 +153,23 @@ fi
 # 2. Install executable binaries to ~/.local/bin
 echo "📦 Installing binaries to $BIN_DIR..."
 mkdir -p "$BIN_DIR"
+UPDATER_BAK="$BIN_DIR/.omarchy-agent-usage-update.bak"
+LEGACY_UPDATER_BAK="$BIN_DIR/omarchy-agent-usage-update.bak"
+# Earlier releases kept the backup under a visible name. A plugin copy there
+# is useless (and was what the collector glob re-executed); a genuine stock or
+# user helper moves to the hidden name.
+if [[ -f "$LEGACY_UPDATER_BAK" && ! -L "$LEGACY_UPDATER_BAK" ]]; then
+  if has_marker "$LEGACY_UPDATER_BAK" "$UPDATER_MARKER_RE"; then
+    rm -f "$LEGACY_UPDATER_BAK"
+  elif [[ ! -e "$UPDATER_BAK" ]]; then
+    mv "$LEGACY_UPDATER_BAK" "$UPDATER_BAK"
+  fi
+fi
+# A backup that is itself a plugin copy (an earlier reinstall backed up the
+# plugin's own helper) would be "restored" over the stock helper on uninstall.
+if has_marker "$UPDATER_BAK" "$UPDATER_MARKER_RE"; then
+  rm -f "$UPDATER_BAK"
+fi
 for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
                "$SCRIPT_DIR/bin/omarchy-agent-usage-update" \
                "$SCRIPT_DIR/bin/omarchy-antigravity" \
@@ -103,9 +189,11 @@ for bin_src in "$SCRIPT_DIR/bin/omarchy-agent-usage-antigravity" \
   # name on PATH; preserve a prior copy so uninstall can restore it. The
   # backup is a hidden dotfile so the collector-discovery glob
   # `omarchy-agent-usage-*` (which that helper itself uses) can never mistake
-  # the backup for a collector and re-execute it recursively.
-  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" && ! -f "$BIN_DIR/.omarchy-agent-usage-update.bak" ]]; then
-    cp "$target" "$BIN_DIR/.omarchy-agent-usage-update.bak" 2>/dev/null || true
+  # the backup for a collector and re-execute it recursively. On a reinstall
+  # the target is the plugin's own copy, which is never backed up.
+  if [[ "$bin_name" == "omarchy-agent-usage-update" && -f "$target" && ! -e "$UPDATER_BAK" ]] &&
+     ! cmp -s "$bin_src" "$target" && ! has_marker "$target" "$UPDATER_MARKER_RE"; then
+    cp "$target" "$UPDATER_BAK" 2>/dev/null || true
   fi
   cp -f "$bin_src" "$target"
   chmod +x "$target"
@@ -160,23 +248,21 @@ if [[ "$should_set_default" == true ]]; then
 else
   echo "ℹ️  Keeping '$CURRENT_AGENT' as default agent."
 fi
+prune_backups "$AGENT_FILE"
 
 # 4. Enable Antigravity provider in shell.json (preserving backup)
 if [[ -f "$SHELL_CONFIG" ]]; then
   echo "🎨 Enabling Antigravity in Omarchy bar widget..."
-  cp "$SHELL_CONFIG" "$SHELL_CONFIG.bak.$(date +%s)"
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT INT TERM
-  jq '
-    .bar.layout.right |= map(
-      if .id == "omarchy.agents" or (.id | endswith(".agents")) then
-        .providers.antigravity.enabled = true
-      else
-        .
-      end
-    )
-  ' "$SHELL_CONFIG" > "$tmp" && mv -f "$tmp" "$SHELL_CONFIG"
-  trap - EXIT INT TERM
+  # Every agents widget (the built-in omarchy.agents or a <user>.agents
+  # clone) in any bar section. Missing sections and entries without a string
+  # id are skipped rather than aborting the filter.
+  if ! update_json --backup "$SHELL_CONFIG" '
+    (.bar.layout[]?[]? | select(type == "object" and ((.id? // "") | tostring | endswith(".agents"))))
+      |= (.providers.antigravity.enabled = true)
+  '; then
+    echo "⚠️  Could not update $SHELL_CONFIG; left it unchanged." >&2
+  fi
+  prune_backups "$SHELL_CONFIG"
 fi
 
 # 5. Install UI enhancement for status bar warning & 1-click auth
@@ -190,6 +276,11 @@ if [[ ! -d "$USER_PLUGIN_DIR" ]]; then
   elif [[ -d "/usr/share/omarchy/shell/plugins/agents" ]]; then
     mkdir -p "$USER_PLUGIN_DIR"
     cp -r /usr/share/omarchy/shell/plugins/agents/* "$USER_PLUGIN_DIR/" 2>/dev/null || true
+  fi
+  # Record that this installer created the clone, so uninstall can remove
+  # it again (a folder that already existed is the user's and is kept).
+  if [[ -d "$USER_PLUGIN_DIR" && ! -L "$USER_PLUGIN_DIR" ]]; then
+    touch "$USER_PLUGIN_DIR/$CLONE_MARKER"
   fi
 fi
 
@@ -239,26 +330,35 @@ fi
 if [[ "$should_install_statusline" == true ]]; then
   echo "📊 Configuring Antigravity CLI status bar..."
   AGY_CLI_DIR="$HOME/.gemini/antigravity-cli"
+  STATUSLINE_SRC="$SCRIPT_DIR/bin/omarchy-antigravity-statusline"
+  STATUSLINE_DST="$AGY_CLI_DIR/statusline.sh"
   mkdir -p "$AGY_CLI_DIR"
-  if [[ -f "$AGY_CLI_DIR/statusline.sh" && ! -f "$AGY_CLI_DIR/statusline.sh.bak" ]]; then
-    cp "$AGY_CLI_DIR/statusline.sh" "$AGY_CLI_DIR/statusline.sh.bak" 2>/dev/null || true
+  # Back up a status line the user wrote, once. The plugin's own copy (a
+  # reinstall) is never backed up: uninstall would "restore" it and leave the
+  # plugin's script behind for good. A backup that is itself a plugin copy,
+  # left by earlier releases, is dropped for the same reason.
+  if has_marker "$STATUSLINE_DST.bak" "$STATUSLINE_MARKER_RE"; then
+    rm -f "$STATUSLINE_DST.bak"
   fi
-  cp -f --remove-destination "$SCRIPT_DIR/bin/omarchy-antigravity-statusline" "$AGY_CLI_DIR/statusline.sh"
-  chmod +x "$AGY_CLI_DIR/statusline.sh"
+  if [[ -f "$STATUSLINE_DST" && ! -e "$STATUSLINE_DST.bak" ]] &&
+     ! cmp -s "$STATUSLINE_SRC" "$STATUSLINE_DST" && ! has_marker "$STATUSLINE_DST" "$STATUSLINE_MARKER_RE"; then
+    cp "$STATUSLINE_DST" "$STATUSLINE_DST.bak" 2>/dev/null || true
+  fi
+  cp -f --remove-destination "$STATUSLINE_SRC" "$STATUSLINE_DST"
+  chmod +x "$STATUSLINE_DST"
 
   AGY_SETTINGS="$AGY_CLI_DIR/settings.json"
   if [[ -f "$AGY_SETTINGS" ]]; then
-    cp "$AGY_SETTINGS" "$AGY_SETTINGS.bak.$(date +%s)"
-    tmp=$(mktemp)
-    trap 'rm -f "$tmp"' EXIT INT TERM
-    jq --arg script "$AGY_CLI_DIR/statusline.sh" '
+    if ! update_json --backup "$AGY_SETTINGS" '
       .statusLine = {
         "type": "command",
         "command": $script,
         "enabled": true
       }
-    ' "$AGY_SETTINGS" > "$tmp" && mv -f "$tmp" "$AGY_SETTINGS"
-    trap - EXIT INT TERM
+    ' --arg script "$STATUSLINE_DST"; then
+      echo "⚠️  Could not update $AGY_SETTINGS; left it unchanged." >&2
+    fi
+    prune_backups "$AGY_SETTINGS"
   else
     jq -n --arg script "$AGY_CLI_DIR/statusline.sh" '{
       "statusLine": {
@@ -274,7 +374,7 @@ fi
 # 7. Install Post-Update Hook (persists across omarchy update)
 echo "🔄 Installing update persistence hook..."
 mkdir -p "$HOOKS_DIR"
-cp -f "$SCRIPT_DIR/hooks/post-update.d/90-antigravity.hook" "$HOOKS_DIR/90-antigravity.hook"
+cp -f --remove-destination "$SCRIPT_DIR/hooks/post-update.d/90-antigravity.hook" "$HOOKS_DIR/90-antigravity.hook"
 chmod +x "$HOOKS_DIR/90-antigravity.hook"
 
 # 8. Collect initial usage metrics
@@ -287,7 +387,8 @@ TOKEN_FILE="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
 IS_AUTH=false
 if [[ -f "$TOKEN_FILE" && -s "$TOKEN_FILE" ]]; then
   IS_AUTH=true
-elif [[ -n "$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)" ]]; then
+elif secret-tool lookup service gemini username antigravity >/dev/null 2>&1; then
+  # Exit status only: the secret itself never lands in a shell variable.
   IS_AUTH=true
 fi
 

@@ -1,9 +1,19 @@
 #!/bin/bash
 # omarchy:summary=Update local usage records for all configured coding agents
-# omarchy:args=[--force] [--limits-only] [agent-id...]
+# omarchy:args=[--force] [--limits-only] [--except <agent>] [agent-id...]
 # omarchy:hidden=true
+# omarchy-antigravity: agent-usage-update
+#
+# The marker line above lets install/uninstall tell this plugin's copy apart
+# from the stock Omarchy helper of the same name; keep it verbatim.
 
 set -euo pipefail
+
+# Recursion guard: a collector that runs the updater again (or a copy of this
+# script mistaken for a collector) would re-run every collector, each of
+# which recurses again — a fork bomb. Nested invocations do nothing.
+[[ -n ${OMARCHY_AGENT_USAGE_UPDATE_ACTIVE:-} ]] && exit 0
+export OMARCHY_AGENT_USAGE_UPDATE_ACTIVE=1
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
 mkdir -p "$STATE_DIR"
@@ -20,7 +30,7 @@ while (( $# > 0 )); do
     --limits-only) limits_only="--limits-only"; shift ;;
     --except)
       if (( $# > 1 )); then
-        excluded["$2"]=1
+        [[ -n "$2" ]] && excluded["$2"]=1
         shift 2
       else
         shift
@@ -31,30 +41,19 @@ while (( $# > 0 )); do
 done
 
 # Collect all available agent collector scripts from both system and local
-# bin. The `update` helper and any backup/temp/editor file are skipped: a
-# stale .bak of THIS script is a full copy of the updater, and discovering it
-# as a collector re-executes it recursively (fork bomb).
+# bin (local wins). Collector ids are plain lowercase names (claude, codex,
+# antigravity, ...): anything else — backup, temp and editor files — is
+# skipped, and so is any id starting with `update`, which is this helper or a
+# copy of it (update.bak.<n>, update-old, update.backup, ...) and would
+# re-enter the updater if run as a collector.
 declare -A collectors
 
-for script in /usr/share/omarchy/bin/omarchy-agent-usage-*; do
-  [[ -x "$script" ]] || continue
-  name=$(basename "$script")
-  id="${name#omarchy-agent-usage-}"
-  [[ "$id" == "update" || "$id" == "*" ]] && continue
-  case "$id" in
-    *.bak|*.tmp|*.orig|*.old|*.disabled|*.sample|*.swp|*~) continue ;;
-  esac
-  collectors["$id"]="$script"
-done
-
-for script in "$HOME"/.local/bin/omarchy-agent-usage-*; do
-  [[ -x "$script" ]] || continue
-  name=$(basename "$script")
-  id="${name#omarchy-agent-usage-}"
-  [[ "$id" == "update" || "$id" == "*" ]] && continue
-  case "$id" in
-    *.bak|*.tmp|*.orig|*.old|*.disabled|*.sample|*.swp|*~) continue ;;
-  esac
+for script in "${OMARCHY_PATH:-/usr/share/omarchy}"/bin/omarchy-agent-usage-* \
+              "$HOME"/.local/bin/omarchy-agent-usage-*; do
+  [[ -f "$script" && -x "$script" ]] || continue
+  id="${script##*/omarchy-agent-usage-}"
+  [[ "$id" == update* ]] && continue
+  [[ "$id" =~ ^[a-z0-9][a-z0-9-]*$ ]] || continue
   collectors["$id"]="$script"
 done
 
@@ -74,30 +73,95 @@ else
   done
 fi
 
-for id in "${target_ids[@]}"; do
-  script="${collectors[$id]}"
-  target_file="$STATE_DIR/$id.json"
-  tmp_file=$(mktemp "$STATE_DIR/.${id}.json.tmp.XXXXXX" 2>/dev/null || mktemp)
-  chmod 600 "$tmp_file" 2>/dev/null || true
+have_timeout=0
+command -v timeout >/dev/null 2>&1 && have_timeout=1
+have_flock=0
+command -v flock >/dev/null 2>&1 && have_flock=1
 
-  cmd=("$script")
+# Run one collector and publish its record atomically. Problems go to stderr;
+# returns non-zero when the collector failed. Runs in its own background
+# subshell, so the fixed lock fd below is private to it.
+collect() {
+  local id="$1" script="$2"
+  local target_file="$STATE_DIR/$id.json"
+  local tmp_file err_file rc=0 jq_rc=0 line lines=0
+
+  # The bar's refresh timers, the omarchy-agent-usage systemd timer and the
+  # plugin service can all start a refresh at once. A collector whose
+  # previous run still holds its lock is skipped instead of run twice. The
+  # lock file is hidden, and the bar only reads *.json from this directory.
+  if (( have_flock )); then
+    exec 9>>"$STATE_DIR/.$id.lock"
+    if ! flock -n 9; then
+      echo "omarchy-agent-usage-update: $id: previous run still in progress; skipped" >&2
+      return 0
+    fi
+  fi
+
+  local cmd=("$script")
   [[ -n "$force" ]] && cmd+=("$force")
   [[ -n "$limits_only" ]] && cmd+=("$limits_only")
 
   # Bound each collector so one hung or misbehaving script cannot stall the
   # whole refresh indefinitely.
-  if command -v timeout >/dev/null 2>&1; then
+  if (( have_timeout )); then
     cmd=(timeout 60 "${cmd[@]}")
   fi
 
-  if "${cmd[@]}" > "$tmp_file" 2>/dev/null; then
-    if [[ -s "$tmp_file" ]] && jq -e . "$tmp_file" >/dev/null 2>&1; then
-      chmod 600 "$tmp_file" 2>/dev/null || true
-      mv -f "$tmp_file" "$target_file"
-    else
-      rm -f "$tmp_file"
+  tmp_file=$(mktemp "$STATE_DIR/.${id}.json.tmp.XXXXXX")
+  err_file=$(mktemp "$STATE_DIR/.${id}.err.XXXXXX")
+
+  # The collector does not inherit the lock fd: a process it leaves behind
+  # must not keep the next refresh locked out.
+  "${cmd[@]}" >"$tmp_file" 2>"$err_file" 9>&- || rc=$?
+
+  # Forward the collector's stderr tagged with its id, without control
+  # characters, and bounded so a chatty collector cannot flood the log.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( ++lines > 50 )); then
+      echo "$id: ... (further output truncated)" >&2
+      break
     fi
-  else
+    printf '%s: %s\n' "$id" "${line//[[:cntrl:]]/}" >&2
+  done <"$err_file"
+  rm -f "$err_file"
+
+  if (( rc != 0 )); then
     rm -f "$tmp_file"
+    if (( have_timeout && rc == 124 )); then
+      echo "omarchy-agent-usage-update: $id: collector timed out after 60s" >&2
+    else
+      echo "omarchy-agent-usage-update: $id: collector failed (exit $rc)" >&2
+    fi
+    return 1
   fi
+
+  # mktemp already created the record private (0600). jq exits 4 when the
+  # output holds no JSON value at all: exit 0 with nothing to say is a
+  # deliberate skip that keeps the previous record.
+  jq -e . "$tmp_file" >/dev/null 2>&1 || jq_rc=$?
+  if (( jq_rc == 4 )); then
+    rm -f "$tmp_file"
+    return 0
+  fi
+  if (( jq_rc != 0 )); then
+    rm -f "$tmp_file"
+    echo "omarchy-agent-usage-update: $id: collector did not print a valid JSON record" >&2
+    return 1
+  fi
+  mv -f "$tmp_file" "$target_file"
+}
+
+# Collectors are independent (and some wait on the network), so run them in
+# parallel like the stock helper and report failure if any of them failed.
+pids=()
+for id in "${target_ids[@]}"; do
+  collect "$id" "${collectors[$id]}" &
+  pids+=("$!")
 done
+
+status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+exit "$status"

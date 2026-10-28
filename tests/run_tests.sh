@@ -18,13 +18,16 @@ echo -e "${BLUE}   Running omarchy-antigravity Full Test Suite        ${NC}"
 echo -e "${BLUE}======================================================${NC}"
 echo ""
 
-TOTAL_SUITES=9
+TOTAL_SUITES=0
 PASSED_SUITES=0
+FAILED_SUITES=()
 
+# Every suite runs even after a failure, so one report lists all of them.
 run_suite() {
   local name="$1"
   local cmd="$2"
 
+  TOTAL_SUITES=$((TOTAL_SUITES + 1))
   echo -e "${BLUE}▶ Running suite: ${name}${NC}"
   if eval "$cmd"; then
     echo -e "${GREEN}✔ ${name} PASSED${NC}"
@@ -33,19 +36,21 @@ run_suite() {
   else
     echo -e "${RED}✖ ${name} FAILED${NC}"
     echo ""
-    return 1
+    FAILED_SUITES+=("$name")
   fi
 }
 
 run_suite "Python Collector Unit & Integration Tests" "PYTHONWARNINGS=error::ResourceWarning python3 -m unittest '$SCRIPT_DIR/test_collector.py'"
 run_suite "Plugin Manifest Validation" "bash '$SCRIPT_DIR/test_manifest.sh'"
 run_suite "Installer & Uninstaller Lifecycle" "bash '$SCRIPT_DIR/test_installer.sh'"
-run_suite "Usage-Updater Collector Discovery" "bash '$SCRIPT_DIR/test_usage_update.sh'"
+run_suite "Usage-Updater Discovery, Locking & Errors" "bash '$SCRIPT_DIR/test_usage_update.sh'"
 run_suite "Installer Symlink Safety" "bash '$SCRIPT_DIR/test_installer_safety.sh'"
+run_suite "Reinstall & Uninstall Safety" "bash '$SCRIPT_DIR/test_uninstall_safety.sh'"
 run_suite "Post-Update Hook Persistence" "bash '$SCRIPT_DIR/test_hook.sh'"
 run_suite "CLI Functional Commands" "bash '$SCRIPT_DIR/test_cli.sh'"
 run_suite "Antigravity CLI Status Bar Tests" "bash '$SCRIPT_DIR/test_statusline.sh'"
 run_suite "CI & Static Gates" "bash '$SCRIPT_DIR/test_ci.sh'"
+run_suite "Pre-push Hook" "bash '$SCRIPT_DIR/test_prepush.sh'"
 
 echo -e "${BLUE}======================================================${NC}"
 if (( PASSED_SUITES == TOTAL_SUITES )); then
@@ -53,7 +58,7 @@ if (( PASSED_SUITES == TOTAL_SUITES )); then
   echo -e "${BLUE}======================================================${NC}"
   exit 0
 else
-  echo -e "${RED}❌ SOME TESTS FAILED (${PASSED_SUITES}/${TOTAL_SUITES} passed)${NC}"
+  echo -e "${RED}❌ SOME TESTS FAILED (${PASSED_SUITES}/${TOTAL_SUITES} passed): ${FAILED_SUITES[*]}${NC}"
   echo -e "${BLUE}======================================================${NC}"
   exit 1
 fi

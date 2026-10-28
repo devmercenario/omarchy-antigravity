@@ -11,7 +11,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "🧪 Running installer & uninstaller integration tests..."
 
 # Create an isolated temporary HOME directory
-TEST_HOME=$(mktemp -d "/tmp/omarchy-test-home.XXXXXX")
+TEST_HOME=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-test-home.XXXXXX")
 cleanup() {
   rm -rf "$TEST_HOME"
 }
@@ -46,10 +46,10 @@ cat <<'EOF' > "$TEST_HOME/.config/omarchy/shell.json"
 }
 EOF
 
-# Mock secret-tool and agy
+# Mock secret-tool (empty keyring: lookup exits 1) and agy
 cat <<'EOF' > "$TEST_HOME/.local/bin/secret-tool"
 #!/bin/bash
-exit 0
+exit 1
 EOF
 chmod +x "$TEST_HOME/.local/bin/secret-tool"
 
@@ -58,6 +58,16 @@ cat <<'EOF' > "$TEST_HOME/.local/bin/agy"
 echo "agy mock"
 EOF
 chmod +x "$TEST_HOME/.local/bin/agy"
+
+# Stub everything that would reach the live session (omarchy-shell IPC and
+# the plugin clone/remove commands call into the running shell), and point
+# OMARCHY_PATH at an empty directory so the updater runs no stock collectors.
+export OMARCHY_PATH="$TEST_HOME/omarchy"
+mkdir -p "$OMARCHY_PATH/bin"
+for stub in omarchy-shell omarchy-plugin-clone omarchy-plugin-remove; do
+  printf '#!/bin/bash\nexit 0\n' > "$TEST_HOME/.local/bin/$stub"
+  chmod +x "$TEST_HOME/.local/bin/$stub"
+done
 
 # Pre-seed a fake pre-existing update helper to verify the installer backs it
 # up (it shadows the stock Omarchy helper) and the uninstaller restores it.

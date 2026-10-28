@@ -3,6 +3,13 @@
 # Omarchy Antigravity CLI Statusline
 # Dynamic theme-aware status bar for Antigravity CLI (agy)
 # ==============================================================================
+# omarchy-antigravity: statusline
+#
+# The marker line above lets install/uninstall tell this plugin's copy apart
+# from a status line the user wrote themselves; keep it verbatim.
+#
+# agy re-renders the status line constantly, so a render costs only a few
+# execs (head, jq, git); everything else uses bash builtins.
 
 set -e
 
@@ -12,7 +19,9 @@ if [ ! -t 0 ]; then
     INPUT=$(head -c 262144)
 fi
 
-# Parse input from stdin (agy passes context JSON)
+CWD=""
+WIDTH=""
+# Parse input from stdin (agy passes context JSON) in a single jq call.
 if [ -n "$INPUT" ]; then
     if [ -n "${OMARCHY_STATUSLINE_DEBUG:-}" ]; then
         (
@@ -21,25 +30,81 @@ if [ -n "$INPUT" ]; then
             echo "$INPUT" > "$HOME/.gemini/antigravity-cli/last_statusline_input.json" 2>/dev/null || true
         )
     fi
-    CWD=$(echo "$INPUT" | jq -r ".cwd // empty" 2>/dev/null || true)
-    WIDTH=$(echo "$INPUT" | jq -r ".width // .terminal_width // .columns // empty" 2>/dev/null || true)
+    # @tsv escapes tabs, newlines, CRs and backslashes inside each field, so
+    # the one raw tab separates the fields and %b undoes the escaping.
+    PARSED=$(jq -r '[(.cwd // "" | tostring), (.width // .terminal_width // .columns // "" | tostring)] | @tsv' <<<"$INPUT" 2>/dev/null) || PARSED=""
+    if [[ $PARSED == *$'\t'* ]]; then
+        printf -v CWD '%b' "${PARSED%%$'\t'*}"
+        WIDTH="${PARSED#*$'\t'}"
+    fi
 fi
 
 CWD="${CWD:-$PWD}"
 
-if [ -z "$WIDTH" ] || [ "$WIDTH" = "null" ] || [ "$WIDTH" -le 0 ] 2>/dev/null; then
-    WIDTH=$(tput cols </dev/tty 2>/dev/null || true)
-fi
-if [ -z "$WIDTH" ] || [ "$WIDTH" = "null" ] || [ "$WIDTH" -le 0 ] 2>/dev/null; then
-    WIDTH=${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}
-fi
+# Only a plain positive integer is a usable width. The value comes from agy's
+# JSON or the environment and ends up in arithmetic, where bash evaluates
+# anything else as an expression (`a[$(cmd)]` would run cmd).
+valid_width() {
+    [[ $1 =~ ^[0-9]{1,4}$ ]] && (( 10#$1 > 0 ))
+}
 
-BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null || true)
-if [ -z "$BRANCH" ]; then
-    BRANCH=$(git -C "$CWD" rev-parse --short HEAD 2>/dev/null || true)
+if ! valid_width "$WIDTH"; then
+    WIDTH=$(tput cols 2>/dev/null </dev/tty || true)
+fi
+if ! valid_width "$WIDTH"; then
+    WIDTH="${COLUMNS:-}"
+fi
+if ! valid_width "$WIDTH"; then
+    WIDTH=$(tput cols 2>/dev/null || true)
+fi
+valid_width "$WIDTH" || WIDTH=100
+WIDTH=$((10#$WIDTH))
+
+# Branch and change counts from a single `git status`. GIT_OPTIONAL_LOCKS=0
+# stops it from refreshing (writing) .git/index, and the empty core.fsmonitor
+# keeps a repository's fsmonitor hook from running just because the status
+# line rendered inside it.
+GIT_STATUS=$(GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor= -C "$CWD" status --porcelain=v2 --branch 2>/dev/null) || GIT_STATUS=""
+BRANCH=""
+OID=""
+ADDED=0
+MODIFIED=0
+UNTRACKED=0
+while IFS= read -r line; do
+    case "$line" in
+        "# branch.head "*) BRANCH="${line#\# branch.head }" ;;
+        "# branch.oid "*) OID="${line#\# branch.oid }" ;;
+        # Changed entries are "<type> XY ...": X is the index (staged)
+        # status, Y the worktree status.
+        "1 "*|"2 "*|"u "*)
+            case "${line:2:1}" in [MADRC]) ADDED=$((ADDED + 1)) ;; esac
+            case "${line:3:1}" in [MD]) MODIFIED=$((MODIFIED + 1)) ;; esac
+            ;;
+        "? "*) UNTRACKED=$((UNTRACKED + 1)) ;;
+    esac
+done <<<"$GIT_STATUS"
+if [ "$BRANCH" = "(detached)" ]; then
+    # Detached HEAD: show the abbreviated commit instead.
+    BRANCH=""
+    if [ "$OID" != "(initial)" ]; then
+        BRANCH="${OID:0:7}"
+    fi
 fi
 BRANCH="${BRANCH:-no-git}"
-FOLDER=$(basename "$CWD")
+
+# Folder name without spawning basename: drop trailing slashes, keep the last
+# path component, and show "/" for the root itself.
+FOLDER="${CWD%"${CWD##*[!/]}"}"
+FOLDER="${FOLDER##*/}"
+FOLDER="${FOLDER:-/}"
+
+# Branch and folder names are user data: drop control characters (an ESC
+# would let a crafted name drive the terminal) and backslashes. Everything
+# below is printed with %s, so nothing in them is interpreted.
+BRANCH="${BRANCH//[[:cntrl:]]/}"
+BRANCH="${BRANCH//\\/}"
+FOLDER="${FOLDER//[[:cntrl:]]/}"
+FOLDER="${FOLDER//\\/}"
 
 # Load colors dynamically from active Omarchy theme
 OMARCHY_THEME_COLORS="$HOME/.local/state/omarchy/current/theme/colors.toml"
@@ -78,76 +143,89 @@ if [ -f "$OMARCHY_THEME_COLORS" ]; then
     done < "$OMARCHY_THEME_COLORS"
 fi
 
-# Convert 6-character hex to decimal RGB (e.g., "7aa2f7" -> "122;162;247")
+# Convert 6-character hex to decimal RGB (e.g., "7aa2f7" -> "122;162;247"),
+# stored in the variable named by $2 (no subshell per colour).
 hex_to_rgb() {
     local h="$1"
-    if [ ${#h} -ge 6 ]; then
-        printf "%d;%d;%d" "$((16#${h:0:2}))" "$((16#${h:2:2}))" "$((16#${h:4:2}))"
+    if [[ $h =~ ^[0-9a-fA-F]{6} ]]; then
+        printf -v "$2" '%d;%d;%d' "$((16#${h:0:2}))" "$((16#${h:2:2}))" "$((16#${h:4:2}))"
     else
-        printf "122;162;247"
+        printf -v "$2" '%s' "122;162;247"
     fi
 }
 
-calc_luminance() {
-    local h="$1"
-    if [ ${#h} -ge 6 ]; then
-        local r=$((16#${h:0:2}))
-        local g=$((16#${h:2:2}))
-        local b=$((16#${h:4:2}))
-        echo "$(( (299*r + 587*g + 114*b) / 1000 ))"
-    else
-        echo 128
-    fi
-}
+ACCENT_LUM=128
+if [[ $hex_accent =~ ^[0-9a-fA-F]{6} ]]; then
+    ACCENT_LUM=$(( (299 * 16#${hex_accent:0:2} + 587 * 16#${hex_accent:2:2} + 114 * 16#${hex_accent:4:2}) / 1000 ))
+fi
 
-RGB_A_BG=$(hex_to_rgb "$hex_accent")
-ACCENT_LUM=$(calc_luminance "$hex_accent")
+hex_to_rgb "$hex_accent" RGB_A_BG
 if [ "$hex_mode" = "light" ] && [ "$ACCENT_LUM" -lt 140 ]; then
     RGB_A_FG="255;255;255"
 else
-    RGB_A_FG=$(hex_to_rgb "$hex_darker_bg")
+    hex_to_rgb "$hex_darker_bg" RGB_A_FG
 fi
 
-RGB_B_BG=$(hex_to_rgb "$hex_lighter_bg")
-RGB_B_FG=$(hex_to_rgb "$hex_fg")
+hex_to_rgb "$hex_lighter_bg" RGB_B_BG
+hex_to_rgb "$hex_fg" RGB_B_FG
 
-RGB_C_BG=$(hex_to_rgb "$hex_dark_bg")
-RGB_C_FG=$(hex_to_rgb "$hex_fg")
+hex_to_rgb "$hex_dark_bg" RGB_C_BG
+hex_to_rgb "$hex_fg" RGB_C_FG
 
-RGB_GREEN=$(hex_to_rgb "$hex_green")
-RGB_YELLOW=$(hex_to_rgb "$hex_yellow")
-RGB_CYAN=$(hex_to_rgb "$hex_cyan")
+hex_to_rgb "$hex_green" RGB_GREEN
+hex_to_rgb "$hex_yellow" RGB_YELLOW
+hex_to_rgb "$hex_cyan" RGB_CYAN
 
-# Git status indicators
-GIT_STATUS=$(git -C "$CWD" status --porcelain 2>/dev/null || true)
-ADDED=$(echo "$GIT_STATUS" | grep -c "^[MADRC]" 2>/dev/null || true)
-MODIFIED=$(echo "$GIT_STATUS" | grep -c "^.[MD]" 2>/dev/null || true)
-UNTRACKED=$(echo "$GIT_STATUS" | grep -c "^\?\?" 2>/dev/null || true)
+ESC=$'\e'
+BOLD="${ESC}[1m"
+RESET="${ESC}[0m"
 
+# Git status indicators (DIFF_TEXT is the same text without colours, used to
+# measure the line).
 DIFF_STR=""
-[ "$ADDED" -gt 0 ] 2>/dev/null && DIFF_STR="${DIFF_STR} \033[38;2;${RGB_GREEN}m+${ADDED}\033[38;2;${RGB_C_FG}m"
-[ "$MODIFIED" -gt 0 ] 2>/dev/null && DIFF_STR="${DIFF_STR} \033[38;2;${RGB_YELLOW}m~${MODIFIED}\033[38;2;${RGB_C_FG}m"
-[ "$UNTRACKED" -gt 0 ] 2>/dev/null && DIFF_STR="${DIFF_STR} \033[38;2;${RGB_CYAN}m?${UNTRACKED}\033[38;2;${RGB_C_FG}m"
+DIFF_TEXT=""
+if [ "$ADDED" -gt 0 ]; then
+    DIFF_STR="${DIFF_STR} ${ESC}[38;2;${RGB_GREEN}m+${ADDED}${ESC}[38;2;${RGB_C_FG}m"
+    DIFF_TEXT="${DIFF_TEXT} +${ADDED}"
+fi
+if [ "$MODIFIED" -gt 0 ]; then
+    DIFF_STR="${DIFF_STR} ${ESC}[38;2;${RGB_YELLOW}m~${MODIFIED}${ESC}[38;2;${RGB_C_FG}m"
+    DIFF_TEXT="${DIFF_TEXT} ~${MODIFIED}"
+fi
+if [ "$UNTRACKED" -gt 0 ]; then
+    DIFF_STR="${DIFF_STR} ${ESC}[38;2;${RGB_CYAN}m?${UNTRACKED}${ESC}[38;2;${RGB_C_FG}m"
+    DIFF_TEXT="${DIFF_TEXT} ?${UNTRACKED}"
+fi
 
 # Section colors and powerline separators
-C_A_BG="\033[48;2;${RGB_A_BG}m"
-C_A_FG="\033[38;2;${RGB_A_FG}m"
-C_B_BG="\033[48;2;${RGB_B_BG}m"
-C_B_FG="\033[38;2;${RGB_B_FG}m"
-C_C_BG="\033[48;2;${RGB_C_BG}m"
-C_C_FG="\033[38;2;${RGB_C_FG}m"
+C_A_BG="${ESC}[48;2;${RGB_A_BG}m"
+C_A_FG="${ESC}[38;2;${RGB_A_FG}m"
+C_B_BG="${ESC}[48;2;${RGB_B_BG}m"
+C_B_FG="${ESC}[38;2;${RGB_B_FG}m"
+C_C_BG="${ESC}[48;2;${RGB_C_BG}m"
+C_C_FG="${ESC}[38;2;${RGB_C_FG}m"
 
-SEP_AB="\033[38;2;${RGB_A_BG};48;2;${RGB_B_BG}m"
-SEP_BC="\033[38;2;${RGB_B_BG};48;2;${RGB_C_BG}m"
-SEP_R1="\033[38;2;${RGB_B_BG};48;2;${RGB_C_BG}m"
-SEP_R2="\033[38;2;${RGB_A_BG};48;2;${RGB_B_BG}m"
+PL_RIGHT=""
+PL_LEFT=""
+SEP_AB="${ESC}[38;2;${RGB_A_BG};48;2;${RGB_B_BG}m${PL_RIGHT}"
+SEP_BC="${ESC}[38;2;${RGB_B_BG};48;2;${RGB_C_BG}m${PL_RIGHT}"
+SEP_R1="${ESC}[38;2;${RGB_B_BG};48;2;${RGB_C_BG}m${PL_LEFT}"
+SEP_R2="${ESC}[38;2;${RGB_A_BG};48;2;${RGB_B_BG}m${PL_LEFT}"
+
+# Substring test on a file's contents with builtins only (no grep per render).
+file_contains() {
+    local content=""
+    [ -f "$1" ] || return 1
+    IFS= read -r -d '' content 2>/dev/null <"$1" || true
+    [[ $content == *"$2"* ]]
+}
 
 # Check RTK status (active & configured)
 RTK_STR=""
 if command -v rtk >/dev/null 2>&1; then
     if [ -f "$HOME/.gemini/hooks/rtk-hook-gemini.sh" ] || \
-       ([ -f "$HOME/.gemini/settings.json" ] && grep -q "rtk" "$HOME/.gemini/settings.json" 2>/dev/null) || \
-       ([ -f "$HOME/.gemini/antigravity-cli/settings.json" ] && grep -q "rtk" "$HOME/.gemini/antigravity-cli/settings.json" 2>/dev/null); then
+       file_contains "$HOME/.gemini/settings.json" "rtk" || \
+       file_contains "$HOME/.gemini/antigravity-cli/settings.json" "rtk"; then
         RTK_STR="⚡ RTK"
     fi
 fi
@@ -156,7 +234,7 @@ fi
 SL_STR=""
 SL_CONFIG="$HOME/.config/shunt-local/config.json"
 if [ -f "$SL_CONFIG" ]; then
-    if [ -f "$HOME/.gemini/config/hooks.json" ] && grep -q "shunt-local" "$HOME/.gemini/config/hooks.json" 2>/dev/null; then
+    if file_contains "$HOME/.gemini/config/hooks.json" "shunt-local"; then
         ENDPOINT=$(jq -r '.endpoint // empty' "$SL_CONFIG" 2>/dev/null || true)
         SL_HOST="127.0.0.1"
         SL_PORT="8080"
@@ -195,30 +273,35 @@ for item in "${ITEMS[@]}"; do
     fi
 done
 
-TIME=$(date +"%H:%M")
+printf -v TIME '%(%H:%M)T' -1
 
-LEFT_RAW="${C_A_BG}${C_A_FG}\033[1m 󰚩 AGY \033[0m${SEP_AB}${C_B_BG}${C_B_FG}  ${BRANCH} ${SEP_BC}${C_C_BG}${C_C_FG}  ${FOLDER}${DIFF_STR} "
-RIGHT_RAW="${SEP_R1}${C_B_BG}${C_B_FG} ${MID_TEXT} ${SEP_R2}${C_A_BG}${C_A_FG}\033[1m  ${TIME} \033[0m"
+# Visible text of each segment; the colour escapes are layered around them.
+SEG_A=" 󰚩 AGY "
+SEG_B="  ${BRANCH} "
+SEG_C="  ${FOLDER}"
+SEG_R1=" ${MID_TEXT} "
+SEG_R2="  ${TIME} "
 
-# Accurately compute visible terminal display width (accounting for ANSI escapes & wide characters)
+LEFT_RAW="${C_A_BG}${C_A_FG}${BOLD}${SEG_A}${RESET}${SEP_AB}${C_B_BG}${C_B_FG}${SEG_B}${SEP_BC}${C_C_BG}${C_C_FG}${SEG_C}${DIFF_STR} "
+RIGHT_RAW="${SEP_R1}${C_B_BG}${C_B_FG}${SEG_R1}${SEP_R2}${C_A_BG}${C_A_FG}${BOLD}${SEG_R2}${RESET}"
+
+# Visible terminal width of plain text: one column per character, plus one
+# for each emoji that terminals draw two columns wide.
 display_width() {
-    local text="$1"
-    local clean_text
-    clean_text=$(printf "%b" "$text" | sed "s/\x1b\[[0-9;]*[a-zA-Z]//g")
-    local len=${#clean_text}
-    local wide_chars
-    wide_chars=$(echo -n "$clean_text" | grep -o "[⚡🧠🔀]" 2>/dev/null | wc -l || echo 0)
-    echo $(( len + wide_chars ))
+    local wide="${1//[!⚡🧠🔀]/}"
+    DISPLAY_WIDTH=$(( ${#1} + ${#wide} ))
 }
 
-LEN_L=$(display_width "$LEFT_RAW")
-LEN_R=$(display_width "$RIGHT_RAW")
+display_width "${SEG_A}${PL_RIGHT}${SEG_B}${PL_RIGHT}${SEG_C}${DIFF_TEXT} "
+LEN_L=$DISPLAY_WIDTH
+display_width "${PL_LEFT}${SEG_R1}${PL_LEFT}${SEG_R2}"
+LEN_R=$DISPLAY_WIDTH
 
 PAD_LEN=$(( WIDTH - LEN_L - LEN_R ))
 if [ "$PAD_LEN" -lt 1 ]; then
     PAD_LEN=1
 fi
 
-PAD=$(printf "%*s" "$PAD_LEN" "")
+printf -v PAD '%*s' "$PAD_LEN" ""
 
-printf "%b" "${LEFT_RAW}${C_C_BG}${PAD}${RIGHT_RAW}"
+printf '%s' "${LEFT_RAW}${C_C_BG}${PAD}${RIGHT_RAW}"

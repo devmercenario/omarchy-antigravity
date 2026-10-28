@@ -5,6 +5,43 @@
 
 set -euo pipefail
 
+# Marker lines that identify this plugin's own status line script (current
+# marker, or the header every earlier release carried).
+STATUSLINE_MARKER_RE='^# (omarchy-antigravity: statusline|Omarchy Antigravity CLI Statusline)$'
+
+# True when $1 is a regular file (not a symlink) carrying marker regex $2.
+has_marker() {
+  [[ -f "$1" && ! -L "$1" ]] && grep -qE -- "$2" "$1" 2>/dev/null
+}
+
+# Temp files are removed on any exit; INT/TERM must exit explicitly.
+TMP_FILES=()
+cleanup_tmp() {
+  (( ${#TMP_FILES[@]} == 0 )) || rm -f -- "${TMP_FILES[@]}"
+}
+trap cleanup_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# update_json FILE FILTER [jq args...]: rewrite FILE through FILTER only when
+# the result differs, via a temp file next to it (atomic rename, same mode).
+update_json() {
+  local file="$1" filter="$2" tmp
+  shift 2
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  TMP_FILES+=("$tmp")
+  if ! jq "$@" "($filter) as \$new | if \$new == . then empty else \$new end" "$file" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod --reference="$file" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
 usage() {
   cat <<EOF
 Usage: omarchy-antigravity <command>
@@ -41,11 +78,9 @@ case "$cmd" in
     auth_found=""
     if [[ -f "$token_file" && -s "$token_file" ]]; then
       auth_found="token file ($token_file)"
-    else
-      raw=$(secret-tool lookup service gemini username antigravity 2>/dev/null || true)
-      if [[ -n "$raw" ]]; then
-        auth_found="system keyring"
-      fi
+    elif secret-tool lookup service gemini username antigravity >/dev/null 2>&1; then
+      # Exit status only: the secret itself never lands in a shell variable.
+      auth_found="system keyring"
     fi
 
     if [[ -z "$auth_found" ]]; then
@@ -66,12 +101,17 @@ case "$cmd" in
     ;;
   refresh|update)
     echo "Refreshing Antigravity quota..."
+    refresh_rc=0
     if [[ -x "$HOME/.local/bin/omarchy-agent-usage-update" ]]; then
-      "$HOME/.local/bin/omarchy-agent-usage-update" --force antigravity
+      "$HOME/.local/bin/omarchy-agent-usage-update" --force antigravity || refresh_rc=$?
     fi
     echo "Notifying Omarchy shell..."
     if command -v omarchy-shell >/dev/null 2>&1; then
       omarchy-shell ipc omarchy.agents refresh >/dev/null 2>&1 || true
+    fi
+    if (( refresh_rc != 0 )); then
+      echo "Quota refresh failed (see the errors above)." >&2
+      exit "$refresh_rc"
     fi
     echo "Quota refreshed!"
     ;;
@@ -103,31 +143,36 @@ case "$cmd" in
           statusline_src="$(dirname "$0")/omarchy-antigravity-statusline"
         fi
         if [[ -n "$statusline_src" ]]; then
-          if [[ -f "$statusline_script" && ! -f "$statusline_script.bak" ]]; then
+          # Back up a status line the user wrote, once; never the plugin's
+          # own copy, which uninstall would otherwise "restore" for good.
+          if [[ -f "$statusline_script" && ! -e "$statusline_script.bak" ]] &&
+             ! cmp -s "$statusline_src" "$statusline_script" &&
+             ! has_marker "$statusline_script" "$STATUSLINE_MARKER_RE"; then
             cp "$statusline_script" "$statusline_script.bak" 2>/dev/null || true
           fi
           cp -f --remove-destination "$statusline_src" "$statusline_script"
           chmod +x "$statusline_script"
         fi
-        tmp=$(mktemp)
-        trap 'rm -f "$tmp"' EXIT INT TERM
+        statusline_filter='.statusLine = {"type":"command","command":$s,"enabled":true}'
         if [[ -f "$settings_file" ]]; then
-          jq --arg s "$statusline_script" '.statusLine = {"type":"command","command":$s,"enabled":true}' "$settings_file" > "$tmp" && mv -f "$tmp" "$settings_file"
+          update_json "$settings_file" "$statusline_filter" --arg s "$statusline_script"
         else
-          jq -n --arg s "$statusline_script" '{"statusLine":{"type":"command","command":$s,"enabled":true}}' > "$tmp" && mv -f "$tmp" "$settings_file"
+          tmp=$(mktemp "$settings_file.XXXXXX")
+          TMP_FILES+=("$tmp")
+          jq -n --arg s "$statusline_script" "{} | $statusline_filter" > "$tmp"
+          mv -f "$tmp" "$settings_file"
         fi
-        trap - EXIT INT TERM
         echo "✅ Antigravity CLI status bar enabled!"
         ;;
       disable)
-        if [[ -f "$settings_file" ]]; then
-          tmp=$(mktemp)
-          trap 'rm -f "$tmp"' EXIT INT TERM
-          jq '.statusLine.enabled = false' "$settings_file" > "$tmp" && mv -f "$tmp" "$settings_file"
-          trap - EXIT INT TERM
-          echo "✅ Antigravity CLI status bar disabled."
-        else
+        if [[ ! -f "$settings_file" ]]; then
           echo "Settings file not found."
+        elif ! jq -e '.statusLine | type == "object"' "$settings_file" >/dev/null 2>&1; then
+          # Nothing to disable; do not invent a partial statusLine entry.
+          echo "No status bar is configured in $settings_file."
+        else
+          update_json "$settings_file" '.statusLine.enabled = false'
+          echo "✅ Antigravity CLI status bar disabled."
         fi
         ;;
       *)

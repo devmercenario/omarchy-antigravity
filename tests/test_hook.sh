@@ -11,7 +11,7 @@ HOOK_SRC="$PROJECT_ROOT/hooks/post-update.d/90-antigravity.hook"
 
 echo "🧪 Running post-update hook persistence tests..."
 
-TEST_HOME=$(mktemp -d "/tmp/omarchy-test-hook.XXXXXX")
+TEST_HOME=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-test-hook.XXXXXX")
 cleanup() {
   rm -rf "$TEST_HOME"
 }
@@ -118,4 +118,77 @@ if ! jq -e '.bar.layout.right[] | select(.id == "omarchy.agents") | .providers.a
 fi
 
 echo "  ✅ Test Case 3 passed: Hook respects an explicit provider disable!"
+
+# The bar watches shell.json and the hook runs on every `omarchy update`:
+# when nothing changes the file must not be rewritten at all.
+file_id() {
+  stat -c '%i %y %a' "$SHELL_JSON"
+}
+no_temp_files() {
+  local leftovers
+  leftovers=$(find "$TEST_HOME/.config/omarchy" -maxdepth 1 -name 'shell.json.*' | head -n 1)
+  [[ -z "$leftovers" ]] || { echo "❌ Assertion failed: hook left a temp file behind: $leftovers" >&2; exit 1; }
+}
+
+# Test Case 4: a second run over an already-enabled config is a no-op, and a
+# real change keeps the file's mode.
+echo "  ▶ Test Case 4: Hook leaves an unchanged shell.json untouched..."
+cat <<'EOF2' > "$SHELL_JSON"
+{
+  "bar": {
+    "layout": {
+      "right": [
+        { "id": "omarchy.agents", "providers": { "claude": { "enabled": true } } }
+      ]
+    }
+  }
+}
+EOF2
+chmod 640 "$SHELL_JSON"
+bash "$HOOK_SRC"
+if [[ "$(stat -c '%a' "$SHELL_JSON")" != "640" ]]; then
+  echo "❌ Assertion failed: hook did not keep shell.json's mode." >&2
+  exit 1
+fi
+before=$(file_id)
+sleep 0.05
+bash "$HOOK_SRC"
+if [[ "$(file_id)" != "$before" ]]; then
+  echo "❌ Assertion failed: hook rewrote shell.json although nothing changed." >&2
+  exit 1
+fi
+no_temp_files
+echo "  ✅ Test Case 4 passed!"
+
+# Test Case 5: odd layouts (no right section, entries without string ids,
+# non-object entries) neither break the hook nor touch the file.
+echo "  ▶ Test Case 5: Hook tolerates odd layouts without rewriting them..."
+cat <<'EOF2' > "$SHELL_JSON"
+{"bar": {"layout": {"left": [{"id": 7}, "clock", null, {"name": "no id"}]}}}
+EOF2
+before=$(file_id)
+bash "$HOOK_SRC"
+if [[ "$(file_id)" != "$before" ]]; then
+  echo "❌ Assertion failed: hook rewrote a config without agents widgets." >&2
+  exit 1
+fi
+no_temp_files
+echo '{"theme": "x"}' > "$SHELL_JSON"
+before=$(file_id)
+bash "$HOOK_SRC"
+[[ "$(file_id)" == "$before" ]] || { echo "❌ Assertion failed: hook rewrote a config without a bar." >&2; exit 1; }
+no_temp_files
+
+# Agents widgets in any section (and <user>.agents clones) are handled.
+cat <<'EOF2' > "$SHELL_JSON"
+{"bar": {"layout": {"left": [{"id": "me.agents"}], "right": [{"id": 3}]}}}
+EOF2
+bash "$HOOK_SRC"
+if ! jq -e '.bar.layout.left[0].providers.antigravity.enabled == true' "$SHELL_JSON" >/dev/null; then
+  echo "❌ Assertion failed: hook did not enable antigravity in a left-section clone widget." >&2
+  exit 1
+fi
+no_temp_files
+echo "  ✅ Test Case 5 passed!"
+
 echo "🎉 All hook tests passed successfully!"

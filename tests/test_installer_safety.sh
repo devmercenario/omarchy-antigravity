@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "🧪 Running installer symlink-safety tests..."
 
-TEST_HOME=$(mktemp -d "/tmp/omarchy-test-symlink.XXXXXX")
+TEST_HOME=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-test-symlink.XXXXXX")
 cleanup() {
   rm -rf "$TEST_HOME"
 }
@@ -25,10 +25,19 @@ export PATH="$TEST_HOME/.local/bin:$PATH"
 mkdir -p "$TEST_HOME/.local/bin" "$TEST_HOME/.config/omarchy"
 
 # Mock dependencies so install.sh runs offline (empty keyring -> no network).
-printf '#!/bin/bash\nexit 0\n' > "$TEST_HOME/.local/bin/secret-tool"
+printf '#!/bin/bash\nexit 1\n' > "$TEST_HOME/.local/bin/secret-tool"
 chmod +x "$TEST_HOME/.local/bin/secret-tool"
 printf '#!/bin/bash\necho agy\n' > "$TEST_HOME/.local/bin/agy"
 chmod +x "$TEST_HOME/.local/bin/agy"
+# Stub everything that would reach the live session (omarchy-shell IPC and
+# the plugin clone/remove commands call into the running shell), and point
+# OMARCHY_PATH at an empty directory so the updater runs no stock collectors.
+export OMARCHY_PATH="$TEST_HOME/omarchy"
+mkdir -p "$OMARCHY_PATH/bin"
+for stub in omarchy-shell omarchy-plugin-clone omarchy-plugin-remove; do
+  printf '#!/bin/bash\nexit 0\n' > "$TEST_HOME/.local/bin/$stub"
+  chmod +x "$TEST_HOME/.local/bin/$stub"
+done
 
 # A victim file plus a symlink sitting exactly where the installer wants to
 # place a binary. A careless `cp -f` would follow the link and truncate the
