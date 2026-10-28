@@ -21,6 +21,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Nothing here pushes; keep the token out of .git/config.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
@@ -52,3 +55,14 @@ jobs:
         run: |
           chmod +x tests/*.sh tests/*.py install.sh uninstall.sh bin/* hooks/post-update.d/*
           ./tests/run_tests.sh
+
+      # Same deterministic scanner the plugin marketplace runs, against the
+      # checked-out commit. It serves the git tree locally (no network).
+      - name: Security baseline (local)
+        run: |
+          node --version
+          node tests/marketplace-baseline-local.mjs
+
+      # QML is not linted here: the runner has neither Quickshell's QML
+      # modules nor Omarchy's Qt release, so qmllint could only fail on
+      # imports. tests/preflight.sh lints it on an Omarchy machine.

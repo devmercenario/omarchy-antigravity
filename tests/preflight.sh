@@ -1,7 +1,9 @@
 #!/bin/bash
 # ==============================================================================
 # Pre-push preflight: run the same checks the Omarchy plugin marketplace runs,
-# locally, against the current working tree — before you push.
+# locally, against the tree this script lives in — before you push. The
+# .githooks/pre-push hook runs it in a temporary worktree of each pushed
+# commit, so uncommitted edits cannot make a push pass or fail.
 #
 #   bash tests/preflight.sh
 #
@@ -59,7 +61,11 @@ bash "$SCRIPT_DIR/run_tests.sh" || fail "test suite failed"
 
 # 4. Automated security baseline against the local commit (no push, no network)
 step "Automated security baseline (local)"
-node "$SCRIPT_DIR/marketplace-baseline-local.mjs" || fail "security baseline scan failed"
+if command -v node >/dev/null 2>&1; then
+  node "$SCRIPT_DIR/marketplace-baseline-local.mjs" || fail "security baseline scan failed"
+else
+  warn "node not installed; skipping the security baseline (CI still runs it)"
+fi
 
 echo ""
 ok "Preflight complete — all checks passed."

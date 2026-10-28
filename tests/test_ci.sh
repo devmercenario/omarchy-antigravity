@@ -36,6 +36,14 @@ while IFS= read -r ref; do
   [[ "$ref" =~ @[0-9a-f]{40}$ ]] || fail "action is not pinned to a full commit SHA: $ref"
 done < <(grep -oE 'uses: [^ ]+' "$WORKFLOW" | awk '{print $2}')
 
+# Checkout must not leave the job token in .git/config for later steps.
+grep -q 'persist-credentials: false' "$WORKFLOW" \
+  || fail "actions/checkout must set persist-credentials: false"
+
+# The marketplace security baseline runs in CI, not only in the local preflight.
+grep -q 'node tests/marketplace-baseline-local.mjs' "$WORKFLOW" \
+  || fail "workflow must run the local security baseline"
+
 # No job may request write permissions from untrusted triggers.
 if grep -qE '^[[:space:]]*(contents|actions|packages|pull-requests|id-token): write' "$WORKFLOW"; then
   fail "workflow must not request write permissions"
@@ -48,6 +56,7 @@ for script in "$PROJECT_ROOT/install.sh" \
               "$PROJECT_ROOT/uninstall.sh" \
               "$PROJECT_ROOT"/bin/omarchy-* \
               "$PROJECT_ROOT"/hooks/post-update.d/*.hook \
+              "$PROJECT_ROOT"/.githooks/* \
               "$PROJECT_ROOT"/tests/*.sh; do
   [[ -f "$script" ]] || continue
   # Only syntax-check shell scripts; skip Python entry points such as the collector.

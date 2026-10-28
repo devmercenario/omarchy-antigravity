@@ -1,7 +1,44 @@
 #!/bin/bash
-# Pre-push hook: run the marketplace preflight before pushing to any remote.
-# Skip with `git push --no-verify`.
+# Pre-push hook: run the marketplace preflight against each commit being
+# pushed — not the working tree, which may hold uncommitted edits — in a
+# temporary git worktree. Skip with `git push --no-verify`.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-echo "▶ Running pre-push preflight (tests/preflight.sh)..."
-bash "$ROOT/tests/preflight.sh"
+
+ROOT="$(git rev-parse --show-toplevel)"
+# Git exports GIT_DIR and friends to hooks; left set, they would make every
+# git command inside the temporary worktree (the baseline scanner reads HEAD
+# there) operate on this checkout instead.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+
+WORKTREE=""
+cleanup() {
+  if [[ -n "$WORKTREE" ]]; then
+    git -C "$ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || rm -rf "$WORKTREE"
+    git -C "$ROOT" worktree prune >/dev/null 2>&1 || true
+    WORKTREE=""
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+declare -A checked=()
+status=0
+# stdin: one "<local ref> <local sha> <remote ref> <remote sha>" line per ref.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # An all-zero local sha is a branch deletion: nothing to test.
+  [[ -z "${local_sha//0/}" ]] && continue
+  [[ -n "${checked[$local_sha]:-}" ]] && continue
+  checked[$local_sha]=1
+
+  echo "▶ Running pre-push preflight on $local_ref (${local_sha:0:12})..."
+  WORKTREE=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-antigravity-prepush.XXXXXX")
+  git -C "$ROOT" worktree add --quiet --detach "$WORKTREE" "$local_sha"
+  if ! bash "$WORKTREE/tests/preflight.sh"; then
+    echo "❌ Preflight failed for $local_ref (${local_sha:0:12}); push aborted." >&2
+    status=1
+  fi
+  cleanup
+done
+
+exit "$status"
